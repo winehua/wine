@@ -1014,7 +1014,7 @@ static void load_display_driver(void)
         winstation = NtUserGetProcessWindowStation();
         if (!NtUserGetObjectInformation( winstation, UOI_FLAGS, &flags, sizeof(flags), NULL )
             || (flags.dwFlags & WSF_VISIBLE))
-            null_user_driver.pCreateWindow = nodrv_CreateWindow;
+            null_user_driver.pCreateWindow = nulldrv_CreateWindow;
 
         __wine_set_user_driver( &null_user_driver, WINE_GDI_DRIVER_VERSION );
     }

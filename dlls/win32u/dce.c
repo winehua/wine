@@ -25,6 +25,8 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "ntstatus.h"
 #include "ntgdi_private.h"
 #include "ntuser_private.h"
@@ -101,6 +103,33 @@ static BOOL offscreen_window_surface_flush( struct window_surface *surface, cons
                                             const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
                                             const BITMAPINFO *shape_info, const void *shape_bits )
 {
+    static int dump_count;
+    char path[128];
+    int fd;
+
+    /* OHOS: dump first few flushes to BMP files for verification */
+    if (dump_count < 5 && color_info && color_bits)
+    {
+        BITMAPFILEHEADER bf;
+        snprintf( path, sizeof(path), "/storage/Users/currentUser/workspace/wine/wine_surface_%d_%dx%d.bmp",
+                  dump_count, color_info->bmiHeader.biWidth, abs(color_info->bmiHeader.biHeight) );
+        fd = open( path, O_WRONLY | O_CREAT | O_TRUNC, 0666 );
+        if (fd >= 0)
+        {
+            DWORD image_size = color_info->bmiHeader.biSizeImage;
+            DWORD header_size = sizeof(BITMAPINFOHEADER);
+            bf.bfType = 0x4d42; /* 'BM' */
+            bf.bfSize = sizeof(bf) + header_size + image_size;
+            bf.bfReserved1 = bf.bfReserved2 = 0;
+            bf.bfOffBits = sizeof(bf) + header_size;
+            write( fd, &bf, sizeof(bf) );
+            write( fd, &color_info->bmiHeader, header_size );
+            write( fd, color_bits, image_size );
+            close( fd );
+            MESSAGE( "OHOS: dumped surface %d to %s\n", dump_count, path );
+        }
+        dump_count++;
+    }
     return TRUE;
 }
 

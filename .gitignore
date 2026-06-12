@@ -1,0 +1,15 @@
+# Build output
+build-native/
+build-ohos/
+build-ohos-arm64/
+
+# Backup files
+*.bak
+
+# Object files
+*.o
+*.a
+
+# Editor
+*.swp
+*~

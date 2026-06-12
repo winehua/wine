@@ -36,6 +36,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/ioctl.h>
 #ifdef HAVE_SYS_SYSINFO_H
 # include <sys/sysinfo.h>
@@ -591,6 +592,8 @@ static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
 {
     void *ptr;
 
+/* OHOS: Box64 wrapped mmap does not support MAP_FIXED_NOREPLACE */
+#undef MAP_FIXED_NOREPLACE
 #ifdef MAP_FIXED_NOREPLACE
     ptr = mmap( start, size, prot, MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON | flags, -1, 0 );
 #elif defined(MAP_TRYFIXED)
@@ -1939,9 +1942,23 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
     if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
     {
         TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
-        if (!mprotect( base, size, unix_prot | PROT_EXEC )) return 0;
+        /* OHOS: temporarily enable exec on noexec filesystem */
+        prctl( 0x6a6974, 0, 0 );
+        if (!mprotect( base, size, unix_prot | PROT_EXEC )) { prctl( 0x6a6974, 0, 1 ); return 0; }
+        prctl( 0x6a6974, 0, 1 );
         /* exec + write may legitimately fail, in that case fall back to write only */
         if (!(unix_prot & PROT_WRITE)) return -1;
+        /* fall through to regular mprotect without exec */
+    }
+
+    /* OHOS: for noexec filesystem, wrap any PROT_EXEC mprotect with prctl */
+    if (unix_prot & PROT_EXEC)
+    {
+        int ret;
+        prctl( 0x6a6974, 0, 0 );
+        ret = mprotect( base, size, unix_prot );
+        prctl( 0x6a6974, 0, 1 );
+        return ret;
     }
 
     return mprotect( base, size, unix_prot );
@@ -3170,10 +3187,40 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         end = file_start + file_size;
         if (sec[i].PointerToRawData >= st.st_size ||
             end > ((st.st_size + sector_align) & ~sector_align) ||
-            end < file_start ||
-            map_file_into_view( view, fd, sec[i].VirtualAddress, file_size, file_start,
-                                VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY,
-                                removable ) != STATUS_SUCCESS)
+            end < file_start)
+        {
+            ERR_(module)( "Could not map %s section %.8s, file probably truncated\n",
+                          debugstr_us(nt_name), sec[i].Name );
+            goto done;
+        }
+
+        /* OHOS: for executable sections, use anonymous memory to avoid noexec filesystem */
+        if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+        {
+            char *sec_addr = (char *)view->base + sec[i].VirtualAddress;
+            size_t sec_offset = sec[i].VirtualAddress & host_page_mask;
+            size_t sec_map_size = ROUND_SIZE( sec[i].VirtualAddress, file_size, host_page_mask );
+
+            prctl( 0x6a6974, 0, 0 );
+            if (mmap( sec_addr - sec_offset, sec_map_size + sec_offset,
+                      PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0 ) == MAP_FAILED)
+            {
+                prctl( 0x6a6974, 0, 1 );
+                ERR_(module)( "Could not map %s section %.8s with anon mmap\n",
+                              debugstr_us(nt_name), sec[i].Name );
+                goto done;
+            }
+            prctl( 0x6a6974, 0, 1 );
+            if (pread( fd, sec_addr, file_size, file_start ) != (ssize_t)file_size)
+            {
+                ERR_(module)( "Could not read %s section %.8s\n",
+                              debugstr_us(nt_name), sec[i].Name );
+                goto done;
+            }
+        }
+        else if (map_file_into_view( view, fd, sec[i].VirtualAddress, file_size, file_start,
+                                     VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY,
+                                     removable ) != STATUS_SUCCESS)
         {
             ERR_(module)( "Could not map %s section %.8s, file probably truncated\n",
                           debugstr_us(nt_name), sec[i].Name );
@@ -4053,29 +4100,43 @@ TEB *virtual_alloc_first_teb(void)
     SIZE_T total = 32 * block_size;
     struct thread_data *thread_data;
 
+    ERR("OHOS-DBG: virtual_alloc_first_teb START\n");
+
     /* reserve space for shared user data */
+    ERR("OHOS-DBG: step1 - NtAllocateVirtualMemory for user_shared_data (size=0x%lx)...\n", (unsigned long)data_size);
     status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
                                       MEM_RESERVE | MEM_COMMIT, PAGE_READONLY );
+    ERR("OHOS-DBG: step1 done - status=%u, user_shared_data=%p\n", status, user_shared_data);
     if (status)
     {
         ERR( "wine: failed to map the shared user data: %08x\n", status );
         exit(1);
     }
 
+    ERR("OHOS-DBG: step2 - NtAllocateVirtualMemory for teb_block (total=0x%lx)...\n", (unsigned long)total);
     NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, is_win64 ? limit_2g - 1 : 0, &total,
-                             MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
+                             MEM_RESERVE, PAGE_READWRITE );  /* OHOS: skip MEM_TOP_DOWN for Box64 */
+    ERR("OHOS-DBG: step2 done - teb_block=%p\n", teb_block);
     teb_block_pos = 30;
     ptr = (char *)teb_block + 30 * block_size;
     data_size = 2 * block_size;
+    ERR("OHOS-DBG: step3 - NtAllocateVirtualMemory MEM_COMMIT (ptr=%p, size=0x%lx)...\n", ptr, (unsigned long)data_size);
     NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &data_size, MEM_COMMIT, PAGE_READWRITE );
+    ERR("OHOS-DBG: step3 done - ptr=%p\n", ptr);
     peb = (PEB *)((char *)teb_block + 31 * block_size + (is_win64 ? 0 : page_size));
+    ERR("OHOS-DBG: step4 - calling init_teb(ptr=%p, FALSE)...\n", ptr);
     teb = init_teb( ptr, FALSE );
+    ERR("OHOS-DBG: step4 done - teb=%p\n", teb);
 
+    ERR("OHOS-DBG: step5 - calling virtual_alloc_thread_data()...\n");
     thread_data = virtual_alloc_thread_data();
+    ERR("OHOS-DBG: step5 done - thread_data=%p\n", thread_data);
     thread_data->teb = teb;
     list_add_head( &teb_list, &thread_data->entry );
+    ERR("OHOS-DBG: step6 - pthread_key_create...\n");
     pthread_key_create( &thread_data_key, NULL );
     pthread_setspecific( thread_data_key, thread_data );
+    ERR("OHOS-DBG: virtual_alloc_first_teb DONE, returning teb=%p\n", teb);
     return teb;
 }
 
@@ -4136,15 +4197,29 @@ struct thread_data *virtual_alloc_thread_data(void)
 {
     NTSTATUS status;
     sigset_t sigset;
-    struct file_view *view;
+    struct file_view *view = NULL;
     struct thread_data *data = NULL;
     SIZE_T size = signal_stack_mask + 1 + kernel_stack_size;
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED, limit_4g, 0, 0 );
+    ERR("OHOS-DBG: virtual_alloc_thread_data map_view status=%u, size=0x%lx\n", status, (unsigned long)size);
     if (!status)
     {
         data = view->base;
+        ERR("OHOS-DBG: virtual_alloc_thread_data OK via map_view, data=%p\n", data);
+    }
+    else
+    {
+        /* OHOS: fallback to anon_mmap for Box64 compatibility */
+        ERR("OHOS-DBG: map_view failed, falling back to anon_mmap_alloc...\n");
+        data = anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
+        ERR("OHOS-DBG: anon_mmap_alloc returned %p\n", data);
+        if (data != MAP_FAILED)
+            status = 0;
+    }
+    if (!status)
+    {
         data->request_fd = -1;
         data->reply_fd   = -1;
         data->wait_fd[0] = -1;
@@ -4153,7 +4228,7 @@ struct thread_data *virtual_alloc_thread_data(void)
 #ifdef VALGRIND_STACK_REGISTER
         VALGRIND_STACK_REGISTER( (char *)data + signal_stack_mask + 1, (char *)data + view->size );
 #endif
-        VIRTUAL_DEBUG_DUMP_VIEW( view );
+        if (view) VIRTUAL_DEBUG_DUMP_VIEW( view );
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     return data;
