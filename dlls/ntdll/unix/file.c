@@ -2361,6 +2361,7 @@ static unsigned int get_drives_info( struct file_identity info[MAX_DOS_DRIVES] )
     memcpy( info, cache, sizeof(cache) );
     ret = nb_drives;
     mutex_unlock( &cache_mutex );
+    if (!ret) ERR( "get_drives_info: no DOS drives found (dosdevices symlinks missing in %s)\n", config_dir );
     return ret;
 }
 
@@ -4337,10 +4338,15 @@ NTSTATUS unix_to_nt_file_name( const char *unix_name, WCHAR **nt, UINT dispositi
     if (!name) return STATUS_NO_MEMORY;
     status = find_drive_nt_root( name, len - 1, &buffer, disposition );
     free( name );
-    if (status && status != STATUS_NO_SUCH_FILE) return status;
-
-    if (!buffer)  /* conversion failed, return \\?\unix path */
+    if (status && status != STATUS_NO_SUCH_FILE && status != STATUS_OBJECT_PATH_NOT_FOUND)
     {
+        ERR( "unix_to_nt_file_name: find_drive_nt_root failed status=%08x for %s\n", status, unix_name );
+        return status;
+    }
+
+    if (!buffer)  /* dosdevices symlinks unavailable, fall back to \\?\unix path */
+    {
+        TRACE( "unix_to_nt_file_name: using \\??\\unix fallback for %s (status=%08x)\n", unix_name, status );
         if (!(buffer = malloc( sizeof(unix_prefixW) + len * sizeof(WCHAR) ))) return STATUS_NO_MEMORY;
         memcpy( buffer, unix_prefixW, sizeof(unix_prefixW) );
         ntdll_umbstowcs( unix_name, len, buffer + ARRAY_SIZE(unix_prefixW), len );
