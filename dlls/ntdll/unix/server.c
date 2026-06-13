@@ -1350,8 +1350,10 @@ static int setup_config_dir(void)
     if (!mkdir( "dosdevices", 0777 ))
     {
         mkdir( "drive_c", 0777 );
-        symlink( "../drive_c", "dosdevices/c:" );
-        symlink( "/", "dosdevices/z:" );
+        if (symlink( "../drive_c", "dosdevices/c:" ) == -1)
+            MESSAGE( "wine: symlink dosdevices/c: → ../drive_c failed: %s\n", strerror(errno) );
+        if (symlink( "/", "dosdevices/z:" ) == -1)
+            MESSAGE( "wine: symlink dosdevices/z: → / failed: %s\n", strerror(errno) );
     }
     else if (errno != EEXIST) fatal_perror( "cannot create %s/dosdevices", config_dir );
 
