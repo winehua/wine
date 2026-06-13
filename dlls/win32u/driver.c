@@ -25,6 +25,7 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <stdlib.h>
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -1011,6 +1012,25 @@ static void load_display_driver(void)
 
     if (is_service_process() || !load_desktop_driver( get_desktop_window() ) || user_driver == &lazy_load_driver)
     {
+#ifdef __OHOS__
+        /* OHOS: services.exe cannot start, PnP enumeration doesn't work.
+         * When WAYLAND_DISPLAY is set, try loading the Wayland driver
+         * directly, bypassing the registry/PnP mechanism. */
+        if (getenv("WAYLAND_DISPLAY"))
+        {
+            static const WCHAR winewaylandW[] = {'w','i','n','e','w','a','y','l','a','n','d','.','d','r','v',0};
+            void *ret_ptr;
+            ULONG ret_len;
+            ERR("OHOS: attempting direct Wayland driver load (bypass PnP)\n");
+            if (!KeUserModeCallback( NtUserLoadDriver, winewaylandW, sizeof(winewaylandW),
+                                     &ret_ptr, &ret_len ))
+            {
+                ERR("OHOS: Wayland driver loaded successfully via bypass\n");
+                return;
+            }
+            ERR("OHOS: Wayland driver bypass FAILED, falling back to null driver\n");
+        }
+#endif
         winstation = NtUserGetProcessWindowStation();
         if (!NtUserGetObjectInformation( winstation, UOI_FLAGS, &flags, sizeof(flags), NULL )
             || (flags.dwFlags & WSF_VISIBLE))
