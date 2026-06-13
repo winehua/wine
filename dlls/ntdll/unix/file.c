@@ -3356,6 +3356,16 @@ static NTSTATUS get_dos_device( char **unix_name, int start_pos )
             dev[2] = 0;  /* remove last ':' to get the drive mount point symlink */
             new_name = get_default_drive_device( *unix_name );
         }
+#ifdef __OHOS__
+        /* OHOS: symlink not available, fall back to default drive mapping */
+        if (!new_name && dev[1] == ':')
+        {
+            if (dev[0] == 'z')
+                new_name = strdup( "/" );
+            else if (dev[0] >= 'c' && dev[0] <= 'y')
+                asprintf( &new_name, "%s/drive_%c", config_dir, dev[0] );
+        }
+#endif
         free( *unix_name );
         *unix_name = new_name;
         if (!new_name) return STATUS_BAD_DEVICE_TYPE;
@@ -3789,6 +3799,29 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
         return get_dos_device( unix_name_ret, pos );
     }
     pos += ret;
+
+#ifdef __OHOS__
+    /* OHOS: symlink() not available in NAPI sandbox. For drive letter
+     * prefixes, fall back to hardcoded default directory paths.
+     * c: → $WINEPREFIX/drive_c, ..., z: → / */
+    if (prefix_len == 2 && prefix[1] == ':')
+    {
+        unix_name[pos] = 0;  /* null-terminate the prefix for lstat */
+        if (lstat( unix_name, &st ) == -1)
+        {
+            if (prefix[0] == 'z')
+            {
+                strcpy( unix_name, "/" );
+                pos = 1;
+            }
+            else if (prefix[0] >= 'c' && prefix[0] <= 'y')
+            {
+                pos = snprintf( unix_name, unix_len, "%s/drive_%c",
+                                config_dir, prefix[0] );
+            }
+        }
+    }
+#endif
 
     /* check if prefix exists (except for DOS drives to avoid extra stat calls) */
 

@@ -1358,6 +1358,9 @@ static int setup_config_dir(void)
     else if (errno != EEXIST) fatal_perror( "cannot create %s/dosdevices", config_dir );
 
     if (fd_cwd == -1) fd_cwd = open( "dosdevices/c:", O_RDONLY );
+#ifdef __OHOS__
+    if (fd_cwd == -1) fd_cwd = open( "drive_c", O_RDONLY );
+#endif
     fcntl( fd_cwd, F_SETFD, FD_CLOEXEC );
     return fd_cwd;
 }
