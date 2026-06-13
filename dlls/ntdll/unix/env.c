@@ -986,7 +986,12 @@ static void add_path_var( WCHAR **env, SIZE_T *pos, SIZE_T *size, const char *na
 {
     WCHAR *nt_name = NULL;
 
-    if (path && unix_to_nt_file_name( path, &nt_name, FILE_OPEN )) return;
+    if (path && unix_to_nt_file_name( path, &nt_name, FILE_OPEN ))
+    {
+        /* OHOS-DEBUG */
+        return;
+    }
+    /* OHOS-DEBUG */
     append_envW( env, pos, size, name, nt_name );
     free( nt_name );
 }

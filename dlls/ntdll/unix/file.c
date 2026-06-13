@@ -2361,7 +2361,7 @@ static unsigned int get_drives_info( struct file_identity info[MAX_DOS_DRIVES] )
     memcpy( info, cache, sizeof(cache) );
     ret = nb_drives;
     mutex_unlock( &cache_mutex );
-    if (!ret) ERR( "get_drives_info: no DOS drives found (dosdevices symlinks missing in %s)\n", config_dir );
+    /* OHOS: expected — symlinks not available. Logged once at startup. */
     return ret;
 }
 
@@ -3775,6 +3775,7 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
         /* allow slash for unix namespace */
         if (pos > 4 && prefix[4] == '/') pos = 4;
         is_unix = pos == 4;
+        /* OHOS-DEBUG */
     }
     prefix_len = pos;
     prefix[prefix_len] = 0;
@@ -4346,11 +4347,12 @@ NTSTATUS unix_to_nt_file_name( const char *unix_name, WCHAR **nt, UINT dispositi
 
     if (!buffer)  /* dosdevices symlinks unavailable, fall back to \\?\unix path */
     {
-        TRACE( "unix_to_nt_file_name: using \\??\\unix fallback for %s (status=%08x)\n", unix_name, status );
+        /* OHOS-DEBUG */
         if (!(buffer = malloc( sizeof(unix_prefixW) + len * sizeof(WCHAR) ))) return STATUS_NO_MEMORY;
         memcpy( buffer, unix_prefixW, sizeof(unix_prefixW) );
         ntdll_umbstowcs( unix_name, len, buffer + ARRAY_SIZE(unix_prefixW), len );
         collapse_path( buffer );
+        status = STATUS_SUCCESS;  /* fallback succeeded, clear error */
     }
 
     *nt = buffer;
@@ -4435,6 +4437,7 @@ NTSTATUS get_nt_and_unix_names( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *nt_name
         if (!unix_name) return STATUS_NO_MEMORY;
         lenA = ntdll_wcstoumbs( name, lenW, unix_name, lenW * 3, FALSE );
         for (ULONG i = 0; i < lenA; i++) if (unix_name[i] == '\\') unix_name[i] = '/';
+        unix_name[lenA] = 0;  /* ensure null termination */
 
         status = find_drive_nt_root( unix_name, lenA, &buffer, disposition );
         if (buffer)
@@ -4442,6 +4445,12 @@ NTSTATUS get_nt_and_unix_names( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *nt_name
             init_unicode_string( nt_name, buffer );
             attr->ObjectName = nt_name;
         }
+#ifdef __OHOS__
+        /* OHOS: dosdevices symlinks not available. The unix path extracted
+         * from \\?\unix\ is valid even if no DOS drive was found.
+         * Return SUCCESS so NtCreateFile will call open_unix_file. */
+        if (!buffer) status = STATUS_SUCCESS;
+#endif
     }
     else
     {

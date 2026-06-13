@@ -2710,6 +2710,7 @@ static NTSTATUS open_dll_file( UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDL
                               FILE_SHARE_READ | FILE_SHARE_DELETE,
                               FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE )))
     {
+        /* OHOS-DEBUG */
         if (status != STATUS_OBJECT_PATH_NOT_FOUND &&
             status != STATUS_OBJECT_NAME_NOT_FOUND &&
             !NtQueryAttributesFile( &attr, &info ))
@@ -2720,6 +2721,7 @@ static NTSTATUS open_dll_file( UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDL
         /* otherwise continue searching */
         return STATUS_DLL_NOT_FOUND;
     }
+    /* OHOS-DEBUG */
 
     if (!NtFsControlFile( handle, 0, NULL, NULL, &io, FSCTL_GET_OBJECT_ID, NULL, 0, &fid, sizeof(fid) ))
     {
@@ -3157,6 +3159,7 @@ static NTSTATUS find_builtin_without_file( const WCHAR *name, UNICODE_STRING *ne
 
     if (!is_prefix_bootstrap)
     {
+        /* OHOS-DEBUG */
         /* 16-bit files can't be loaded from the prefix */
         if (!name[1] || wcscmp( name + wcslen(name) - 2, L"16" )) return status;
     }
@@ -3188,16 +3191,19 @@ static NTSTATUS find_builtin_without_file( const WCHAR *name, UNICODE_STRING *ne
     {
         swprintf( dllpath, ARRAY_SIZE(dllpath), L"WINEDLLDIR%u", i );
         if (get_env_var( dllpath, wcslen(pe_dir) + wcslen(name) + 1, new_name )) break;
+  /* OHOS-DEBUG */
         len = new_name->Length;
         RtlAppendUnicodeToString( new_name, pe_dir );
         RtlAppendUnicodeToString( new_name, L"\\" );
         RtlAppendUnicodeToString( new_name, name );
         status = open_dll_file( new_name, pwm, mapping, image_info, id );
+        /* OHOS-DEBUG */
         if (status != STATUS_DLL_NOT_FOUND) goto done;
         new_name->Length = len;
         RtlAppendUnicodeToString( new_name, L"\\" );
         RtlAppendUnicodeToString( new_name, name );
         status = open_dll_file( new_name, pwm, mapping, image_info, id );
+        /* OHOS-DEBUG */
         if (status == STATUS_NOT_SUPPORTED) found_image = TRUE;
         else if (status != STATUS_DLL_NOT_FOUND) goto done;
         RtlFreeUnicodeString( new_name );
@@ -3246,9 +3252,15 @@ static NTSTATUS search_dll_file( LPCWSTR paths, LPCWSTR search, UNICODE_STRING *
         wcscpy( name + len, search );
 
         nt_name->Buffer = NULL;
-        if ((status = RtlDosPathNameToNtPathName_U_WithStatus( name, nt_name, NULL, NULL ))) goto done;
+        if ((status = RtlDosPathNameToNtPathName_U_WithStatus( name, nt_name, NULL, NULL )))
+        {
+            /* OHOS-DEBUG */
+            goto done;
+        }
 
+        /* OHOS-DEBUG */
         status = open_dll_file( nt_name, pwm, mapping, image_info, id );
+        /* OHOS-DEBUG */
         if (status == STATUS_NOT_SUPPORTED) found_image = TRUE;
         else if (status != STATUS_DLL_NOT_FOUND) goto done;
         RtlFreeUnicodeString( nt_name );
