@@ -1680,9 +1680,11 @@ static void update_wineprefix( BOOL force )
         HANDLE process;
         DWORD count = 0;
 
+        WINE_ERR("wineboot: starting PreInstall\n");
         if ((process = start_rundll32( inf_path, L"PreInstall", IMAGE_FILE_MACHINE_TARGET_HOST )))
         {
             HWND hwnd = show_wait_window();
+            WINE_ERR("wineboot: PreInstall started, waiting for completion\n");
             for (;;)
             {
                 if (process)
@@ -1694,21 +1696,29 @@ static void update_wineprefix( BOOL force )
                         while (PeekMessageW( &msg, 0, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
                         continue;
                     }
+                    WINE_ERR("wineboot: rundll32 process completed\n");
                     CloseHandle( process );
                 }
                 if (!machines[count].Machine) break;
+                WINE_ERR("wineboot: starting install for machine %u (native=%d)\n",
+                         machines[count].Machine, machines[count].Native);
                 if (machines[count].Native)
                     process = start_rundll32( inf_path, L"DefaultInstall", IMAGE_FILE_MACHINE_TARGET_HOST );
                 else
                     process = start_rundll32( inf_path, L"Wow64Install", machines[count].Machine );
                 count++;
             }
+            WINE_ERR("wineboot: all installs complete, destroying wait window\n");
             DestroyWindow( hwnd );
+        } else {
+            WINE_ERR("wineboot: PreInstall failed to start!\n");
         }
+        WINE_ERR("wineboot: calling install_root_pnp_devices\n");
         install_root_pnp_devices();
+        WINE_ERR("wineboot: calling update_user_profile\n");
         update_user_profile();
 
-        TRACE( "wine: configuration in %s has been updated.\n", debugstr_w(prettyprint_configdir()) );
+        WINE_ERR("wineboot: prefix update complete\n");
     }
 
 done:

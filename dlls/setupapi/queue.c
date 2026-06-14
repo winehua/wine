@@ -1387,6 +1387,7 @@ BOOL WINAPI SetupCommitFileQueueW( HWND owner, HSPFILEQ handle, PSP_FILE_CALLBAC
 
     if (queue->delete_queue.count)
     {
+        ERR( "SETUPAPI-COMMIT: delete queue (%u files)\n", queue->delete_queue.count );
         if (!(handler( context, SPFILENOTIFY_STARTSUBQUEUE, FILEOP_DELETE,
                        queue->delete_queue.count ))) goto done;
         for (op = queue->delete_queue.head; op; op = op->next)
@@ -1411,6 +1412,7 @@ BOOL WINAPI SetupCommitFileQueueW( HWND owner, HSPFILEQ handle, PSP_FILE_CALLBAC
 
     if (queue->rename_queue.count)
     {
+        ERR( "SETUPAPI-COMMIT: rename queue (%u files)\n", queue->rename_queue.count );
         if (!(handler( context, SPFILENOTIFY_STARTSUBQUEUE, FILEOP_RENAME,
                        queue->rename_queue.count ))) goto done;
         for (op = queue->rename_queue.head; op; op = op->next)
@@ -1436,6 +1438,7 @@ BOOL WINAPI SetupCommitFileQueueW( HWND owner, HSPFILEQ handle, PSP_FILE_CALLBAC
 
     if (queue->copy_queue.count)
     {
+        ERR( "SETUPAPI-COMMIT: copy queue (%u files)\n", queue->copy_queue.count );
         if (!(handler( context, SPFILENOTIFY_STARTSUBQUEUE, FILEOP_COPY,
                        queue->copy_queue.count ))) goto done;
         for (op = queue->copy_queue.head; op; op = op->next)
@@ -1444,6 +1447,8 @@ BOOL WINAPI SetupCommitFileQueueW( HWND owner, HSPFILEQ handle, PSP_FILE_CALLBAC
 
             if (!op->media->resolved)
             {
+                ERR( "SETUPAPI-COMMIT: NEEDMEDIA path op=%p media=%p src_file=%s\n",
+                     op, op->media, debugstr_w(op->src_file) );
                 /* The NEEDMEDIA callback asks for the folder containing the
                  * first file, but that might be in a subdir of the source
                  * disk's root directory. We have to do some contortions to
@@ -1457,6 +1462,7 @@ BOOL WINAPI SetupCommitFileQueueW( HWND owner, HSPFILEQ handle, PSP_FILE_CALLBAC
                 src_path[0] = 0;
                 if (op->src_path)
                 {
+                    ERR( "SETUPAPI-COMMIT: NEEDMEDIA src_path=%s\n", debugstr_w(op->src_path) );
                     lstrcpyW(src_path, op->src_path);
                     path_len = lstrlenW(src_path);
 
@@ -1467,8 +1473,18 @@ BOOL WINAPI SetupCommitFileQueueW( HWND owner, HSPFILEQ handle, PSP_FILE_CALLBAC
                     op->src_path = NULL;
                 }
 
-                for (;;)
+                ERR( "SETUPAPI-COMMIT: NEEDMEDIA entering for(;;) loop, root=%s tag=%s\n",
+                     debugstr_w(op->media->root), debugstr_w(op->media->tag) );
                 {
+                    int needmedia_retries = 0;
+                    for (;;)
+                {
+                    if (++needmedia_retries > 10)
+                    {
+                        ERR( "SETUPAPI-COMMIT: NEEDMEDIA giving up after %d retries for src_file=%s\n",
+                             needmedia_retries, debugstr_w(op->src_file) );
+                        break;
+                    }
                     SOURCE_MEDIA_W media;
                     media.Reserved = NULL;
                     media.Tagfile = op->media->tag;
@@ -1507,7 +1523,9 @@ BOOL WINAPI SetupCommitFileQueueW( HWND owner, HSPFILEQ handle, PSP_FILE_CALLBAC
                                 op->media->root[root_len - path_len - 1] = 0;
                         }
                         op->media->resolved = TRUE;
+                        ERR( "SETUPAPI-COMMIT: ENDCOPY(needmedia) for %s\n", debugstr_w(paths.Target) );
                         handler( context, SPFILENOTIFY_ENDCOPY, (UINT_PTR)&paths, 0 );
+                        ERR( "SETUPAPI-COMMIT: ENDCOPY(needmedia) handler returned\n" );
                         break;
                     }
                     paths.Win32Error = GetLastError();
@@ -1529,10 +1547,13 @@ BOOL WINAPI SetupCommitFileQueueW( HWND owner, HSPFILEQ handle, PSP_FILE_CALLBAC
                     else if (op_result != FILEOP_DOIT)
                         FIXME("Unhandled return value %#x.\n", op_result);
                 }
+                }
             }
             else
             {
                 build_filepathsW( op, &paths );
+                ERR( "SETUPAPI-COMMIT: copying %s -> %s\n",
+                     debugstr_w(paths.Source), debugstr_w(paths.Target) );
                 op_result = handler( context, SPFILENOTIFY_STARTCOPY, (UINT_PTR)&paths, FILEOP_COPY );
                 if (op_result == FILEOP_ABORT)
                     goto done;
@@ -1559,19 +1580,26 @@ BOOL WINAPI SetupCommitFileQueueW( HWND owner, HSPFILEQ handle, PSP_FILE_CALLBAC
                     else if (op_result != FILEOP_SKIP && op_result != FILEOP_DOIT)
                         FIXME("Unhandled return value %#x.\n", op_result);
                 }
+                ERR( "SETUPAPI-COMMIT: ENDCOPY for %s\n", debugstr_w(paths.Target) );
                 handler( context, SPFILENOTIFY_ENDCOPY, (UINT_PTR)&paths, 0 );
+                ERR( "SETUPAPI-COMMIT: ENDCOPY handler returned for %s\n", debugstr_w(paths.Target) );
             }
         }
+        ERR( "SETUPAPI-COMMIT: calling ENDSUBQUEUE for copy\n" );
         handler( context, SPFILENOTIFY_ENDSUBQUEUE, FILEOP_COPY, 0 );
+        ERR( "SETUPAPI-COMMIT: copy queue done\n" );
     }
 
 
     result = TRUE;
 
  done:
+    ERR( "SETUPAPI-COMMIT: ENDQUEUE callback (result=%d)\n", result );
     handler( context, SPFILENOTIFY_ENDQUEUE, result, 0 );
+    ERR( "SETUPAPI-COMMIT: ENDQUEUE callback done\n" );
     HeapFree( GetProcessHeap(), 0, (void *)paths.Source );
     HeapFree( GetProcessHeap(), 0, (void *)paths.Target );
+    ERR( "SETUPAPI-COMMIT: SetupCommitFileQueueW complete\n" );
     return result;
 }
 

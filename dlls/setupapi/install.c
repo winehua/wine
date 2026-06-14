@@ -807,9 +807,10 @@ static BOOL install_section_callback( HINF hinf, PCWSTR field, void *arg )
 {
     struct install_section_callback_info *info = arg;
 
-    TRACE( "installing %s\n", debugstr_w(field) );
+    ERR( "SETUPAPI: section_callback for %s\n", debugstr_w(field) );
     SetupInstallFromInfSectionW( info->hwnd, hinf, field, SPINST_ALL, NULL, NULL, SP_COPY_NEWER,
                                  info->callback, info->callback_context, NULL, NULL );
+    ERR( "SETUPAPI: section_callback for %s done\n", debugstr_w(field) );
     return TRUE;
 }
 
@@ -1148,37 +1149,47 @@ BOOL WINAPI SetupInstallFromInfSectionW( HWND owner, HINF hinf, PCWSTR section, 
 
     if (flags & SPINST_REGSVR)
     {
+        ERR( "SETUPAPI: [%s] WineFakeDlls start\n", debugstr_w(section) );
         if (iterate_section_fields( hinf, section, L"WineFakeDlls", fake_dlls_callback, NULL ))
             cleanup_fake_dlls();
         else
             return FALSE;
+        ERR( "SETUPAPI: [%s] WineFakeDlls done\n", debugstr_w(section) );
     }
     if (flags & SPINST_FILES)
     {
         HSPFILEQ queue;
 
+        ERR( "SETUPAPI: [%s] CopyFiles start\n", debugstr_w(section) );
         if (!(queue = SetupOpenFileQueue())) return FALSE;
         ret = (SetupInstallFilesFromInfSectionW( hinf, NULL, queue, section, src_root, copy_flags ) &&
                SetupCommitFileQueueW( owner, queue, callback, context ));
         SetupCloseFileQueue( queue );
         if (!ret) return FALSE;
+        ERR( "SETUPAPI: [%s] CopyFiles done\n", debugstr_w(section) );
     }
     if (flags & SPINST_INIFILES)
     {
+        ERR( "SETUPAPI: [%s] UpdateInis start\n", debugstr_w(section) );
         if (!iterate_section_fields( hinf, section, L"UpdateInis", update_ini_callback, NULL ) ||
             !iterate_section_fields( hinf, section, L"UpdateIniFields",
                                      update_ini_fields_callback, NULL ))
             return FALSE;
+        ERR( "SETUPAPI: [%s] UpdateInis done\n", debugstr_w(section) );
     }
     if (flags & SPINST_INI2REG)
     {
+        ERR( "SETUPAPI: [%s] Ini2Reg start\n", debugstr_w(section) );
         if (!iterate_section_fields( hinf, section, L"Ini2Reg", ini2reg_callback, NULL ))
             return FALSE;
+        ERR( "SETUPAPI: [%s] Ini2Reg done\n", debugstr_w(section) );
     }
     if (flags & SPINST_LOGCONFIG)
     {
+        ERR( "SETUPAPI: [%s] LogConf start\n", debugstr_w(section) );
         if (!iterate_section_fields( hinf, section, L"LogConf", logconf_callback, NULL ))
             return FALSE;
+        ERR( "SETUPAPI: [%s] LogConf done\n", debugstr_w(section) );
     }
     if (flags & SPINST_REGSVR)
     {
@@ -1191,6 +1202,7 @@ BOOL WINAPI SetupInstallFromInfSectionW( HWND owner, HINF hinf, PCWSTR section, 
             info.callback_context = context;
         }
 
+        ERR( "SETUPAPI: [%s] RegisterDlls start\n", debugstr_w(section) );
         hr = CoInitialize(NULL);
 
         ret = iterate_section_fields( hinf, section, L"RegisterDlls", register_dlls_callback, &info );
@@ -1200,10 +1212,12 @@ BOOL WINAPI SetupInstallFromInfSectionW( HWND owner, HINF hinf, PCWSTR section, 
             CoUninitialize();
 
         free( info.modules );
+        ERR( "SETUPAPI: [%s] RegisterDlls done (ret=%d)\n", debugstr_w(section), ret );
         if (!ret) return FALSE;
     }
     if (flags & SPINST_UNREGSVR)
     {
+        ERR( "SETUPAPI: [%s] UnregisterDlls start\n", debugstr_w(section) );
         struct register_dll_info info = { .unregister = TRUE };
         HRESULT hr;
 
@@ -1222,12 +1236,14 @@ BOOL WINAPI SetupInstallFromInfSectionW( HWND owner, HINF hinf, PCWSTR section, 
             CoUninitialize();
 
         free( info.modules );
+        ERR( "SETUPAPI: [%s] UnregisterDlls done\n", debugstr_w(section) );
         if (!ret) return FALSE;
     }
     if (flags & SPINST_REGISTRY)
     {
         struct registry_callback_info info;
 
+        ERR( "SETUPAPI: [%s] AddReg/DelReg start\n", debugstr_w(section) );
         info.default_root = key_root;
         info.delete = TRUE;
         if (!iterate_section_fields( hinf, section, L"DelReg", registry_callback, &info ))
@@ -1235,6 +1251,7 @@ BOOL WINAPI SetupInstallFromInfSectionW( HWND owner, HINF hinf, PCWSTR section, 
         info.delete = FALSE;
         if (!iterate_section_fields( hinf, section, L"AddReg", registry_callback, &info ))
             return FALSE;
+        ERR( "SETUPAPI: [%s] AddReg/DelReg done\n", debugstr_w(section) );
     }
     if (flags & SPINST_BITREG)
     {
@@ -1288,17 +1305,28 @@ void WINAPI InstallHinfSectionW( HWND hwnd, HINSTANCE handle, LPCWSTR cmdline, I
     if (hinf == INVALID_HANDLE_VALUE) return;
 
     SetupDiGetActualSectionToInstallW( hinf, section, section, ARRAY_SIZE(section), NULL, NULL );
-    TRACE( "using section %s\n", debugstr_w(section) );
+    ERR( "SETUPAPI: processing section %s\n", debugstr_w(section) );
 
     iterate_section_fields( hinf, section, L"Include", include_callback, NULL );
+    ERR( "SETUPAPI: Include done, starting install_section_callback\n" );
 
     info.callback_context = SetupInitDefaultQueueCallback( hwnd );
     install_section_callback( hinf, section, &info );
+    ERR( "SETUPAPI: install_section_callback (%s) done\n", debugstr_w(section) );
+
+    ERR( "SETUPAPI: starting Needs iteration for %s\n", debugstr_w(section) );
     iterate_section_fields( hinf, section, L"Needs", install_section_callback, &info );
+    ERR( "SETUPAPI: Needs iteration done for %s\n", debugstr_w(section) );
+
     SetupTermDefaultQueueCallback( info.callback_context );
+    ERR( "SETUPAPI: Needs done, starting Services install (%s)\n", debugstr_w(section) );
+
     lstrcatW( section, L".Services" );
     SetupInstallServicesFromInfSectionW( hinf, section, 0 );
+    ERR( "SETUPAPI: Services install done\n" );
+
     SetupCloseInfFile( hinf );
+    ERR( "SETUPAPI: InstallHinfSectionW complete\n" );
 
     /* FIXME: should check the mode and maybe reboot */
     /* there isn't much point in doing that since we */
@@ -1496,12 +1524,20 @@ BOOL WINAPI SetupInstallServicesFromInfSectionW( HINF hinf, PCWSTR section, DWOR
     INT section_flags;
     BOOL ret = TRUE;
 
+    ERR( "SETUPAPI: installing services for section=%s\n", debugstr_w(section) );
+
     if (!SetupFindFirstLineW( hinf, section, NULL, &context ))
     {
         SetLastError( ERROR_SECTION_NOT_FOUND );
         return FALSE;
     }
-    if (!(scm = OpenSCManagerW( NULL, NULL, SC_MANAGER_ALL_ACCESS ))) return FALSE;
+    ERR( "SETUPAPI: calling OpenSCManagerW...\n" );
+    if (!(scm = OpenSCManagerW( NULL, NULL, SC_MANAGER_ALL_ACCESS )))
+    {
+        ERR( "SETUPAPI: OpenSCManagerW FAILED (err=%lu)\n", GetLastError() );
+        return FALSE;
+    }
+    ERR( "SETUPAPI: OpenSCManagerW OK, scm=%p\n", scm );
 
     if (SetupFindFirstLineW( hinf, section, L"AddService", &context ))
     {
@@ -1529,6 +1565,7 @@ BOOL WINAPI SetupInstallServicesFromInfSectionW( HINF hinf, PCWSTR section, DWOR
     }
     if (ret) SetLastError( ERROR_SUCCESS );
  done:
+    ERR( "SETUPAPI: services install done, closing SCM (ret=%d)\n", ret );
     CloseServiceHandle( scm );
     return ret;
 }

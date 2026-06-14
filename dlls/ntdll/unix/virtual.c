@@ -1942,22 +1942,21 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
     if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
     {
         TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
-        /* OHOS: temporarily enable exec on noexec filesystem */
+        /* OHOS: enable exec on noexec filesystem. Keep JIT on. */
         prctl( 0x6a6974, 0, 0 );
-        if (!mprotect( base, size, unix_prot | PROT_EXEC )) { prctl( 0x6a6974, 0, 1 ); return 0; }
-        prctl( 0x6a6974, 0, 1 );
+        if (!mprotect( base, size, unix_prot | PROT_EXEC )) return 0;
         /* exec + write may legitimately fail, in that case fall back to write only */
         if (!(unix_prot & PROT_WRITE)) return -1;
         /* fall through to regular mprotect without exec */
     }
 
-    /* OHOS: for noexec filesystem, wrap any PROT_EXEC mprotect with prctl */
+    /* OHOS: for noexec filesystem, activate JIT before PROT_EXEC mprotect.
+     * Do NOT turn JIT off — Box64's InternalMmap & NewBrick also need it. */
     if (unix_prot & PROT_EXEC)
     {
         int ret;
         prctl( 0x6a6974, 0, 0 );
         ret = mprotect( base, size, unix_prot );
-        prctl( 0x6a6974, 0, 1 );
         return ret;
     }
 
