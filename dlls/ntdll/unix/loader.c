@@ -302,7 +302,6 @@ static void set_dll_path(void)
     count = 0;
 
     if (!build_dir) dll_paths[count++] = dll_dir;
-    /* OHOS-DEBUG */
 
     if (path)
     {
@@ -313,7 +312,6 @@ static void set_dll_path(void)
 
     for (i = 0; i < count; i++)
     {
-        /* OHOS-DEBUG */
         dll_path_maxlen = max( dll_path_maxlen, strlen(dll_paths[i]) );
     }
     dll_paths[count] = NULL;

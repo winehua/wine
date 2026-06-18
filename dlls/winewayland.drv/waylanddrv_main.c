@@ -30,8 +30,6 @@
 
 #include "waylanddrv.h"
 
-#include "wine/debug.h"
-WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
 char *process_name = NULL;
 
@@ -95,15 +93,11 @@ static NTSTATUS waylanddrv_unix_init(void *arg)
     __wine_set_user_driver(&waylanddrv_funcs, WINE_GDI_DRIVER_VERSION);
 
     wayland_init_process_name();
-    ERR("WAYLANDDRV: initializing driver for process '%s'\n",
-        process_name ? process_name : "(null)");
 
     if (!wayland_process_init()) {
-        ERR("WAYLANDDRV: wayland_process_init FAILED\n");
         goto err;
     }
 
-    ERR("WAYLANDDRV: driver init SUCCESS\n");
     return 0;
 
 err:
