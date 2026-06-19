@@ -1543,6 +1543,12 @@ static void freetype_load_fonts(void)
 {
 #ifdef SONAME_LIBFONTCONFIG
     load_fontconfig_fonts();
+#ifdef __OHOS__
+    /* OHOS: libfontconfig.so 不在设备上, fontconfig 加载会静默失败.
+     * 此时需要额外扫描 /system/fonts/ 来使用系统的 HarmonyOS 字体. */
+    if (!fontconfig_enabled)
+        ReadFontDir("/system/fonts", TRUE);
+#endif
 #elif defined(__APPLE__)
     load_mac_fonts();
 #elif defined(__ANDROID__)
