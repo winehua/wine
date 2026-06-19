@@ -292,6 +292,10 @@ struct wayland_surface
     struct wayland_window_config window;
     int content_width, content_height;
     HCURSOR hcursor;
+
+    /* xdg_toplevel min/max size 约束 (surface-local 坐标, 0 = 无限制) */
+    int32_t min_width, min_height;
+    int32_t max_width, max_height;
 };
 
 /**********************************************************************

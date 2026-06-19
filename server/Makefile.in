@@ -22,6 +22,7 @@ SOURCES = \
 	mailslot.c \
 	main.c \
 	mapping.c \
+	musl_compat.c \
 	mutex.c \
 	named_pipe.c \
 	object.c \

@@ -321,7 +321,7 @@ static NTSTATUS get_dosdev_symlink( void *args )
                     snprintf( alt, sizeof(alt), "%s/drive_%c", prefix, dev[0] );
                     if (!stat( alt, &st ))
                     {
-                        strncpy( params->dest, alt, params->size );
+                        lstrcpynA( params->dest, alt, params->size );
                         if (params->size > 0) params->dest[params->size - 1] = 0;
                         return STATUS_SUCCESS;
                     }
