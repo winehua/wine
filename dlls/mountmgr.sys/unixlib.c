@@ -26,6 +26,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -290,6 +291,45 @@ static NTSTATUS get_dosdev_symlink( void *args )
 
     ret = readlink( path, params->dest, params->size );
     free( path );
+#ifdef __OHOS__
+    /* OHOS: symlink() not available in NAPI sandbox. For known drive
+     * letters, return hardcoded default mount points, but ONLY if the
+     * target directory actually exists (avoids creating phantom drives).
+     * c: → $WINEPREFIX/drive_c, z: → /
+     * :: (block device) variants are skipped (no real device). */
+    if (ret == -1)
+    {
+        const char *dev = params->dev;
+        if (dev[0] && dev[1] == ':' && !dev[2])
+        {
+            struct stat st;
+            if (dev[0] == 'z')
+            {
+                const char *home = getenv( "HOME" );
+                if (!home) home = "/storage/Users/currentUser";
+                lstrcpynA( params->dest, home, params->size );
+                if (params->size > 0) params->dest[params->size - 1] = 0;
+                return STATUS_SUCCESS;
+            }
+            else if (dev[0] >= 'c' && dev[0] <= 'y')
+            {
+                const char *prefix = getenv( "WINEPREFIX" );
+                if (!prefix) prefix = getenv( "HOME" );
+                if (prefix)
+                {
+                    char alt[PATH_MAX];
+                    snprintf( alt, sizeof(alt), "%s/drive_%c", prefix, dev[0] );
+                    if (!stat( alt, &st ))
+                    {
+                        strncpy( params->dest, alt, params->size );
+                        if (params->size > 0) params->dest[params->size - 1] = 0;
+                        return STATUS_SUCCESS;
+                    }
+                }
+            }
+        }
+    }
+#endif
     if (ret == -1) return STATUS_NO_SUCH_DEVICE;
     if (ret == params->size) return STATUS_BUFFER_TOO_SMALL;
     params->dest[ret] = 0;

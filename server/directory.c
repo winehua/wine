@@ -509,6 +509,32 @@ void init_directories( struct fd *intl_fd )
     set_user_atom_table( atom_table );
     release_object( atom_table );
 
+#ifdef __OHOS__
+    /* OHOS NAPI 沙箱不支持 symlink()，导致 $WINEPREFIX/dosdevices/ 下
+     * 无法创建符号链接。mountmgr.sys 依赖这些 symlink 在 NT 命名空间中
+     * 创建 \??\C: 和 \??\Z: 条目。没有这些条目，explorer 的 My Computer
+     * 视图通过 GetLogicalDrives() → NtQueryDirectoryObject(\DosDevices\)
+     * 枚举不到任何盘符。
+     *
+     * 解决思路：直接在 wineserver 初始化时往 \??\ 目录 (dir_global) 创建
+     * C: 和 Z: 命名事件对象。上方的 create_obj_symlink() 已将 \DosDevices\
+     * 链接到 \??\，所以 NtOpenDirectoryObject("\DosDevices\") 实际打开的
+     * 就是 dir_global。GetLogicalDrives 只按名称 (X:) 过滤，任何类型的
+     * 命名对象都可以，不需要必须是符号链接。 */
+    {
+        static const WCHAR c_driveW[] = {'C',':'};
+        static const WCHAR z_driveW[] = {'Z',':'};
+        static const struct unicode_str c_str = {c_driveW, sizeof(c_driveW)};
+        static const struct unicode_str z_str = {z_driveW, sizeof(z_driveW)};
+        struct event *ev;
+
+        ev = create_event( &dir_global->obj, &c_str, OBJ_PERMANENT, 1, 0, NULL );
+        if (ev) release_object( ev );
+        ev = create_event( &dir_global->obj, &z_str, OBJ_PERMANENT, 1, 0, NULL );
+        if (ev) release_object( ev );
+    }
+#endif
+
     release_object( named_pipe_device );
     release_object( mailslot_device );
     release_object( null_device );

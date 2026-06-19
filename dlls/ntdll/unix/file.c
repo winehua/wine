@@ -2350,6 +2350,33 @@ static unsigned int get_drives_info( struct file_identity info[MAX_DOS_DRIVES] )
                 }
                 else
                 {
+#ifdef __OHOS__
+                    /* OHOS: symlink not available, try hardcoded drive paths.
+                     * c:→$WINEPREFIX/drive_c, z:→/ */
+                    char alt_path[PATH_MAX];
+                    if (i == 'z' - 'a')
+                    {
+                        const char *home = getenv( "HOME" );
+                        if (!home) home = "/storage/Users/currentUser";
+                        snprintf( alt_path, sizeof(alt_path), "%s", home );
+                    }
+                    else if (i >= 'c' - 'a' && i <= 'y' - 'a')
+                    {
+                        snprintf( alt_path, sizeof(alt_path), "%s/drive_%c",
+                                  config_dir, 'a' + i );
+                    }
+                    else
+                    {
+                        alt_path[0] = 0;
+                    }
+                    if (alt_path[0] && !stat( alt_path, &st ))
+                    {
+                        cache[i].dev = st.st_dev;
+                        cache[i].ino = st.st_ino;
+                        nb_drives++;
+                        continue;
+                    }
+#endif
                     cache[i].dev = 0;
                     cache[i].ino = 0;
                 }
@@ -3362,7 +3389,11 @@ static NTSTATUS get_dos_device( char **unix_name, int start_pos )
         if (!new_name && dev[1] == ':')
         {
             if (dev[0] == 'z')
-                new_name = strdup( "/" );
+            {
+                const char *home = getenv( "HOME" );
+                if (!home) home = "/storage/Users/currentUser";
+                new_name = strdup( home );
+            }
             else if (dev[0] >= 'c' && dev[0] <= 'y')
                 asprintf( &new_name, "%s/drive_%c", config_dir, dev[0] );
         }
@@ -3805,7 +3836,7 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
 #ifdef __OHOS__
     /* OHOS: symlink() not available in NAPI sandbox. For drive letter
      * prefixes, fall back to hardcoded default directory paths.
-     * c: → $WINEPREFIX/drive_c, ..., z: → / */
+     * c: → $WINEPREFIX/drive_c, ..., z: → $HOME */
     if (prefix_len == 2 && prefix[1] == ':')
     {
         unix_name[pos] = 0;  /* null-terminate the prefix for lstat */
@@ -3813,8 +3844,10 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
         {
             if (prefix[0] == 'z')
             {
-                strcpy( unix_name, "/" );
-                pos = 1;
+                const char *home = getenv( "HOME" );
+                if (!home) home = "/storage/Users/currentUser";
+                strcpy( unix_name, home );
+                pos = strlen( home );
             }
             else if (prefix[0] >= 'c' && prefix[0] <= 'y')
             {
