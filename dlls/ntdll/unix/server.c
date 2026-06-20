@@ -1628,22 +1628,42 @@ size_t server_init_process(void)
     {
         MESSAGE( "OHOS-DBG: server_init WINESERVERSOCKET=%s, using fd directly\n", env_socket );
         fd_socket = atoi( env_socket );
+
+        /* PAD_MODE: wineserver 可能在进程间传递 fd 期间退出。
+         * recv(MSG_PEEK|MSG_DONTWAIT) 检测: 对方关闭返回 0，存活且无数据
+         * 返回 -1/EAGAIN，有数据返回 >0（MSG_PEEK 不消耗）。 */
+        {
+            char dummy;
+            ssize_t peek = recv( fd_socket, &dummy, 1, MSG_PEEK | MSG_DONTWAIT );
+            if (peek == 0 || (peek == -1 && errno != EAGAIN && errno != EWOULDBLOCK))
+            {
+                MESSAGE( "OHOS-DBG: server_init WINESERVERSOCKET fd=%d dead (peek=%zd errno=%d), "
+                         "falling back to server_connect\n",
+                         fd_socket, peek, peek == -1 ? errno : 0 );
+                close( fd_socket );
+                goto server_connect_fallback;
+            }
+        }
+
         if (fcntl( fd_socket, F_SETFD, FD_CLOEXEC ) == -1)
             fatal_perror( "Bad server socket %d", fd_socket );
         unsetenv( "WINESERVERSOCKET" );
     }
     else
     {
+    server_connect_fallback:
         MESSAGE( "OHOS-DBG: server_init NO WINESERVERSOCKET, calling server_connect()\n" );
-        const char *arch = getenv( "WINEARCH" );
+        {
+            const char *arch = getenv( "WINEARCH" );
 
-        if (is_win64 && arch && !strcmp( arch, "win32" ))
-            fatal_error( "WINEARCH is set to 'win32' but this is not supported in wow64 mode.\n" );
-        if (arch && strcmp( arch, "win32" ) && strcmp( arch, "win64" ) && strcmp( arch, "wow64" ))
-            fatal_error( "WINEARCH set to invalid value '%s', it must be win32, win64, or wow64.\n", arch );
+            if (is_win64 && arch && !strcmp( arch, "win32" ))
+                fatal_error( "WINEARCH is set to 'win32' but this is not supported in wow64 mode.\n" );
+            if (arch && strcmp( arch, "win32" ) && strcmp( arch, "win64" ) && strcmp( arch, "wow64" ))
+                fatal_error( "WINEARCH set to invalid value '%s', it must be win32, win64, or wow64.\n", arch );
 
-        fd_socket = server_connect();
-        MESSAGE( "OHOS-DBG: server_connect returned fd=%d\n", fd_socket );
+            fd_socket = server_connect();
+            MESSAGE( "OHOS-DBG: server_connect returned fd=%d\n", fd_socket );
+        }
     }
 
     /* setup the signal mask */

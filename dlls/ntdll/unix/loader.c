@@ -623,7 +623,7 @@ void start_server( BOOL debug )
                 if (connect(broker_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0)
                 {
                     char entryParams[1024];
-                    snprintf(entryParams, sizeof(entryParams), "%s|wineserver|-f", binDir);
+                    snprintf(entryParams, sizeof(entryParams), "%s|wineserver|-f|-p", binDir);
                     MESSAGE( "OHOS-DBG: start_server broker request: %s\n", entryParams );
 
                     char req[2048];
