@@ -609,8 +609,18 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
 
     if (!IsRectEmpty(&rect))
     {
+        // PAD_MODE: 传递窗口在虚拟桌面中的位置，使 compositor 能正确合成
+        // surface->window.rect 是相对于虚拟桌面的屏幕坐标
+        // CW_USEDEFAULT (0x80000000) 会被 bounds check 过滤掉
+        int geo_x = 0, geo_y = 0;
+#ifdef PAD_MODE
+        if (surface->window.rect.left > -32768 && surface->window.rect.left < 32768)
+            geo_x = surface->window.rect.left;
+        if (surface->window.rect.top > -32768 && surface->window.rect.top < 32768)
+            geo_y = surface->window.rect.top;
+#endif
         xdg_surface_set_window_geometry(surface->xdg_surface,
-                                        rect.left, rect.top,
+                                        geo_x, geo_y,
                                         rect.right - rect.left,
                                         rect.bottom - rect.top);
     }
