@@ -1541,6 +1541,7 @@ static WCHAR *build_command_line( WCHAR **wargv )
  */
 static void run_wineboot( WCHAR *env, SIZE_T size )
 {
+    MESSAGE( "OHOS-DBG: run_wineboot ENTER\n" );
     static const WCHAR eventW[] = {'\\','K','e','r','n','e','l','O','b','j','e','c','t','s',
         '\\','_','_','w','i','n','e','b','o','o','t','_','e','v','e','n','t',0};
     static const WCHAR appnameW[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','w','s',
@@ -1603,10 +1604,12 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
     handles[count++] = process;
 
 wait:
+    MESSAGE( "OHOS-DBG: run_wineboot at wait, count=%d\n", count );
     timeout.QuadPart = (ULONGLONG)5 * 60 * 1000 * -10000;
     if (NtWaitForMultipleObjects( count, handles, WaitAny, FALSE, &timeout ) == WAIT_TIMEOUT)
         ERR( "boot event wait timed out\n" );
     while (count) NtClose( handles[--count] );
+    MESSAGE( "OHOS-DBG: run_wineboot EXIT\n" );
 }
 
 
@@ -1960,8 +1963,26 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     TRACE( "image %s cmdline %s dir %s\n",
            debugstr_w(main_wargv[0]), debugstr_w(cmdline), debugstr_w(curdir) );
 
+    /* OHOS: build DllPath from WINEDLLPATH for PE DLL search */
+    DWORD dllpath_len = 0;
+    WCHAR *dllpath_w = NULL;
+    const char *winedllpath = getenv("WINEDLLPATH");
+    if (winedllpath)
+    {
+        DWORD ulen = strlen(winedllpath);
+        dllpath_w = malloc((ulen + 2) * sizeof(WCHAR));
+        if (dllpath_w)
+        {
+            for (const char *s = winedllpath; *s; s++)
+                dllpath_w[dllpath_len++] = (*s == ':') ? ';' : *s;
+            dllpath_w[dllpath_len] = 0;
+            dllpath_len = (dllpath_len + 1) * sizeof(WCHAR);
+        }
+    }
+
     size = (sizeof(*params)
             + MAX_PATH * sizeof(WCHAR)  /* curdir */
+            + dllpath_len               /* dll path */
             + (wcslen( cmdline ) + 1) * sizeof(WCHAR)  /* command line */
             + (wcslen( main_wargv[0] ) + 1) * sizeof(WCHAR) * 2 /* image path + window title */
             + env_pos * sizeof(WCHAR));
@@ -1985,6 +2006,15 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     put_unicode_string( main_wargv[0], &dst, &params->ImagePathName );
     put_unicode_string( cmdline, &dst, &params->CommandLine );
     put_unicode_string( main_wargv[0], &dst, &params->WindowTitle );
+    if (dllpath_w)
+    {
+        memcpy(dst, dllpath_w, dllpath_len);
+        params->DllPath.Buffer = dst;
+        params->DllPath.Length = dllpath_len - sizeof(WCHAR);
+        params->DllPath.MaximumLength = dllpath_len;
+        dst += dllpath_len / sizeof(WCHAR);
+        free(dllpath_w);
+    }
     free( nt_name.Buffer );
     free( cmdline );
     free( curdir );

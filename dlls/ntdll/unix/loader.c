@@ -37,6 +37,11 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#ifdef PAD_MODE
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <dirent.h>
+#endif
 #include <unistd.h>
 #include <dlfcn.h>
 #ifdef HAVE_PWD_H
@@ -250,6 +255,8 @@ static int build_path_and_exec( pid_t *pid, const char *dir, const char *name, c
 
     argv[0] = build_path( dir, name );
     ret = posix_spawn( pid, argv[0], NULL, NULL, argv, environ );
+    MESSAGE( "OHOS-DBG: build_path_and_exec dir=%s name=%s path=%s ret=%d errno=%d\n",
+             dir, name, argv[0], ret, ret ? errno : 0 );
     free( argv[0] );
     return ret;
 }
@@ -397,8 +404,23 @@ static void init_paths(void)
     else
     {
         if (!(dll_dir = remove_tail( ntdll_dir, get_so_dir(current_machine) ))) dll_dir = ntdll_dir;
+#ifdef PAD_MODE
+        {
+            const char *wine_data_dir = getenv( "WINEDATADIR" );
+            if (wine_data_dir) data_dir = strdup( wine_data_dir );
+            else data_dir = build_relative_path( dll_dir, LIBDIR "/wine", DATADIR "/wine" );
+
+            const char *wine_bin_dir = getenv( "WINEBINDIR" );
+            if (wine_bin_dir) bin_dir = strdup( wine_bin_dir );
+            else bin_dir = build_relative_path( dll_dir, LIBDIR "/wine", BINDIR );
+
+            const char *wine_unix_dir = getenv( "WINEUNIXDIR" );
+            if (wine_unix_dir) dll_dir = strdup( wine_unix_dir );
+        }
+#else
         bin_dir = build_relative_path( dll_dir, LIBDIR "/wine", BINDIR );
         data_dir = build_relative_path( dll_dir, LIBDIR "/wine", DATADIR "/wine" );
+#endif
         wineloader = build_path( ntdll_dir, "wine" );
     }
 
@@ -509,6 +531,9 @@ static int exec_wineserver( pid_t *pid, char **argv )
 {
     char *path;
 
+    MESSAGE( "OHOS-DBG: exec_wineserver called, bin_dir=%s build_dir=%s\n",
+             bin_dir ? bin_dir : "(null)", build_dir ? build_dir : "(null)" );
+
     if (!is_win64 && alt_build_dir)  /* look for 64-bit server */
         return build_path_and_exec( pid, alt_build_dir, "server/wineserver", argv );
 
@@ -523,6 +548,7 @@ static int exec_wineserver( pid_t *pid, char **argv )
         for (path = strtok( strdup( path ), ":" ); path; path = strtok( NULL, ":" ))
             if (!build_path_and_exec( pid, path, "wineserver", argv )) return 0;
     }
+    MESSAGE( "OHOS-DBG: exec_wineserver FAILED all paths, last try BINDIR=%s\n", BINDIR );
     return build_path_and_exec( pid, BINDIR, "wineserver", argv );
 }
 
@@ -535,22 +561,199 @@ static int exec_wineserver( pid_t *pid, char **argv )
 void start_server( BOOL debug )
 {
     static BOOL started;  /* we only try once */
-    char *argv[3];
-    static char debug_flag[] = "-d";
 
+    MESSAGE( "OHOS-DBG: start_server called, started=%d debug=%d\n", started, debug );
     if (!started)
     {
+#ifdef PAD_MODE
+        /* 问题起因: 标准 Linux 上 start_server() 通过 posix_spawn 启动 wineserver，
+         * wineserver 自动 daemonize（double-fork），中间进程退出后 waitpid 返回，
+         * 此时 wineserver socket 已就绪。但 OHOS PAD_MODE 没有 execve，
+         * wineserver 是 libwineserver.so 库而非独立 ELF 可执行文件。
+         *
+         * 解决办法: 通过 Process Broker 请求主进程调用 StartNativeChildProcess
+         * 来重启 wineserver。由于没有 daemonize + waitpid 同步点，
+         * 需要轮询 socket 直到就绪。
+         *
+         * 跨进程互斥: static BOOL started 只在单进程内有效，多进程可能同时
+         * 进入此路径。spawn 前扫描 .wineserver/<host>/socket 是否存在——
+         * 存在说明 wineserver 已在运行（可能是其他进程 spawn 的），不重复 spawn。*/
+        const char *prefix = getenv("WINEPREFIX");
+        if (!prefix) prefix = "/data/storage/el2/base/files/.wine";
+        char sockdir_check[512];
+        snprintf(sockdir_check, sizeof(sockdir_check), "%s/.wineserver", prefix);
+
+        /* 扫描 .wineserver 下是否有活跃的 socket 文件 */
+        int socket_alive = 0;
+        {
+            struct stat st;
+            if (stat(sockdir_check, &st) == 0 && S_ISDIR(st.st_mode))
+            {
+                DIR *d = opendir(sockdir_check);
+                if (d)
+                {
+                    struct dirent *de;
+                    while ((de = readdir(d)))
+                    {
+                        if (de->d_name[0] == '.') continue;
+                        char sub[1024];
+                        snprintf(sub, sizeof(sub), "%s/%s/socket", sockdir_check, de->d_name);
+                        if (stat(sub, &st) == 0 && S_ISSOCK(st.st_mode))
+                            { socket_alive = 1; break; }
+                    }
+                    closedir(d);
+                }
+            }
+        }
+
+        if (!socket_alive)
+        {
+            const char *binDir = getenv("WINEBINDIR");
+            if (!binDir) binDir = "/data/storage/el2/base/files/wine/bin";
+
+            int broker_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (broker_fd >= 0)
+            {
+                struct sockaddr_un addr;
+                memset(&addr, 0, sizeof(addr));
+                addr.sun_family = AF_UNIX;
+                const char *broker_path = getenv("PROCESSBROKER");
+                strcpy(addr.sun_path, broker_path ? broker_path : "/data/storage/el2/base/files/.wine_broker");
+
+                if (connect(broker_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0)
+                {
+                    char entryParams[1024];
+                    snprintf(entryParams, sizeof(entryParams), "%s|wineserver|-f", binDir);
+                    MESSAGE( "OHOS-DBG: start_server broker request: %s\n", entryParams );
+
+                    char req[2048];
+                    int reqlen = snprintf(req, sizeof(req), "SPAWN\n%s\n", entryParams);
+
+                    struct iovec iov;
+                    iov.iov_base = req;
+                    iov.iov_len = reqlen;
+
+                    struct msghdr msg = {};
+                    msg.msg_iov = &iov;
+                    msg.msg_iovlen = 1;
+
+                    if (sendmsg(broker_fd, &msg, MSG_NOSIGNAL) >= 0)
+                    {
+                        int32_t response[2];
+                        ssize_t n = recv(broker_fd, response, sizeof(response), MSG_WAITALL);
+                        if (n == sizeof(response))
+                        {
+                            MESSAGE( "OHOS-DBG: start_server broker replied childPid=%d status=%d\n",
+                                     response[0], response[1] );
+                            if (response[1] == 0 && response[0] > 0)
+                                started = TRUE;
+                        }
+                    }
+                }
+                close(broker_fd);
+            }
+
+            if (started)
+            {
+                /* poll socket 直到就绪（最多 5 秒） */
+                MESSAGE( "OHOS-DBG: start_server waiting for wineserver socket...\n" );
+                int found = 0;
+                for (int wait = 0; wait < 25; wait++)
+                {
+                    struct stat st;
+                    if (stat(sockdir_check, &st) == 0 && S_ISDIR(st.st_mode))
+                    {
+                        DIR *d = opendir(sockdir_check);
+                        if (d)
+                        {
+                            struct dirent *de;
+                            while ((de = readdir(d)))
+                            {
+                                if (de->d_name[0] == '.') continue;
+                                char sub[1024];
+                                snprintf(sub, sizeof(sub), "%s/%s/socket", sockdir_check, de->d_name);
+                                if (stat(sub, &st) == 0 && S_ISSOCK(st.st_mode))
+                                {
+                                    MESSAGE( "OHOS-DBG: start_server socket ready at %s\n", sub );
+                                    found = 1;
+                                    break;
+                                }
+                            }
+                            closedir(d);
+                        }
+                        if (found) break;
+                    }
+                    usleep(200000);
+                }
+                if (found)
+                    MESSAGE( "OHOS-DBG: start_server wineserver socket ready\n" );
+                else
+                    MESSAGE( "OHOS-DBG: start_server timeout waiting for socket\n" );
+            }
+            else
+                MESSAGE( "OHOS-DBG: start_server broker spawn failed, will retry\n" );
+        }
+        else
+        {
+            /* socket 已存在，但可能是即将退出的 wineserver 残留。
+             * 短暂 poll 确认 socket 稳定存在（2 秒），消失则 fall through 去 spawn。 */
+            MESSAGE( "OHOS-DBG: start_server socket found, verifying stability...\n" );
+            int stable = 1;
+            for (int wait = 0; wait < 10; wait++)
+            {
+                usleep(200000);
+                int still_there = 0;
+                struct stat st;
+                if (stat(sockdir_check, &st) == 0 && S_ISDIR(st.st_mode))
+                {
+                    DIR *d = opendir(sockdir_check);
+                    if (d)
+                    {
+                        struct dirent *de;
+                        while ((de = readdir(d)))
+                        {
+                            if (de->d_name[0] == '.') continue;
+                            char sub[1024];
+                            snprintf(sub, sizeof(sub), "%s/%s/socket", sockdir_check, de->d_name);
+                            if (stat(sub, &st) == 0 && S_ISSOCK(st.st_mode))
+                                { still_there = 1; break; }
+                        }
+                        closedir(d);
+                    }
+                }
+                if (!still_there) { stable = 0; break; }
+            }
+            if (stable)
+            {
+                MESSAGE( "OHOS-DBG: start_server socket stable, skipping spawn\n" );
+                started = TRUE;
+            }
+            else
+                MESSAGE( "OHOS-DBG: start_server socket vanished, will spawn\n" );
+        }
+#else
+        /* 标准 Linux: posix_spawn wineserver */
         int status;
         pid_t pid;
+        char *argv[3];
+        static char debug_flag[] = "-d";
 
         argv[1] = debug ? debug_flag : NULL;
         argv[2] = NULL;
-        if (exec_wineserver( &pid, argv )) fatal_error( "could not exec wineserver\n" );
+        if (exec_wineserver( &pid, argv ))
+        {
+            MESSAGE( "OHOS-DBG: start_server FAILED exec_wineserver returned error\n" );
+            fatal_error( "could not exec wineserver\n" );
+        }
+        MESSAGE( "OHOS-DBG: start_server waitpid pid=%d...\n", (int)pid );
         waitpid( pid, &status, 0 );
         status = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        MESSAGE( "OHOS-DBG: start_server waitpid done, pid=%d status=%d WIFEXITED=%d\n",
+                 (int)pid, status, WIFEXITED(status) );
         if (status == 2) return;  /* server lock held by someone else, will retry later */
         if (status) exit(status);  /* server failed */
         started = TRUE;
+#endif
     }
 }
 
@@ -1867,10 +2070,13 @@ static void start_main_thread(void)
     *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
     set_load_order_app_name( main_wargv[0] );
     init_thread_stack( teb, 0, 0, 0 );
+    MESSAGE( "OHOS-DBG: init_thread_stack done, StackBase=%p StackLimit=%p\n",
+             teb->Tib.StackBase, teb->Tib.StackLimit );
     NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
     load_ntdll();
     load_wow64_ntdll( main_image_info.Machine );
     load_apiset_dll();
+    MESSAGE( "OHOS-DBG: start_main_thread about to call server_init_process_done\n" );
     server_init_process_done();
 }
 
@@ -2002,7 +2208,9 @@ static int pre_exec(void)
 
 static int pre_exec(void)
 {
-#ifdef HAVE_WINE_PRELOADER
+#ifdef PAD_MODE
+    return 0;  /* Pad fork-only: no preloader, no execve */
+#elif defined(HAVE_WINE_PRELOADER)
     return 1;  /* we have a preloader */
 #else
     return 0;  /* no exec needed */
@@ -2018,7 +2226,11 @@ static void reexec_loader( int argc, char *argv[], char *extra_arg )
     char **new_argv;
 
     /* have to exec if we have a preloader, or an argument, or if we are the initial wrapper */
+#ifdef PAD_MODE
+    if (!pre_exec() && !extra_arg) return;  // Pad: no preloader, skip default reexec
+#else
     if (!pre_exec() && !extra_arg && dlsym( RTLD_DEFAULT, "wine_main_preload_info" )) return;
+#endif
 
     if (extra_arg)
     {

@@ -866,7 +866,10 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
     {
         if (builtin->unix_path && !builtin->unix_handle)
         {
-            builtin->unix_handle = dlopen( builtin->unix_path, RTLD_NOW );
+            /* OHOS: dlopen 不能用绝对路径, 只取文件名让系统 linker 搜索 libs/ */
+            const char *name = strrchr( builtin->unix_path, '/' );
+            name = name ? name + 1 : builtin->unix_path;
+            builtin->unix_handle = dlopen( name, RTLD_NOW );
             if (!builtin->unix_handle)
                 WARN_(module)( "failed to load %s: %s\n", debugstr_a(builtin->unix_path), dlerror() );
         }

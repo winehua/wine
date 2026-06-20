@@ -1415,6 +1415,8 @@ static int server_connect(void)
     /* chdir to the server directory */
     if (chdir( server_dir ) == -1)
     {
+        MESSAGE( "OHOS-DBG: server_connect chdir(%s) failed errno=%d (ENOENT=%d), calling start_server\n",
+                 server_dir, errno, ENOENT );
         if (errno != ENOENT) fatal_perror( "chdir to %s", server_dir );
         start_server( TRACE_ON(server) );
         if (chdir( server_dir ) == -1) fatal_perror( "chdir to %s", server_dir );
@@ -1431,11 +1433,14 @@ static int server_connect(void)
         if (retry)
         {
             usleep( 100000 * retry * retry );
+            MESSAGE( "OHOS-DBG: server_connect retry=%d, calling start_server\n", retry );
             start_server( TRACE_ON(server) );
             if (lstat( SOCKETNAME, &st ) == -1) continue;  /* still no socket, wait a bit more */
         }
         else if (lstat( SOCKETNAME, &st ) == -1) /* check for an already existing socket */
         {
+            MESSAGE( "OHOS-DBG: server_connect no socket at %s/%s, errno=%d, calling start_server\n",
+                     server_dir, SOCKETNAME, errno );
             if (errno != ENOENT) fatal_perror( "lstat %s/%s", server_dir, SOCKETNAME );
             start_server( TRACE_ON(server) );
             if (lstat( SOCKETNAME, &st ) == -1) continue;  /* still no socket, wait a bit more */
@@ -1621,6 +1626,7 @@ size_t server_init_process(void)
     server_pid = -1;
     if (env_socket)
     {
+        MESSAGE( "OHOS-DBG: server_init WINESERVERSOCKET=%s, using fd directly\n", env_socket );
         fd_socket = atoi( env_socket );
         if (fcntl( fd_socket, F_SETFD, FD_CLOEXEC ) == -1)
             fatal_perror( "Bad server socket %d", fd_socket );
@@ -1628,6 +1634,7 @@ size_t server_init_process(void)
     }
     else
     {
+        MESSAGE( "OHOS-DBG: server_init NO WINESERVERSOCKET, calling server_connect()\n" );
         const char *arch = getenv( "WINEARCH" );
 
         if (is_win64 && arch && !strcmp( arch, "win32" ))
@@ -1636,6 +1643,7 @@ size_t server_init_process(void)
             fatal_error( "WINEARCH set to invalid value '%s', it must be win32, win64, or wow64.\n", arch );
 
         fd_socket = server_connect();
+        MESSAGE( "OHOS-DBG: server_connect returned fd=%d\n", fd_socket );
     }
 
     /* setup the signal mask */
@@ -1766,6 +1774,9 @@ void server_init_process_done(void)
      * is sent by init_process_done */
     signal_init_process( data->teb );
     init_teb_data( data );
+    MESSAGE( "OHOS-DBG: server_init_process_done signal_init done, "
+             "TransferAddress=%p peb=%p\n",
+             main_image_info.TransferAddress, peb );
 
     /* Signal the parent process to continue */
     SERVER_START_REQ( init_process_done )
@@ -1778,6 +1789,7 @@ void server_init_process_done(void)
     SERVER_END_REQ;
 
     assert( !status );
+    MESSAGE( "OHOS-DBG: server_init_process_done about to signal_start_thread\n" );
     signal_start_thread( main_image_info.TransferAddress, peb, data->teb );
 }
 

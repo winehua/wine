@@ -243,8 +243,10 @@ static void init_limits(void)
 
 int main( int argc, char *argv[] )
 {
+    write(2, "OHOS-WS: main() ENTER\n", 22);
     setvbuf( stderr, NULL, _IOLBF, 0 );
     server_argv0 = argv[0];
+    write(2, "OHOS-WS: parse_options...\n", 26);
     parse_options( argc, argv, "d::fhk::p::vw", long_options, option_callback );
 
     /* setup temporary handlers before the real signal initialization is done */
@@ -256,16 +258,27 @@ int main( int argc, char *argv[] )
     signal( SIGABRT, sigterm_handler );
     init_limits();
 
+    fprintf(stderr, "OHOS-WS: sock_init...\n");
     sock_init();
+    fprintf(stderr, "OHOS-WS: open_master_socket...\n");
     open_master_socket();
 
-    if (debug_level) fprintf( stderr, "wineserver: starting (pid=%ld)\n", (long) getpid() );
+    fprintf(stderr, "wineserver: starting (pid=%ld)\n", (long) getpid() );
     set_current_time();
+    fprintf(stderr, "OHOS-WS: init_signals...\n");
     init_signals();
+    fprintf(stderr, "OHOS-WS: init_memory...\n");
     init_memory();
+    fprintf(stderr, "OHOS-WS: init_directories...\n");
     init_directories( load_intl_file() );
+    fprintf(stderr, "OHOS-WS: init_threading...\n");
     init_threading();
+    fprintf(stderr, "OHOS-WS: init_registry...\n");
     init_registry();
+    fprintf(stderr, "OHOS-WS: master_socket_timeout=%lld (TIMEOUT_INFINITE=%lld)\n",
+            (long long)master_socket_timeout, (long long)TIMEOUT_INFINITE);
+    write(2, "OHOS-WS: entering main_loop\n", 29);
     main_loop();
+    write(2, "OHOS-WS: main_loop RETURNED!\n", 30);
     return 0;
 }

@@ -56,6 +56,9 @@
 # include <libprocstat.h>
 #endif
 #include <unistd.h>
+#ifdef PAD_MODE
+#include <sys/un.h>
+#endif
 #ifdef HAVE_MACH_MACH_H
 # include <mach/mach.h>
 #endif
@@ -416,6 +419,108 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
         isatty(1) && is_unix_console_handle( params->hStdOutput ))
         stdout_fd = 1;
 
+#ifdef PAD_MODE
+    /* Process Broker: 通过 Unix socket 请求主进程创建子进程。
+     *
+     * 问题起因: wineboot 是 appspawn 子进程，它在 --init 阶段通过
+     * NtCreateUserProcess → spawn_process 创建 services.exe 等子进程。
+     * 若 spawn_process 内部直接调用 OH_Ability_StartNativeChildProcess，
+     * 会返回 NCP_ERR_ALREADY_IN_CHILD（OHOS API 13 不支持嵌套创建子进程）。
+     *
+     * 解决办法: 通过 Unix socket 将创建请求转发到主进程中的 Broker 线程，
+     * Broker 在主进程上下文（非 appspawn 子进程）调用 StartNativeChildProcess，
+     * 并通过 SCM_RIGHTS 传递 wineserver socket fd 给子进程。 */
+    {
+        const char *broker_path = getenv("PROCESSBROKER");
+        if (!broker_path) broker_path = "/data/storage/el2/base/files/.wine_broker";
+        const char *binDir = getenv("WINEBINDIR");
+        if (!binDir) binDir = "/data/storage/el2/base/files/wine/bin";
+        char *entryParams = NULL;
+        int broker_fd;
+        struct sockaddr_un addr;
+        struct msghdr msg;
+        union { char buf[CMSG_SPACE(sizeof(int))]; struct cmsghdr align; } ctrl;
+        struct cmsghdr *cmsg;
+        int i, len;
+        ssize_t sent, received;
+        int32_t response[2];
+
+        argv = build_argv( &params->CommandLine, 0 );
+
+        /* 构建 entryParams: "binDir|wine|arg0|arg1|..."
+         * wine_child.cpp 的 __wine_main 需要 argc>=2 (argv[0]=wine) */
+        len = strlen(binDir) + 1 + 5; /* + "|wine" */
+        for (i = 0; argv[i]; i++) len += strlen(argv[i]) + 1;
+        entryParams = malloc(len + 1);
+        if (entryParams)
+        {
+            char *p = entryParams;
+            p += snprintf(p, len + 1, "%s|wine", binDir);
+            for (i = 0; argv[i]; i++)
+                p += snprintf(p, len + 1 - (p - entryParams), "|%s", argv[i]);
+        }
+
+        /* 连接 broker */
+        broker_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (broker_fd >= 0)
+        {
+            memset(&addr, 0, sizeof(addr));
+            addr.sun_family = AF_UNIX;
+            strcpy(addr.sun_path, broker_path);
+
+            if (connect(broker_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0)
+            {
+                /* 构造请求: "SPAWN\n{entryParams}\n" + SCM_RIGHTS */
+                char req_hdr[32];
+                int hdr_len = snprintf(req_hdr, sizeof(req_hdr), "SPAWN\n");
+                size_t ep_len = entryParams ? strlen(entryParams) : 0;
+
+                struct iovec iov_parts[3];
+                iov_parts[0].iov_base = req_hdr;
+                iov_parts[0].iov_len = hdr_len;
+                iov_parts[1].iov_base = entryParams ? entryParams : (char*)"";
+                iov_parts[1].iov_len = ep_len;
+                iov_parts[2].iov_base = (char*)"\n";
+                iov_parts[2].iov_len = 1;
+
+                memset(&msg, 0, sizeof(msg));
+                msg.msg_iov = iov_parts;
+                msg.msg_iovlen = 3;
+                msg.msg_control = ctrl.buf;
+                msg.msg_controllen = sizeof(ctrl.buf);
+
+                cmsg = CMSG_FIRSTHDR(&msg);
+                cmsg->cmsg_level = SOL_SOCKET;
+                cmsg->cmsg_type = SCM_RIGHTS;
+                cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+                memcpy(CMSG_DATA(cmsg), &socketfd, sizeof(int));
+                msg.msg_controllen = cmsg->cmsg_len;
+
+                sent = sendmsg(broker_fd, &msg, MSG_NOSIGNAL);
+                if (sent >= 0)
+                {
+                    /* 接收响应: childPid + status (8 字节) */
+                    received = recv(broker_fd, response, sizeof(response), MSG_WAITALL);
+                    if (received == sizeof(response))
+                    {
+                        pid = response[0];
+                        int32_t broker_status = response[1];
+                        if (broker_status != 0 || pid <= 0)
+                            status = STATUS_UNSUCCESSFUL;
+                    }
+                    else status = STATUS_UNSUCCESSFUL;
+                }
+                else status = STATUS_UNSUCCESSFUL;
+            }
+            else status = STATUS_UNSUCCESSFUL;
+            close(broker_fd);
+        }
+        else status = STATUS_UNSUCCESSFUL;
+
+        free(argv);
+        free(entryParams);
+    }
+#else
     if (!(pid = fork()))  /* child */
     {
         if (!(pid = fork()))  /* grandchild */
@@ -457,6 +562,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
         } while (wret < 0 && errno == EINTR);
     }
     else status = STATUS_NO_MEMORY;
+#endif
 
     if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
     if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
@@ -563,6 +669,11 @@ NTSTATUS wow64_wine_spawnvp( void *args )
 static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, int unixdir,
                                const RTL_USER_PROCESS_PARAMETERS *params )
 {
+#ifdef PAD_MODE
+    /* Pad: native Unix binary execution not supported (no execve).
+     * This path is rarely hit for core Wine (most exes are PE). */
+    return STATUS_UNSUCCESSFUL;
+#else
     pid_t pid;
     int fd[2], stdin_fd = -1, stdout_fd = -1;
     char **argv;
@@ -651,6 +762,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
     if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
     if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
     return status;
+#endif /* !PAD_MODE */
 }
 
 static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_t **handles, data_size_t *handles_len )

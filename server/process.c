@@ -574,9 +574,11 @@ static void set_process_startup_state( struct process *process, enum startup_sta
 /* callback for server shutdown */
 static void server_shutdown_timeout( void *arg )
 {
+    write(2, "OHOS-WS: server_shutdown_timeout FIRED\n", 39);
     shutdown_timeout = NULL;
     if (!running_processes)
     {
+        write(2, "OHOS-WS: no running_processes, closing master socket\n", 53);
         close_master_socket( 0 );
         return;
     }
@@ -614,7 +616,10 @@ static void process_died( struct process *process )
     if (!process->is_system)
     {
         if (!--user_processes && !shutdown_stage && master_socket_timeout != TIMEOUT_INFINITE)
+        {
+            write(2, "OHOS-WS: user_processes->0, scheduling shutdown timeout\n", 55);
             shutdown_timeout = add_timeout_user( master_socket_timeout, server_shutdown_timeout, NULL );
+        }
     }
     release_object( process );
     if (!--running_processes && shutdown_stage) close_master_socket( 0 );
@@ -1849,7 +1854,10 @@ DECL_HANDLER(make_process_system)
             release_thread_desktop( thread, 0 );
         process->is_system = 1;
         if (!--user_processes && !shutdown_stage && master_socket_timeout != TIMEOUT_INFINITE)
+        {
+            write(2, "OHOS-WS: user_processes->0 (detach), scheduling shutdown timeout\n", 61);
             shutdown_timeout = add_timeout_user( master_socket_timeout, server_shutdown_timeout, NULL );
+        }
     }
     release_object( process );
 }
