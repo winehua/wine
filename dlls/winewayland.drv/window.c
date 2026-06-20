@@ -62,10 +62,13 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
     struct rb_entry *rb_entry;
     HWND parent;
 
-    /* Don't create win data for desktop or HWND_MESSAGE windows. */
+    /* PAD_MODE: 桌面窗口需要 wayland surface 作为 subsurfacing 的根。
+     * 允许所有窗口（包括桌面/HWND_MESSAGE）创建 win_data。 */
+#ifndef PAD_MODE
     if (!(parent = NtUserGetAncestor(hwnd, GA_PARENT))) return NULL;
     if (parent != NtUserGetDesktopWindow() && !NtUserGetAncestor(parent, GA_PARENT))
         return NULL;
+#endif
 
     if (!(data = calloc(1, sizeof(*data)))) return NULL;
 
