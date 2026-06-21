@@ -447,15 +447,21 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
 
         argv = build_argv( &params->CommandLine, 0 );
 
-        /* 构建 entryParams: "binDir|wine|arg0|arg1|..."
-         * wine_child.cpp 的 __wine_main 需要 argc>=2 (argv[0]=wine) */
-        len = strlen(binDir) + 1 + 5; /* + "|wine" */
+        /* 构建 entryParams: "binDir|arg0|arg1|..."
+         * ARM64 Box64 in-process 模式下不需要 "|wine" 前缀，因为 Box64
+         * 已将目标 ELF 路径设为 guest argv[0]。x86_64 Pad 仍需前缀。 */
+        len = strlen(binDir) + 1;
+        if (!getenv("USE_LIBBOX64"))
+            len += 5; /* + "|wine" */
         for (i = 0; argv[i]; i++) len += strlen(argv[i]) + 1;
         entryParams = malloc(len + 1);
         if (entryParams)
         {
             char *p = entryParams;
-            p += snprintf(p, len + 1, "%s|wine", binDir);
+            if (getenv("USE_LIBBOX64"))
+                p += snprintf(p, len + 1, "%s", binDir);
+            else
+                p += snprintf(p, len + 1, "%s|wine", binDir);
             for (i = 0; argv[i]; i++)
                 p += snprintf(p, len + 1 - (p - entryParams), "|%s", argv[i]);
         }

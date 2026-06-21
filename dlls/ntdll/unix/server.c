@@ -1351,9 +1351,9 @@ static int setup_config_dir(void)
     {
         mkdir( "drive_c", 0777 );
         if (symlink( "../drive_c", "dosdevices/c:" ) == -1)
-            MESSAGE( "wine: symlink dosdevices/c: → ../drive_c failed: %s\n", strerror(errno) );
+            MESSAGE( "wine: symlink dosdevices/c: → ../drive_c not supported, will fallback to drive_c (not fatal): %s\n", strerror(errno) );
         if (symlink( "/", "dosdevices/z:" ) == -1)
-            MESSAGE( "wine: symlink dosdevices/z: → / failed: %s\n", strerror(errno) );
+            MESSAGE( "wine: symlink dosdevices/z: → / not supported, will fallback (not fatal): %s\n", strerror(errno) );
     }
     else if (errno != EEXIST) fatal_perror( "cannot create %s/dosdevices", config_dir );
 
