@@ -244,12 +244,6 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
     context = *orig_context;
     context.ContextFlags &= ~0x40; /* Clear xstate flag. */
 
-    MESSAGE( "OHOS-DBG: call_seh_handlers ENTER Rip=%I64x Rsp=%I64x ExceptionCode=%08lx "
-             "StackBase=%p StackLimit=%p Teb=%p\n",
-             context.Rip, context.Rsp, rec->ExceptionCode,
-             NtCurrentTeb()->Tib.StackBase, NtCurrentTeb()->Tib.StackLimit,
-             NtCurrentTeb() );
-
     dispatch.TargetIp      = 0;
     dispatch.ContextRecord = &context;
     dispatch.HistoryTable  = &table;
@@ -1044,12 +1038,7 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
  */
 void WINAPI LdrInitializeThunk( CONTEXT *context, ULONG_PTR unk2, ULONG_PTR unk3, ULONG_PTR unk4 )
 {
-    MESSAGE( "OHOS-DBG: LdrInitializeThunk ENTER context=%p Rip=%I64x\n",
-             context, context ? context->Rip : 0 );
     loader_init( context, (void **)&context->Rcx );
-    ERR( "OHOS-DBG: LdrInitializeThunk after loader_init, Rip=%I64x Rcx=%I64x Rsp=%I64x, "
-         "calling signal_start_thread\n",
-         context->Rip, context->Rcx, context->Rsp );
     TRACE_(relay)( "\1Starting thread proc %p (arg=%p)\n", (void *)context->Rcx, (void *)context->Rdx );
     signal_start_thread( context );
 }

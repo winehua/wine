@@ -763,11 +763,6 @@ static struct heap *unsafe_heap_from_handle( HANDLE handle, ULONG flags, ULONG *
     if (!heap || (heap->magic != HEAP_MAGIC))
     {
         ERR( "Invalid handle %p!\n", handle );
-        if (!heap)
-            MESSAGE( "OHOS-DBG: unsafe_heap_from_handle: NULL handle\n" );
-        else
-            MESSAGE( "OHOS-DBG: unsafe_heap_from_handle: bad magic %p magic=%08lx expected=%08lx\n",
-                     handle, heap->magic, (ULONG)HEAP_MAGIC );
         return NULL;
     }
     if (heap->flags & HEAP_VALIDATE_ALL)

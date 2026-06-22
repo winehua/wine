@@ -2299,8 +2299,6 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     case TRAP_x86_PROTFLT:   /* General protection fault */
         {
             WORD err = ERROR_sig(sigcontext);
-            MESSAGE( "OHOS-DBG: protfault Rip=%p err=%x rsp=%p\n",
-                     (void *)RIP_sig(sigcontext), err, (void *)RSP_sig(sigcontext) );
             if (!err && (rec.ExceptionCode = is_privileged_instr( &context.c ))) break;
             if ((err & 7) == 2 && handle_interrupt( data, sigcontext, &rec, &context )) return;
             rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
@@ -2315,9 +2313,6 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         rec.NumberParameters = 2;
         rec.ExceptionInformation[0] = (ERROR_sig(sigcontext) >> 1) & 0x09;
         rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
-        MESSAGE( "OHOS-DBG: pagefault Rip=%p addr=%p err=%x rsp=%p\n",
-                 (void *)RIP_sig(sigcontext), siginfo->si_addr,
-                 ERROR_sig(sigcontext), (void *)RSP_sig(sigcontext) );
         if (!virtual_handle_fault( data, &rec, (void *)RSP_sig(sigcontext) ) ||
             check_invalid_gsbase( data, sigcontext ))
         {
@@ -2862,11 +2857,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
     thread_data->instrumentation_callback = &instrumentation_callback;
 
 #if defined __linux__
-    {
-        int gs_ret = arch_prctl( ARCH_SET_GS, teb );
-        MESSAGE( "OHOS-DBG: arch_prctl(ARCH_SET_GS, teb=%p) ret=%d\n",
-                 teb, gs_ret );
-    }
+    arch_prctl( ARCH_SET_GS, teb );
     if (fs32_sel)
     {
         arch_prctl( ARCH_GET_FS, &thread_data->pthread_teb );
@@ -2890,8 +2881,6 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
     context.Rdx    = (ULONG_PTR)arg;
     context.Rsp    = (ULONG_PTR)teb->Tib.StackBase - 0x28;
     context.Rip    = (ULONG_PTR)pRtlUserThreadStart;
-    MESSAGE( "OHOS-DBG: init_syscall_frame entry=%p arg=%p RtlUserThreadStart=%p\n",
-             entry, arg, pRtlUserThreadStart );
     context.SegCs  = cs64_sel;
     context.SegDs  = ds64_sel;
     context.SegEs  = ds64_sel;

@@ -66,7 +66,6 @@ __ASM_GLOBAL_FUNC( BaseThreadInitThunk,
 #else
 void __fastcall BaseThreadInitThunk( DWORD unknown, LPTHREAD_START_ROUTINE entry, void *arg )
 {
-    ERR( "OHOS-DBG: BaseThreadInitThunk calling entry=%p arg=%p\n", entry, arg );
     RtlExitUserThread( entry( arg ) );
 }
 #endif

@@ -255,7 +255,7 @@ static int build_path_and_exec( pid_t *pid, const char *dir, const char *name, c
 
     argv[0] = build_path( dir, name );
     ret = posix_spawn( pid, argv[0], NULL, NULL, argv, environ );
-    MESSAGE( "OHOS-DBG: build_path_and_exec dir=%s name=%s path=%s ret=%d errno=%d\n",
+    MESSAGE( "[OHOS-LOADER] build_path_and_exec dir=%s name=%s path=%s ret=%d errno=%d\n",
              dir, name, argv[0], ret, ret ? errno : 0 );
     free( argv[0] );
     return ret;
@@ -531,7 +531,7 @@ static int exec_wineserver( pid_t *pid, char **argv )
 {
     char *path;
 
-    MESSAGE( "OHOS-DBG: exec_wineserver called, bin_dir=%s build_dir=%s\n",
+    MESSAGE( "[OHOS-LOADER] exec_wineserver called, bin_dir=%s build_dir=%s\n",
              bin_dir ? bin_dir : "(null)", build_dir ? build_dir : "(null)" );
 
     if (!is_win64 && alt_build_dir)  /* look for 64-bit server */
@@ -548,7 +548,7 @@ static int exec_wineserver( pid_t *pid, char **argv )
         for (path = strtok( strdup( path ), ":" ); path; path = strtok( NULL, ":" ))
             if (!build_path_and_exec( pid, path, "wineserver", argv )) return 0;
     }
-    MESSAGE( "OHOS-DBG: exec_wineserver FAILED all paths, last try BINDIR=%s\n", BINDIR );
+    MESSAGE( "[OHOS-LOADER] exec_wineserver FAILED all paths, last try BINDIR=%s\n", BINDIR );
     return build_path_and_exec( pid, BINDIR, "wineserver", argv );
 }
 
@@ -562,7 +562,7 @@ void start_server( BOOL debug )
 {
     static BOOL started;  /* we only try once */
 
-    MESSAGE( "OHOS-DBG: start_server called, started=%d debug=%d\n", started, debug );
+    MESSAGE( "[OHOS-LOADER] start_server called, started=%d debug=%d\n", started, debug );
     if (!started)
     {
 #ifdef PAD_MODE
@@ -624,7 +624,7 @@ void start_server( BOOL debug )
                 {
                     char entryParams[1024];
                     snprintf(entryParams, sizeof(entryParams), "%s|wineserver|-f|-p", binDir);
-                    MESSAGE( "OHOS-DBG: start_server broker request: %s\n", entryParams );
+                    MESSAGE( "[OHOS-LOADER] start_server broker request: %s\n", entryParams );
 
                     char req[2048];
                     int reqlen = snprintf(req, sizeof(req), "SPAWN\n%s\n", entryParams);
@@ -643,7 +643,7 @@ void start_server( BOOL debug )
                         ssize_t n = recv(broker_fd, response, sizeof(response), MSG_WAITALL);
                         if (n == sizeof(response))
                         {
-                            MESSAGE( "OHOS-DBG: start_server broker replied childPid=%d status=%d\n",
+                            MESSAGE( "[OHOS-LOADER] start_server broker replied childPid=%d status=%d\n",
                                      response[0], response[1] );
                             if (response[1] == 0 && response[0] > 0)
                                 started = TRUE;
@@ -656,7 +656,7 @@ void start_server( BOOL debug )
             if (started)
             {
                 /* poll socket 直到就绪（最多 5 秒） */
-                MESSAGE( "OHOS-DBG: start_server waiting for wineserver socket...\n" );
+                MESSAGE( "[OHOS-LOADER] start_server waiting for wineserver socket...\n" );
                 int found = 0;
                 for (int wait = 0; wait < 25; wait++)
                 {
@@ -674,7 +674,7 @@ void start_server( BOOL debug )
                                 snprintf(sub, sizeof(sub), "%s/%s/socket", sockdir_check, de->d_name);
                                 if (stat(sub, &st) == 0 && S_ISSOCK(st.st_mode))
                                 {
-                                    MESSAGE( "OHOS-DBG: start_server socket ready at %s\n", sub );
+                                    MESSAGE( "[OHOS-LOADER] start_server socket ready at %s\n", sub );
                                     found = 1;
                                     break;
                                 }
@@ -686,18 +686,18 @@ void start_server( BOOL debug )
                     usleep(200000);
                 }
                 if (found)
-                    MESSAGE( "OHOS-DBG: start_server wineserver socket ready\n" );
+                    MESSAGE( "[OHOS-LOADER] start_server wineserver socket ready\n" );
                 else
-                    MESSAGE( "OHOS-DBG: start_server timeout waiting for socket\n" );
+                    MESSAGE( "[OHOS-LOADER] start_server timeout waiting for socket\n" );
             }
             else
-                MESSAGE( "OHOS-DBG: start_server broker spawn failed, will retry\n" );
+                MESSAGE( "[OHOS-LOADER] start_server broker spawn failed, will retry\n" );
         }
         else
         {
             /* socket 已存在，但可能是即将退出的 wineserver 残留。
              * 短暂 poll 确认 socket 稳定存在（2 秒），消失则 fall through 去 spawn。 */
-            MESSAGE( "OHOS-DBG: start_server socket found, verifying stability...\n" );
+            MESSAGE( "[OHOS-LOADER] start_server socket found, verifying stability...\n" );
             int stable = 1;
             for (int wait = 0; wait < 10; wait++)
             {
@@ -725,11 +725,11 @@ void start_server( BOOL debug )
             }
             if (stable)
             {
-                MESSAGE( "OHOS-DBG: start_server socket stable, skipping spawn\n" );
+                MESSAGE( "[OHOS-LOADER] start_server socket stable, skipping spawn\n" );
                 started = TRUE;
             }
             else
-                MESSAGE( "OHOS-DBG: start_server socket vanished, will spawn\n" );
+                MESSAGE( "[OHOS-LOADER] start_server socket vanished, will spawn\n" );
         }
 #else
         /* 标准 Linux: posix_spawn wineserver */
@@ -742,13 +742,13 @@ void start_server( BOOL debug )
         argv[2] = NULL;
         if (exec_wineserver( &pid, argv ))
         {
-            MESSAGE( "OHOS-DBG: start_server FAILED exec_wineserver returned error\n" );
+            MESSAGE( "[OHOS-LOADER] start_server FAILED exec_wineserver returned error\n" );
             fatal_error( "could not exec wineserver\n" );
         }
-        MESSAGE( "OHOS-DBG: start_server waitpid pid=%d...\n", (int)pid );
+        MESSAGE( "[OHOS-LOADER] start_server waitpid pid=%d...\n", (int)pid );
         waitpid( pid, &status, 0 );
         status = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-        MESSAGE( "OHOS-DBG: start_server waitpid done, pid=%d status=%d WIFEXITED=%d\n",
+        MESSAGE( "[OHOS-LOADER] start_server waitpid done, pid=%d status=%d WIFEXITED=%d\n",
                  (int)pid, status, WIFEXITED(status) );
         if (status == 2) return;  /* server lock held by someone else, will retry later */
         if (status) exit(status);  /* server failed */
@@ -2070,13 +2070,10 @@ static void start_main_thread(void)
     *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
     set_load_order_app_name( main_wargv[0] );
     init_thread_stack( teb, 0, 0, 0 );
-    MESSAGE( "OHOS-DBG: init_thread_stack done, StackBase=%p StackLimit=%p\n",
-             teb->Tib.StackBase, teb->Tib.StackLimit );
     NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
     load_ntdll();
     load_wow64_ntdll( main_image_info.Machine );
     load_apiset_dll();
-    MESSAGE( "OHOS-DBG: start_main_thread about to call server_init_process_done\n" );
     server_init_process_done();
 }
 

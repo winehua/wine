@@ -222,7 +222,6 @@ static unsigned int unload_trace_seq;
 
 static void __fastcall default_thread_init_func( DWORD unknown, LPTHREAD_START_ROUTINE entry, void *arg )
 {
-    ERR( "OHOS-DBG: default_thread_init_func calling entry=%p arg=%p\n", entry, arg );
     RtlExitUserThread( entry( arg ) );
 }
 
@@ -1798,12 +1797,8 @@ static NTSTATUS process_attach( LDR_DDAG_NODE *node, LPVOID lpReserved )
     /* Call DLL entry point */
     if (status == STATUS_SUCCESS)
     {
-        ERR( "OHOS-DBG: calling DllMain(%s) PROCESS_ATTACH\n",
-             debugstr_w(wm->ldr.BaseDllName.Buffer) );
         call_ldr_notifications( LDR_DLL_NOTIFICATION_REASON_LOADED, &wm->ldr );
         status = MODULE_InitDLL( wm, DLL_PROCESS_ATTACH, lpReserved );
-        ERR( "OHOS-DBG: DllMain(%s) PROCESS_ATTACH done status=%lx\n",
-             debugstr_w(wm->ldr.BaseDllName.Buffer), status );
         if (status == STATUS_SUCCESS)
         {
             wm->ldr.Flags |= LDR_PROCESS_ATTACHED;
@@ -4450,10 +4445,6 @@ void loader_init( CONTEXT *context, void **entry )
     ULONG_PTR cookie, port = 0;
     WINE_MODREF *wm;
 
-    MESSAGE( "OHOS-DBG: loader_init ENTER ProcessHeap=%p Peb=%p\n",
-             NtCurrentTeb()->Peb ? NtCurrentTeb()->Peb->ProcessHeap : (void*)-1,
-             NtCurrentTeb()->Peb );
-
     if (process_detaching) NtTerminateThread( GetCurrentThread(), 0 );
 
     if (NtCurrentTeb()->SkipLoaderInit) return;
@@ -4473,8 +4464,6 @@ void loader_init( CONTEXT *context, void **entry )
         peb->TlsExpansionBitmap = &tls_expansion_bitmap;
         peb->LoaderLock         = &loader_section;
         peb->ProcessHeap        = RtlCreateHeap( HEAP_GROWABLE, NULL, 0, 0, NULL, NULL );
-        MESSAGE( "OHOS-DBG: loader_init RtlCreateHeap → ProcessHeap=%p\n",
-                 peb->ProcessHeap );
 
         RtlInitializeBitMap( &tls_bitmap, peb->TlsBitmapBits, sizeof(peb->TlsBitmapBits) * 8 );
         RtlInitializeBitMap( &tls_expansion_bitmap, peb->TlsExpansionBitmapBits,
@@ -4514,8 +4503,6 @@ void loader_init( CONTEXT *context, void **entry )
         }
         node_kernel32 = kernel32->ldr.DdagNode;
         pBaseThreadInitThunk = RtlFindExportedRoutineByName( kernel32->ldr.DllBase, "BaseThreadInitThunk" );
-        ERR( "OHOS-DBG: pBaseThreadInitThunk=%p (default=%p)\n",
-             pBaseThreadInitThunk, (void *)default_thread_init_func );
         LdrGetProcedureAddress( kernel32->ldr.DllBase, &ctrl_routine, 0, (void **)&pCtrlRoutine );
 
         actctx_init();
@@ -4523,16 +4510,10 @@ void loader_init( CONTEXT *context, void **entry )
         if (needs_elevation())
             elevate_token();
         get_env_var( L"WINESYSTEMDLLPATH", 0, &system_dll_path );
-        ERR( "OHOS-DBG: before fixup_imports *entry=%p wm->ldr.EntryPoint=%p flags=%lx\n",
-             *entry, wm->ldr.EntryPoint, wm->ldr.Flags );
         if (wm->ldr.Flags & LDR_COR_ILONLY)
-        {
-            ERR( "OHOS-DBG: taking fixup_imports_ilonly path!\n" );
             status = fixup_imports_ilonly( wm, NULL, entry );
-        }
         else
             status = fixup_imports( wm, NULL );
-        ERR( "OHOS-DBG: after fixup *entry=%p\n", *entry );
 
         if (status)
         {
@@ -4540,7 +4521,6 @@ void loader_init( CONTEXT *context, void **entry )
                  debugstr_w(NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer), status );
             NtTerminateProcess( GetCurrentProcess(), status );
         }
-        ERR( "OHOS-DBG: imports_fixup_done, flushing...\n" );
         imports_fixup_done = TRUE;
     }
     else
@@ -4563,10 +4543,8 @@ void loader_init( CONTEXT *context, void **entry )
 
     NtCurrentTeb()->FlsSlots = fls_alloc_data();
 
-    ERR( "OHOS-DBG: after imports block, attach_done=%d\n", attach_done );
     if (!attach_done)  /* first time around */
     {
-        ERR( "OHOS-DBG: first-time attach, calling alloc_thread_tls...\n" );
         attach_done = 1;
         if ((status = alloc_thread_tls()) != STATUS_SUCCESS)
         {
@@ -4578,14 +4556,10 @@ void loader_init( CONTEXT *context, void **entry )
         if (wm->ldr.ActivationContext)
             RtlActivateActivationContext( 0, wm->ldr.ActivationContext, &cookie );
 
-        ERR( "OHOS-DBG: calling process_attach for ntdll...\n" );
         status = process_attach( node_ntdll, context );
-        ERR( "OHOS-DBG: process_attach ntdll done status=%lx\n", status );
         if (!status)
         {
-            ERR( "OHOS-DBG: calling process_attach for kernel32...\n" );
             status = process_attach( node_kernel32, context );
-            ERR( "OHOS-DBG: process_attach kernel32 done status=%lx\n", status );
         }
         if (status)
         {
@@ -4594,7 +4568,6 @@ void loader_init( CONTEXT *context, void **entry )
             NtTerminateProcess( GetCurrentProcess(), status );
         }
 
-        ERR( "OHOS-DBG: calling walk_node_dependencies...\n" );
         if ((status = walk_node_dependencies( wm->ldr.DdagNode, context, process_attach )))
         {
             if (last_failed_modref)
@@ -4604,7 +4577,6 @@ void loader_init( CONTEXT *context, void **entry )
                  debugstr_w(NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer), status );
             NtTerminateProcess( GetCurrentProcess(), status );
         }
-        ERR( "OHOS-DBG: walk_node_dependencies done status=%lx\n", status );
         release_address_space();
         if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, DLL_PROCESS_ATTACH );
         if (wm->ldr.ActivationContext) RtlDeactivateActivationContext( 0, cookie );
@@ -4620,7 +4592,6 @@ void loader_init( CONTEXT *context, void **entry )
         if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, DLL_THREAD_ATTACH );
     }
 
-    ERR( "OHOS-DBG: loader_init EXIT\n" );
     RtlLeaveCriticalSection( &loader_section );
 }
 

@@ -1541,7 +1541,6 @@ static WCHAR *build_command_line( WCHAR **wargv )
  */
 static void run_wineboot( WCHAR *env, SIZE_T size )
 {
-    MESSAGE( "OHOS-DBG: run_wineboot ENTER\n" );
     static const WCHAR eventW[] = {'\\','K','e','r','n','e','l','O','b','j','e','c','t','s',
         '\\','_','_','w','i','n','e','b','o','o','t','_','e','v','e','n','t',0};
     static const WCHAR appnameW[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','w','s',
@@ -1604,12 +1603,10 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
     handles[count++] = process;
 
 wait:
-    MESSAGE( "OHOS-DBG: run_wineboot at wait, count=%d\n", count );
     timeout.QuadPart = (ULONGLONG)5 * 60 * 1000 * -10000;
     if (NtWaitForMultipleObjects( count, handles, WaitAny, FALSE, &timeout ) == WAIT_TIMEOUT)
         ERR( "boot event wait timed out\n" );
     while (count) NtClose( handles[--count] );
-    MESSAGE( "OHOS-DBG: run_wineboot EXIT\n" );
 }
 
 
