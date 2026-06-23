@@ -374,6 +374,16 @@ HRESULT validate_fmt(const WAVEFORMATEXTENSIBLE *fmt, BOOL compatible)
     return ret;
 }
 
+static BOOL backend_allows_shared_mode_conversion(void)
+{
+    static const WCHAR wineohos_driverW[] = L"wineohos.drv";
+
+    /* The OHOS backend always mixes through a fixed 48 kHz stereo s16 broker.
+     * Let the backend accept common shared-mode client formats and normalize
+     * them internally instead of rejecting them before create_stream(). */
+    return drvs.module_name[0] && !wcsicmp(drvs.module_name, wineohos_driverW);
+}
+
 static HRESULT stream_init(struct audio_client *client, const BOOLEAN force_def_period,
                            const AUDCLNT_SHAREMODE mode, const DWORD flags,
                            REFERENCE_TIME duration, REFERENCE_TIME period,
@@ -421,17 +431,19 @@ static HRESULT stream_init(struct audio_client *client, const BOOLEAN force_def_
     } else {
         WAVEFORMATEX *mix_fmt;
 
-        if (FAILED(hr = IAudioClient3_GetMixFormat(&client->IAudioClient3_iface, &mix_fmt)))
-            return hr;
-
-        if (flags & AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM)
+        if (flags & AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM || backend_allows_shared_mode_conversion())
             compatible = TRUE;
-        else if (flags & AUDCLNT_STREAMFLAGS_RATEADJUST)
-            compatible = fmt->nChannels == mix_fmt->nChannels;
-        else
-            compatible = fmt->nSamplesPerSec == mix_fmt->nSamplesPerSec && fmt->nChannels == mix_fmt->nChannels;
+        else {
+            if (FAILED(hr = IAudioClient3_GetMixFormat(&client->IAudioClient3_iface, &mix_fmt)))
+                return hr;
 
-        CoTaskMemFree(mix_fmt);
+            if (flags & AUDCLNT_STREAMFLAGS_RATEADJUST)
+                compatible = fmt->nChannels == mix_fmt->nChannels;
+            else
+                compatible = fmt->nSamplesPerSec == mix_fmt->nSamplesPerSec && fmt->nChannels == mix_fmt->nChannels;
+
+            CoTaskMemFree(mix_fmt);
+        }
     }
 
     hr = validate_fmt((const WAVEFORMATEXTENSIBLE *)fmt, compatible);
@@ -816,12 +828,17 @@ static HRESULT WINAPI client_IsFormatSupported(IAudioClient3 *iface, AUDCLNT_SHA
     } else {
         WAVEFORMATEX *mix_fmt;
 
-        if (FAILED(hr = IAudioClient3_GetMixFormat(iface, &mix_fmt)))
-            return hr;
+        if (backend_allows_shared_mode_conversion())
+            compatible = TRUE;
+        else
+        {
+            if (FAILED(hr = IAudioClient3_GetMixFormat(iface, &mix_fmt)))
+                return hr;
 
-        compatible = fmt->nSamplesPerSec == mix_fmt->nSamplesPerSec && fmt->nChannels == mix_fmt->nChannels;
+            compatible = fmt->nSamplesPerSec == mix_fmt->nSamplesPerSec && fmt->nChannels == mix_fmt->nChannels;
 
-        CoTaskMemFree(mix_fmt);
+            CoTaskMemFree(mix_fmt);
+        }
     }
 
     hr = validate_fmt((const WAVEFORMATEXTENSIBLE *)fmt, TRUE);

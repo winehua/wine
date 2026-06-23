@@ -1,0 +1,7 @@
+MODULE    = winehua_audio_smoke.exe
+IMPORTS   = ole32
+
+EXTRADLLFLAGS = -mconsole
+
+SOURCES = \
+	main.c
