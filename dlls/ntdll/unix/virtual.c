@@ -4197,15 +4197,15 @@ struct thread_data *virtual_alloc_thread_data(void)
     {
         data = view->base;
     }
+#ifdef __OHOS__
+    /* OHOS: Box64 不支持 map_view, 回退到 anon_mmap */
     else
     {
-#ifdef __OHOS__
-        /* OHOS: fallback to anon_mmap for Box64 compatibility */
         data = anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
         if (data != MAP_FAILED)
             status = 0;
-#endif
     }
+#endif
     if (!status)
     {
         data->request_fd = -1;
