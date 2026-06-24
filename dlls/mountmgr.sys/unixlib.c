@@ -295,7 +295,7 @@ static NTSTATUS get_dosdev_symlink( void *args )
     /* OHOS: symlink() not available in NAPI sandbox. For known drive
      * letters, return hardcoded default mount points, but ONLY if the
      * target directory actually exists (avoids creating phantom drives).
-     * c: → $WINEPREFIX/drive_c, z: → /
+     * c: → $WINEPREFIX/drive_c, z: → /storage/Users/currentUserstorage/Users/currentUser
      * :: (block device) variants are skipped (no real device). */
     if (ret == -1)
     {
@@ -305,9 +305,8 @@ static NTSTATUS get_dosdev_symlink( void *args )
             struct stat st;
             if (dev[0] == 'z')
             {
-                const char *home = getenv( "HOME" );
-                if (!home) home = "/storage/Users/currentUser";
-                lstrcpynA( params->dest, home, params->size );
+                const char *z_target = "/storage/Users/currentUser";
+                lstrcpynA( params->dest, z_target, params->size );
                 if (params->size > 0) params->dest[params->size - 1] = 0;
                 return STATUS_SUCCESS;
             }

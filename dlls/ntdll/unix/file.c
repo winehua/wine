@@ -3836,7 +3836,7 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
 #ifdef __OHOS__
     /* OHOS: symlink() not available in NAPI sandbox. For drive letter
      * prefixes, fall back to hardcoded default directory paths.
-     * c: → $WINEPREFIX/drive_c, ..., z: → $HOME */
+     * c: → $WINEPREFIX/drive_c, ..., z: → /storage/Users/currentUser */
     if (prefix_len == 2 && prefix[1] == ':')
     {
         unix_name[pos] = 0;  /* null-terminate the prefix for lstat */
@@ -3844,10 +3844,9 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
         {
             if (prefix[0] == 'z')
             {
-                const char *home = getenv( "HOME" );
-                if (!home) home = "/storage/Users/currentUser";
-                strcpy( unix_name, home );
-                pos = strlen( home );
+                const char *z_target = "/storage/Users/currentUser";
+                strcpy( unix_name, z_target );
+                pos = strlen( z_target );
             }
             else if (prefix[0] >= 'c' && prefix[0] <= 'y')
             {
