@@ -15,8 +15,6 @@
 #include <windows.h>
 #include <GL/gl.h>
 
-#include "graphics_runtime_env.h"
-
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -30,19 +28,20 @@ struct app_state
     int height;
     BOOL running;
     BOOL loop_forever;
-    BOOL running_under_wine;
     DWORD duration_ms;
     LARGE_INTEGER freq;
-    WinehuaGraphicsRuntimeEnv gfx_env;
+    const char *requested_backend;
+    const char *active_backend;
+    const char *virgl_ready;
+    const char *virgl_socket_ready;
+    const char *virgl_library_ready;
+    const char *guest_gfx_ready;
+    const char *guest_gfx_mode;
+    const char *frame_transport;
+    const char *graphics_note;
+    BOOL force_gl;
     double current_fps;
 };
-
-static BOOL detect_wine_runtime(void)
-{
-    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-
-    return ntdll && GetProcAddress(ntdll, "wine_get_version") != NULL;
-}
 
 enum seven_segment_bits
 {
@@ -71,35 +70,39 @@ static const unsigned char digit_segments[10] =
 
 static void load_graphics_env(struct app_state *state)
 {
-    winehua_graphics_runtime_env_load(&state->gfx_env);
+    const char *force_gl;
+
+    state->requested_backend = getenv("WINEHUA_GRAPHICS_BACKEND");
+    state->active_backend = getenv("WINEHUA_GRAPHICS_ACTIVE");
+    state->virgl_ready = getenv("WINEHUA_VIRGL_READY");
+    state->virgl_socket_ready = getenv("WINEHUA_VIRGL_SOCKET_READY");
+    state->virgl_library_ready = getenv("WINEHUA_VIRGL_LIBRARY_READY");
+    state->guest_gfx_ready = getenv("WINEHUA_GUEST_GFX_READY");
+    state->guest_gfx_mode = getenv("WINEHUA_GUEST_GFX_MODE");
+    state->frame_transport = getenv("WINEHUA_FRAME_TRANSPORT");
+    state->graphics_note = getenv("WINEHUA_GRAPHICS_NOTE");
+    force_gl = getenv("WINEHUA_GRAPHICS_FORCE_GL");
+    state->force_gl = force_gl && !lstrcmpA(force_gl, "1");
 }
 
 static BOOL validate_graphics_backend(const struct app_state *state, char *reason, size_t reason_size)
 {
-    const WinehuaGraphicsRuntimeEnv *gfx = &state->gfx_env;
-    const char *requested = winehua_graphics_env_or(gfx->requested_backend, "?");
-    const char *active = winehua_graphics_env_or(gfx->active_backend, "?");
-    const char *ready = winehua_graphics_env_or(gfx->virgl_ready, "?");
-    const char *socket_ready = winehua_graphics_env_or(gfx->virgl_socket_ready, "?");
-    const char *library_ready = winehua_graphics_env_or(gfx->virgl_library_ready, "?");
-    const char *guest_ready = winehua_graphics_env_or(gfx->guest_gfx_ready, "?");
-    const char *guest_mode = winehua_graphics_env_or(gfx->guest_gfx_mode, "?");
-    const char *transport = winehua_graphics_env_or(gfx->frame_transport, "?");
-    const char *note = winehua_graphics_env_or(gfx->graphics_note, "(none)");
-    const char *force_mode = gfx->force_gl ? "1" : "0";
+    const char *requested = state->requested_backend ? state->requested_backend : "?";
+    const char *active = state->active_backend ? state->active_backend : "?";
+    const char *ready = state->virgl_ready ? state->virgl_ready : "?";
+    const char *socket_ready = state->virgl_socket_ready ? state->virgl_socket_ready : "?";
+    const char *library_ready = state->virgl_library_ready ? state->virgl_library_ready : "?";
+    const char *guest_ready = state->guest_gfx_ready ? state->guest_gfx_ready : "?";
+    const char *guest_mode = state->guest_gfx_mode ? state->guest_gfx_mode : "?";
+    const char *transport = state->frame_transport ? state->frame_transport : "?";
+    const char *note = state->graphics_note ? state->graphics_note : "(none)";
+    const char *force_mode = state->force_gl ? "1" : "0";
 
     if (reason_size) reason[0] = '\0';
 
-    if (!state->running_under_wine)
+    if (!state->active_backend || lstrcmpiA(state->active_backend, "virgl"))
     {
-        snprintf(reason, reason_size,
-                 "Native Windows runtime detected. Skipping Wine/VirGL environment checks and running visual smoke only.");
-        return TRUE;
-    }
-
-    if (!gfx->active_backend || lstrcmpiA(gfx->active_backend, "virgl"))
-    {
-        if (gfx->force_gl)
+        if (state->force_gl)
         {
             snprintf(reason, reason_size,
                      "VirGL backend is not active, but force_gl=1 so continuing with OpenGL diagnostics.\n\n"
@@ -115,9 +118,9 @@ static BOOL validate_graphics_backend(const struct app_state *state, char *reaso
         return FALSE;
     }
 
-    if (!gfx->virgl_ready || lstrcmpA(gfx->virgl_ready, "1"))
+    if (!state->virgl_ready || lstrcmpA(state->virgl_ready, "1"))
     {
-        if (gfx->force_gl)
+        if (state->force_gl)
         {
             snprintf(reason, reason_size,
                      "VirGL backend is selected but not ready, yet force_gl=1 so continuing with OpenGL diagnostics.\n\n"
@@ -259,17 +262,17 @@ static BOOL init_opengl(struct app_state *state)
             (const char *)glGetString(GL_VENDOR),
             (const char *)glGetString(GL_RENDERER),
             (const char *)glGetString(GL_VERSION));
-        fprintf(stderr, "winehua_graphics_smoke: env requested=%s active=%s virgl_ready=%s guest_gfx_ready=%s guest_gfx_mode=%s socket_ready=%s library_ready=%s transport=%s force_gl=%d note=%s\n",
-            winehua_graphics_env_or(state->gfx_env.requested_backend, "(null)"),
-            winehua_graphics_env_or(state->gfx_env.active_backend, "(null)"),
-            winehua_graphics_env_or(state->gfx_env.virgl_ready, "(null)"),
-            winehua_graphics_env_or(state->gfx_env.guest_gfx_ready, "(null)"),
-            winehua_graphics_env_or(state->gfx_env.guest_gfx_mode, "(null)"),
-            winehua_graphics_env_or(state->gfx_env.virgl_socket_ready, "(null)"),
-            winehua_graphics_env_or(state->gfx_env.virgl_library_ready, "(null)"),
-            winehua_graphics_env_or(state->gfx_env.frame_transport, "(null)"),
-            state->gfx_env.force_gl ? 1 : 0,
-            winehua_graphics_env_or(state->gfx_env.graphics_note, "(null)"));
+    fprintf(stderr, "winehua_graphics_smoke: env requested=%s active=%s virgl_ready=%s guest_gfx_ready=%s guest_gfx_mode=%s socket_ready=%s library_ready=%s transport=%s force_gl=%d note=%s\n",
+            state->requested_backend ? state->requested_backend : "(null)",
+            state->active_backend ? state->active_backend : "(null)",
+            state->virgl_ready ? state->virgl_ready : "(null)",
+            state->guest_gfx_ready ? state->guest_gfx_ready : "(null)",
+            state->guest_gfx_mode ? state->guest_gfx_mode : "(null)",
+            state->virgl_socket_ready ? state->virgl_socket_ready : "(null)",
+            state->virgl_library_ready ? state->virgl_library_ready : "(null)",
+            state->frame_transport ? state->frame_transport : "(null)",
+            state->force_gl ? 1 : 0,
+            state->graphics_note ? state->graphics_note : "(null)");
     return TRUE;
 }
 
@@ -279,10 +282,10 @@ static void set_window_title_once(const struct app_state *state)
 
     snprintf(title, sizeof(title),
              "WineHua Graphics Smoke [req=%s act=%s ready=%s force=%d]",
-             winehua_graphics_env_or(state->gfx_env.requested_backend, "?"),
-             winehua_graphics_env_or(state->gfx_env.active_backend, "?"),
-             winehua_graphics_env_or(state->gfx_env.virgl_ready, "?"),
-             state->gfx_env.force_gl ? 1 : 0);
+             state->requested_backend ? state->requested_backend : "?",
+             state->active_backend ? state->active_backend : "?",
+             state->virgl_ready ? state->virgl_ready : "?",
+             state->force_gl ? 1 : 0);
     SetWindowTextA(state->hwnd, title);
 }
 
@@ -617,7 +620,6 @@ int main(int argc, char **argv)
     BOOL forced_continue = FALSE;
 
     parse_args(&state, argc, argv);
-    state.running_under_wine = detect_wine_runtime();
     load_graphics_env(&state);
     if (!QueryPerformanceFrequency(&state.freq) || !state.freq.QuadPart)
     {
@@ -631,12 +633,7 @@ int main(int argc, char **argv)
         MessageBoxA(NULL, reason, "WineHua Graphics Smoke", MB_OK | MB_ICONWARNING);
         return 4;
     }
-    if (reason[0] && !state.running_under_wine)
-    {
-        fprintf(stderr, "winehua_graphics_smoke: %s\n", reason);
-        reason[0] = '\0';
-    }
-    if (state.gfx_env.force_gl && reason[0])
+    if (state.force_gl && reason[0])
     {
         forced_continue = TRUE;
         fprintf(stderr, "winehua_graphics_smoke: forced diagnostics mode: %s\n", reason);
@@ -650,16 +647,16 @@ int main(int argc, char **argv)
         snprintf(reason, sizeof(reason),
                  "OpenGL initialization failed.\n\nrequested=%s\nactive=%s\nready=%s\nguest_gfx_ready=%s\nguest_gfx_mode=%s\nsocket_ready=%s\nlibrary_ready=%s\ntransport=%s\nforce_gl=%d\n\nnote=%s\n\n"
                  "ChoosePixelFormat / WGL initialization is not working in the current build.",
-                 winehua_graphics_env_or(state.gfx_env.requested_backend, "?"),
-                 winehua_graphics_env_or(state.gfx_env.active_backend, "?"),
-                 winehua_graphics_env_or(state.gfx_env.virgl_ready, "?"),
-                 winehua_graphics_env_or(state.gfx_env.guest_gfx_ready, "?"),
-                 winehua_graphics_env_or(state.gfx_env.guest_gfx_mode, "?"),
-                 winehua_graphics_env_or(state.gfx_env.virgl_socket_ready, "?"),
-                 winehua_graphics_env_or(state.gfx_env.virgl_library_ready, "?"),
-                 winehua_graphics_env_or(state.gfx_env.frame_transport, "?"),
-                 state.gfx_env.force_gl ? 1 : 0,
-                 winehua_graphics_env_or(state.gfx_env.graphics_note, "(none)"));
+                 state.requested_backend ? state.requested_backend : "?",
+                 state.active_backend ? state.active_backend : "?",
+                 state.virgl_ready ? state.virgl_ready : "?",
+                 state.guest_gfx_ready ? state.guest_gfx_ready : "?",
+                 state.guest_gfx_mode ? state.guest_gfx_mode : "?",
+                 state.virgl_socket_ready ? state.virgl_socket_ready : "?",
+                 state.virgl_library_ready ? state.virgl_library_ready : "?",
+                 state.frame_transport ? state.frame_transport : "?",
+                 state.force_gl ? 1 : 0,
+                 state.graphics_note ? state.graphics_note : "(none)");
         MessageBoxA(state.hwnd, reason, "WineHua Graphics Smoke", MB_OK | MB_ICONERROR);
         return 3;
     }
