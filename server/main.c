@@ -44,6 +44,7 @@
 /* command-line options */
 int debug_level = 0;
 int foreground = 0;
+int no_auto_close = 0;
 timeout_t master_socket_timeout = 3 * -TICKS_PER_SEC;  /* master socket timeout, default is 3 seconds */
 const char *server_argv0;
 
@@ -58,6 +59,7 @@ static void usage( FILE *fh )
     fprintf(fh, "   -h,    --help            display this help message\n");
     fprintf(fh, "   -k[n], --kill[=n]        kill the current wineserver, optionally with signal n\n");
     fprintf(fh, "   -p[n], --persistent[=n]  make server persistent, optionally for n seconds\n");
+    fprintf(fh, "   --no-auto-close           don't close desktop when last non-system process exits\n");
     fprintf(fh, "   -v,    --version         display version information and exit\n");
     fprintf(fh, "   -w,    --wait            wait until the current wineserver terminates\n");
     fprintf(fh, "\n");
@@ -77,6 +79,9 @@ static void option_callback( int optc, char *optarg )
         break;
     case 'f':
         foreground = 1;
+        break;
+    case 128:  /* --no-auto-close */
+        no_auto_close = 1;
         break;
     case 'h':
         usage(stdout);
@@ -118,6 +123,7 @@ static struct long_option
     {"help",        0, 'h'},
     {"kill",        2, 'k'},
     {"persistent",  2, 'p'},
+    {"no-auto-close", 0, 128},  /* 128 = non-ASCII, long-only */
     {"version",     0, 'v'},
     {"wait",        0, 'w'},
     { NULL }

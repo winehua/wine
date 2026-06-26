@@ -341,6 +341,7 @@ extern struct object *create_symlink( struct object *root, const struct unicode_
   /* command-line options */
 extern int debug_level;
 extern int foreground;
+extern int no_auto_close;
 extern timeout_t master_socket_timeout;
 extern const char *server_argv0;
 
