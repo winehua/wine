@@ -1564,6 +1564,7 @@ enable_winegstreamer
 enable_winehid_sys
 enable_winemac_drv
 enable_winemapi
+enable_wineohos_drv
 enable_wineoss_drv
 enable_wineps_drv
 enable_winepulse_drv
@@ -1803,6 +1804,7 @@ enable_winefile
 enable_winemenubuilder
 enable_winemine
 enable_winemsibuilder
+enable_winehua_audio_smoke
 enable_winepath
 enable_winetest
 enable_winevdm
@@ -23638,6 +23640,7 @@ wine_fn_config_makefile dlls/winegstreamer enable_winegstreamer
 wine_fn_config_makefile dlls/winehid.sys enable_winehid_sys
 wine_fn_config_makefile dlls/winemac.drv enable_winemac_drv
 wine_fn_config_makefile dlls/winemapi enable_winemapi
+wine_fn_config_makefile dlls/wineohos.drv enable_wineohos_drv
 wine_fn_config_makefile dlls/wineoss.drv enable_wineoss_drv
 wine_fn_config_makefile dlls/wineps.drv enable_wineps_drv
 wine_fn_config_makefile dlls/wineps16.drv16 enable_win16
@@ -23926,6 +23929,7 @@ wine_fn_config_makefile programs/winefile enable_winefile
 wine_fn_config_makefile programs/winemenubuilder enable_winemenubuilder
 wine_fn_config_makefile programs/winemine enable_winemine
 wine_fn_config_makefile programs/winemsibuilder enable_winemsibuilder
+wine_fn_config_makefile programs/winehua_audio_smoke enable_winehua_audio_smoke
 wine_fn_config_makefile programs/winepath enable_winepath
 wine_fn_config_makefile programs/winetest enable_winetest
 wine_fn_config_makefile programs/winevdm enable_winevdm

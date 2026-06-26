@@ -13,3 +13,4 @@ build-ohos-arm64/
 # Editor
 *.swp
 *~
+autom4te.cache/
