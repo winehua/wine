@@ -358,7 +358,7 @@ HRESULT validate_fmt(const WAVEFORMATEXTENSIBLE *fmt, BOOL compatible)
     {
         if (fmt2.Format.wBitsPerSample != 32 && fmt2.Format.wBitsPerSample != 64)
             ret = E_INVALIDARG;
-        else if (fmt2.Format.wBitsPerSample != 32)
+        else if (fmt2.Format.wBitsPerSample != 32 && !compatible)
             ret = AUDCLNT_E_UNSUPPORTED_FORMAT;
         else if (fmt2.Samples.wValidBitsPerSample != fmt2.Format.wBitsPerSample)
             ret = AUDCLNT_E_UNSUPPORTED_FORMAT;

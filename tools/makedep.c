@@ -2508,6 +2508,7 @@ static struct install_command *find_install_command( enum install_rules rules, s
 
     ARRAY_FOR_EACH( cmd, &install_commands[rules], struct install_command )
     {
+        if (cmd->dest) continue;
         if (strcmp( cmd->dir, dir )) continue;
         if (args.count != cmd->args.count) continue;
         for (i = 0; i < args.count; i++) if (strcmp( args.str[i], cmd->args.str[i] )) break;
@@ -2897,7 +2898,17 @@ static void output_install_commands( struct array commands )
     {
         if (cmd->dest)
         {
-            assert( cmd->files.count == 1 );
+            if (cmd->files.count != 1)
+            {
+                unsigned int i;
+
+                fprintf( stderr, "makedep: invalid install command dir=%s dest=%s files=%u targets=%u args=%u\n",
+                         cmd->dir, cmd->dest, cmd->files.count, cmd->targets.count, cmd->args.count );
+                for (i = 0; i < cmd->args.count; i++) fprintf( stderr, "  arg[%u]=%s\n", i, cmd->args.str[i] );
+                for (i = 0; i < cmd->files.count; i++) fprintf( stderr, "  file[%u]=%s\n", i, cmd->files.str[i] );
+                for (i = 0; i < cmd->targets.count; i++) fprintf( stderr, "  target[%u]=%s\n", i, cmd->targets.str[i] );
+                assert( cmd->files.count == 1 );
+            }
             output( "\t%s", install );
             output_filenames( cmd->args );
             output_filenames( cmd->files );

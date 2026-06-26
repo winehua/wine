@@ -26,8 +26,13 @@
 
 #include <assert.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 #include "ntstatus.h"
 #include "waylanddrv.h"
@@ -44,6 +49,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 static const struct egl_platform *egl;
 static const struct opengl_funcs *funcs;
 static const struct opengl_drawable_funcs wayland_drawable_funcs;
+static int winehua_virgl_probe_done;
 
 struct wayland_gl_drawable
 {
@@ -137,6 +143,52 @@ static void wayland_init_egl_platform(struct egl_platform *platform)
     platform->native_display = process_wayland.wl_display;
     platform->force_pbuffer_formats = TRUE;
     egl = platform;
+}
+
+static void wayland_probe_winehua_virgl_socket(void)
+{
+    const char *socket_path = getenv("WINEHUA_VIRGL_SOCKET");
+    struct sockaddr_un addr;
+    int fd;
+
+    if (winehua_virgl_probe_done) return;
+    winehua_virgl_probe_done = 1;
+
+    if (!socket_path || !socket_path[0]) return;
+    if (strlen(socket_path) >= sizeof(addr.sun_path))
+    {
+        fprintf(stderr, "winehua_virgl_guest_probe: socket path too long: %s\n", socket_path);
+        WARN("WineHua virgl socket path too long: %s\n", debugstr_a(socket_path));
+        return;
+    }
+
+    if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
+    {
+        fprintf(stderr, "winehua_virgl_guest_probe: socket() failed for %s: %s\n",
+                socket_path, strerror(errno));
+        WARN("WineHua virgl socket() failed for %s: %s\n", debugstr_a(socket_path), strerror(errno));
+        return;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, socket_path);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1)
+    {
+        fprintf(stderr, "winehua_virgl_guest_probe: connect(%s) failed: %s\n",
+                socket_path, strerror(errno));
+        WARN("WineHua virgl connect(%s) failed: %s\n", debugstr_a(socket_path), strerror(errno));
+        close(fd);
+        return;
+    }
+
+    fprintf(stderr,
+            "winehua_virgl_guest_probe: connected to %s, but winewayland OpenGL still uses the stock EGL path\n",
+            socket_path);
+    WARN("WineHua virgl guest probe connected to %s, but command transport is not implemented yet\n",
+         debugstr_a(socket_path));
+    close(fd);
 }
 
 static void wayland_drawable_flush(struct opengl_drawable *base, UINT flags)
@@ -255,6 +307,7 @@ UINT WAYLAND_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, c
 
     if (!opengl_funcs->egl_handle) return STATUS_NOT_SUPPORTED;
     funcs = opengl_funcs;
+    wayland_probe_winehua_virgl_socket();
 
     wayland_driver_funcs.p_get_proc_address = (*driver_funcs)->p_get_proc_address;
     wayland_driver_funcs.p_init_pixel_formats = (*driver_funcs)->p_init_pixel_formats;

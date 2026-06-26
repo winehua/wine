@@ -53,6 +53,7 @@ static const WCHAR render_device_name[] =
     'O','H','O','S',' ','A','u','d','i','o',' ','S','p','e','a','k','e','r',0
 };
 static const char render_device_id[] = "default";
+#define MIX_FRAMES_ERROR (~0u)
 
 struct ohos_stream
 {
@@ -152,9 +153,24 @@ static BOOL is_pcm_format(const WAVEFORMATEX *fmt)
            IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_PCM);
 }
 
+static UINT16 get_valid_bits_per_sample(const WAVEFORMATEX *fmt)
+{
+    if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
+        return ((const WAVEFORMATEXTENSIBLE *)fmt)->Samples.wValidBitsPerSample;
+    return fmt->wBitsPerSample;
+}
+
+static BOOL is_supported_sample_rate(UINT32 rate)
+{
+    /* The broker always mixes to 48 kHz stereo s16, so we can accept
+     * common shared-mode client streams and resample them on either side
+     * of the mix rate instead of rejecting them up front. */
+    return rate >= 8000 && rate <= 192000;
+}
+
 static HRESULT validate_format(const WAVEFORMATEX *fmt)
 {
-    const WAVEFORMATEXTENSIBLE *fmtex = (const WAVEFORMATEXTENSIBLE *)fmt;
+    UINT16 valid_bits;
 
     if (!fmt) return E_POINTER;
     if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
@@ -162,22 +178,30 @@ static HRESULT validate_format(const WAVEFORMATEX *fmt)
         return AUDCLNT_E_UNSUPPORTED_FORMAT;
     if (fmt->nChannels != 1 && fmt->nChannels != 2)
         return AUDCLNT_E_UNSUPPORTED_FORMAT;
-    if (fmt->nSamplesPerSec != 22050 && fmt->nSamplesPerSec != 44100 &&
-        fmt->nSamplesPerSec != 48000)
+    if (!is_supported_sample_rate(fmt->nSamplesPerSec))
+        return AUDCLNT_E_UNSUPPORTED_FORMAT;
+    valid_bits = get_valid_bits_per_sample(fmt);
+    if (!valid_bits || valid_bits > fmt->wBitsPerSample)
         return AUDCLNT_E_UNSUPPORTED_FORMAT;
 
     if (is_pcm_format(fmt))
     {
-        if (fmt->wBitsPerSample != 16) return AUDCLNT_E_UNSUPPORTED_FORMAT;
-        if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
-            fmtex->Samples.wValidBitsPerSample != fmt->wBitsPerSample)
+        if (fmt->wBitsPerSample != 8 && fmt->wBitsPerSample != 16 &&
+            fmt->wBitsPerSample != 24 && fmt->wBitsPerSample != 32)
+            return AUDCLNT_E_UNSUPPORTED_FORMAT;
+        if (fmt->wBitsPerSample == 32)
+        {
+            if (valid_bits != 24 && valid_bits != 32)
+                return AUDCLNT_E_UNSUPPORTED_FORMAT;
+        }
+        else if (valid_bits != fmt->wBitsPerSample)
             return AUDCLNT_E_UNSUPPORTED_FORMAT;
     }
     else if (is_float_format(fmt))
     {
-        if (fmt->wBitsPerSample != 32) return AUDCLNT_E_UNSUPPORTED_FORMAT;
-        if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
-            fmtex->Samples.wValidBitsPerSample != fmt->wBitsPerSample)
+        if (fmt->wBitsPerSample != 32 && fmt->wBitsPerSample != 64)
+            return AUDCLNT_E_UNSUPPORTED_FORMAT;
+        if (valid_bits != fmt->wBitsPerSample)
             return AUDCLNT_E_UNSUPPORTED_FORMAT;
     }
     else return AUDCLNT_E_UNSUPPORTED_FORMAT;
@@ -210,6 +234,51 @@ static WAVEFORMATEXTENSIBLE *clone_wave_format(const WAVEFORMATEX *fmt)
     ret->SubFormat = is_float_format(fmt) ? KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
                                           : KSDATAFORMAT_SUBTYPE_PCM;
     return ret;
+}
+
+static float read_pcm_u8(const BYTE *src)
+{
+    return ((INT32)src[0] - 128) / 128.0f;
+}
+
+static float read_pcm_s16(const BYTE *src)
+{
+    INT16 sample;
+
+    memcpy(&sample, src, sizeof(sample));
+    return sample / 32768.0f;
+}
+
+static float read_pcm_s24(const BYTE *src)
+{
+    INT32 sample = (INT32)((UINT32)src[0] | ((UINT32)src[1] << 8) | ((UINT32)src[2] << 16));
+
+    if (sample & 0x00800000) sample |= ~0x00ffffff;
+    return sample / 8388608.0f;
+}
+
+static float read_pcm_s32(const BYTE *src)
+{
+    INT32 sample;
+
+    memcpy(&sample, src, sizeof(sample));
+    return (float)((double)sample / 2147483648.0);
+}
+
+static float read_ieee_float32(const BYTE *src)
+{
+    float sample;
+
+    memcpy(&sample, src, sizeof(sample));
+    return sample;
+}
+
+static float read_ieee_float64(const BYTE *src)
+{
+    double sample;
+
+    memcpy(&sample, src, sizeof(sample));
+    return (float)sample;
 }
 
 static INT16 clamp_s16_float(float sample)
@@ -400,29 +469,48 @@ static HRESULT create_broker_stream(struct ohos_stream *stream, UINT32 requested
 static void decode_input_frame(const struct ohos_stream *stream, const BYTE *buffer, UINT32 frame, float *left, float *right)
 {
     UINT32 channels = stream->fmt->Format.nChannels;
+    UINT32 bytes_per_sample = stream->fmt->Format.wBitsPerSample / 8;
+    const BYTE *src = buffer + frame * stream->client_bytes_per_frame;
+    float sample0 = 0.0f, sample1 = 0.0f;
 
     if (is_float_format(&stream->fmt->Format))
     {
-        const float *src = (const float *)buffer + frame * channels;
-        if (channels == 1)
-            *left = *right = src[0];
+        if (bytes_per_sample == 4)
+        {
+            sample0 = read_ieee_float32(src);
+            sample1 = channels == 1 ? sample0 : read_ieee_float32(src + bytes_per_sample);
+        }
         else
         {
-            *left = src[0];
-            *right = src[1];
+            sample0 = read_ieee_float64(src);
+            sample1 = channels == 1 ? sample0 : read_ieee_float64(src + bytes_per_sample);
         }
     }
     else
     {
-        const INT16 *src = (const INT16 *)buffer + frame * channels;
-        if (channels == 1)
-            *left = *right = src[0] / 32768.0f;
-        else
+        switch (bytes_per_sample)
         {
-            *left = src[0] / 32768.0f;
-            *right = src[1] / 32768.0f;
+        case 1:
+            sample0 = read_pcm_u8(src);
+            sample1 = channels == 1 ? sample0 : read_pcm_u8(src + bytes_per_sample);
+            break;
+        case 2:
+            sample0 = read_pcm_s16(src);
+            sample1 = channels == 1 ? sample0 : read_pcm_s16(src + bytes_per_sample);
+            break;
+        case 3:
+            sample0 = read_pcm_s24(src);
+            sample1 = channels == 1 ? sample0 : read_pcm_s24(src + bytes_per_sample);
+            break;
+        default:
+            sample0 = read_pcm_s32(src);
+            sample1 = channels == 1 ? sample0 : read_pcm_s32(src + bytes_per_sample);
+            break;
         }
     }
+
+    *left = sample0;
+    *right = sample1;
 }
 
 static void apply_client_volume(const struct ohos_stream *stream, float *left, float *right)
@@ -487,7 +575,7 @@ static UINT32 convert_client_frames_to_mix_locked(struct ohos_stream *stream, co
 
     if (stream->fmt->Format.nSamplesPerSec == 48000)
     {
-        if (in_frames > dst_capacity_frames) return 0;
+        if (in_frames > dst_capacity_frames) return MIX_FRAMES_ERROR;
         for (i = 0; i < in_frames; ++i)
         {
             float left, right;
@@ -510,7 +598,7 @@ static UINT32 convert_client_frames_to_mix_locked(struct ohos_stream *stream, co
         UINT64 target_mix_total = (src_total * 48000ULL) / stream->fmt->Format.nSamplesPerSec;
         UINT64 needed = target_mix_total - stream->mix_output_frames;
 
-        if (needed > dst_capacity_frames) return 0;
+        if (needed > dst_capacity_frames) return MIX_FRAMES_ERROR;
 
         for (i = 0; i < needed; ++i)
         {
@@ -832,7 +920,7 @@ static NTSTATUS ohos_release_render_buffer(void *args)
 
     mix_frames = convert_client_frames_to_mix_locked(stream, stream->local_buffer, params->written_frames,
                                                      stream->mix_buffer, stream->mix_buffer_capacity_frames);
-    if (params->written_frames && !mix_frames && stream->fmt->Format.nSamplesPerSec != 44100)
+    if (mix_frames == MIX_FRAMES_ERROR)
     {
         stream->locked_frames = 0;
         return ohos_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_ERROR);
