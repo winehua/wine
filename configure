@@ -1805,6 +1805,7 @@ enable_winemenubuilder
 enable_winemine
 enable_winemsibuilder
 enable_winehua_audio_smoke
+enable_winehua_graphics_smoke
 enable_winepath
 enable_winetest
 enable_winevdm
@@ -23930,6 +23931,7 @@ wine_fn_config_makefile programs/winemenubuilder enable_winemenubuilder
 wine_fn_config_makefile programs/winemine enable_winemine
 wine_fn_config_makefile programs/winemsibuilder enable_winemsibuilder
 wine_fn_config_makefile programs/winehua_audio_smoke enable_winehua_audio_smoke
+wine_fn_config_makefile programs/winehua_graphics_smoke enable_winehua_graphics_smoke
 wine_fn_config_makefile programs/winepath enable_winepath
 wine_fn_config_makefile programs/winetest enable_winetest
 wine_fn_config_makefile programs/winevdm enable_winevdm

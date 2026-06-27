@@ -24,6 +24,8 @@
 #include "config.h"
 
 #include <assert.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <pthread.h>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -38,6 +40,32 @@
 #include "dibdrv/dibdrv.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wgl);
+
+static BOOL winehua_opengl_diag_enabled(void)
+{
+    static int cached = -1;
+    const char *value;
+
+    if (cached != -1) return cached;
+
+    value = getenv( "WINEHUA_OPENGL_DIAG" );
+    cached = !!(value && value[0] && strcmp( value, "0" ));
+    return cached;
+}
+
+static void winehua_opengl_diag( const char *fmt, ... )
+{
+    va_list args;
+
+    if (!winehua_opengl_diag_enabled()) return;
+
+    fprintf( stderr, "winehua_opengl_diag: " );
+    va_start( args, fmt );
+    vfprintf( stderr, fmt, args );
+    va_end( args );
+    fputc( '\n', stderr );
+    fflush( stderr );
+}
 
 struct pbuffer
 {
@@ -472,12 +500,16 @@ static UINT egldrv_init_pixel_formats( UINT *onscreen_count )
     const struct opengl_funcs *funcs = &display_funcs;
     struct egl_platform *egl = &display_egl;
     EGLConfig *configs;
-    EGLint i, j, render, count;
+    EGLint i, j, render, count, total_count;
+    UINT opengl_count = 0, gles1_count = 0, gles2_count = 0, gles3_count = 0;
 
     funcs->p_eglGetConfigs( egl->display, NULL, 0, &count );
+    total_count = count;
     if (!(configs = malloc( count * sizeof(*configs) ))) return 0;
     if (!funcs->p_eglGetConfigs( egl->display, configs, count, &count ) || !count)
     {
+        winehua_opengl_diag( "eglGetConfigs failed display=%p error=%#x count=%d",
+                             egl->display, funcs->p_eglGetError(), count );
         ERR( "Failed to get any configs from eglChooseConfig\n" );
         free( configs );
         return 0;
@@ -486,9 +518,19 @@ static UINT egldrv_init_pixel_formats( UINT *onscreen_count )
     for (i = 0, j = 0; i < count; i++)
     {
         funcs->p_eglGetConfigAttrib( egl->display, configs[i], EGL_RENDERABLE_TYPE, &render );
+        if (render & EGL_OPENGL_BIT) opengl_count++;
+        if (render & EGL_OPENGL_ES_BIT) gles1_count++;
+        if (render & EGL_OPENGL_ES2_BIT) gles2_count++;
+#ifdef EGL_OPENGL_ES3_BIT_KHR
+        if (render & EGL_OPENGL_ES3_BIT_KHR) gles3_count++;
+#endif
         if (render & EGL_OPENGL_BIT) configs[j++] = configs[i];
     }
     count = j;
+
+    winehua_opengl_diag( "egl configs total=%d filtered_opengl=%d renderable_counts gl=%u es1=%u es2=%u es3=%u",
+                         total_count, count, opengl_count, gles1_count, gles2_count, gles3_count );
+    if (!count) winehua_opengl_diag( "no EGL configs advertise EGL_OPENGL_BIT; Wine WGL pixel format enumeration will be empty" );
 
     if (TRACE_ON(wgl)) for (i = 0; i < count; i++)
     {
@@ -883,9 +925,12 @@ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
 
     if (!(funcs->egl_handle = dlopen( SONAME_LIBEGL, RTLD_NOW | RTLD_GLOBAL )))
     {
+        winehua_opengl_diag( "dlopen(%s) failed: %s", SONAME_LIBEGL, dlerror() );
         ERR( "Failed to load %s: %s\n", SONAME_LIBEGL, dlerror() );
         return FALSE;
     }
+
+    winehua_opengl_diag( "loaded %s handle=%p", SONAME_LIBEGL, funcs->egl_handle );
 
 #define LOAD_FUNCPTR( name )                                    \
     if (!(funcs->p_##name = dlsym( funcs->egl_handle, #name ))) \
@@ -928,6 +973,7 @@ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
     return TRUE;
 
 failed:
+    winehua_opengl_diag( "egl_init failed after loading %s", SONAME_LIBEGL );
     dlclose( funcs->egl_handle );
     funcs->egl_handle = NULL;
     return FALSE;
@@ -2682,9 +2728,12 @@ static void display_funcs_init(void)
 
     if ((status = user_driver->pOpenGLInit( WINE_OPENGL_DRIVER_VERSION, &display_funcs, &driver_funcs )))
         WARN( "Failed to initialize the driver OpenGL functions, status %#x\n", status );
+    winehua_opengl_diag( "user_driver->pOpenGLInit status=%#x egl_handle=%p driver_funcs=%p",
+                         status, display_funcs.egl_handle, driver_funcs );
     init_egl_platforms( &display_funcs, driver_funcs );
 
     formats_count = driver_funcs->p_init_pixel_formats( &onscreen_count );
+    winehua_opengl_diag( "pixel_formats formats_count=%u onscreen_count=%u", formats_count, onscreen_count );
     if (!(pixel_formats = malloc( formats_count * sizeof(*pixel_formats) ))) ERR( "Failed to allocate memory for pixel formats\n" );
     else for (int i = 0; i < formats_count; i++) driver_funcs->p_describe_pixel_format( i + 1, pixel_formats + i );
 
