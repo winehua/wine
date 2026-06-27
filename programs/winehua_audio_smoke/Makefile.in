@@ -1,5 +1,5 @@
 MODULE    = winehua_audio_smoke.exe
-IMPORTS   = ole32 winmm
+IMPORTS   = comdlg32 ole32 winmm
 
 EXTRADLLFLAGS = -mconsole
 
