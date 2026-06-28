@@ -1,5 +1,7 @@
 MODULE    = winehua_audio_smoke.exe
-IMPORTS   = ole32 winmm
+IMPORTS   = $(MPG123_PE_LIBS) comdlg32 ole32 shlwapi winmm
+EXTRAINCL = $(MPG123_PE_CFLAGS)
+EXTRADEFS = -DMPG123_NO_LARGENAME
 
 EXTRADLLFLAGS = -mconsole
 
