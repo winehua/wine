@@ -37,6 +37,11 @@ struct app_state
     const char *virgl_library_ready;
     const char *guest_gfx_ready;
     const char *guest_gfx_mode;
+    const char *frame_presenter;
+    const char *frame_zero_copy;
+    const char *frame_damage_upload;
+    const char *native_buffer_available;
+    const char *frame_fallback;
     const char *frame_transport;
     const char *graphics_note;
     BOOL force_gl;
@@ -79,6 +84,11 @@ static void load_graphics_env(struct app_state *state)
     state->virgl_library_ready = getenv("WINEHUA_VIRGL_LIBRARY_READY");
     state->guest_gfx_ready = getenv("WINEHUA_GUEST_GFX_READY");
     state->guest_gfx_mode = getenv("WINEHUA_GUEST_GFX_MODE");
+    state->frame_presenter = getenv("WINEHUA_FRAME_PRESENTER");
+    state->frame_zero_copy = getenv("WINEHUA_FRAME_ZERO_COPY");
+    state->frame_damage_upload = getenv("WINEHUA_FRAME_DAMAGE_UPLOAD");
+    state->native_buffer_available = getenv("WINEHUA_NATIVE_BUFFER_AVAILABLE");
+    state->frame_fallback = getenv("WINEHUA_FRAME_FALLBACK");
     state->frame_transport = getenv("WINEHUA_FRAME_TRANSPORT");
     state->graphics_note = getenv("WINEHUA_GRAPHICS_NOTE");
     force_gl = getenv("WINEHUA_GRAPHICS_FORCE_GL");
@@ -262,7 +272,7 @@ static BOOL init_opengl(struct app_state *state)
             (const char *)glGetString(GL_VENDOR),
             (const char *)glGetString(GL_RENDERER),
             (const char *)glGetString(GL_VERSION));
-    fprintf(stderr, "winehua_graphics_smoke: env requested=%s active=%s virgl_ready=%s guest_gfx_ready=%s guest_gfx_mode=%s socket_ready=%s library_ready=%s transport=%s force_gl=%d note=%s\n",
+    fprintf(stderr, "winehua_graphics_smoke: env requested=%s active=%s virgl_ready=%s guest_gfx_ready=%s guest_gfx_mode=%s socket_ready=%s library_ready=%s presenter=%s zero_copy=%s damage_upload=%s native_buffer=%s fallback=%s transport=%s force_gl=%d note=%s\n",
             state->requested_backend ? state->requested_backend : "(null)",
             state->active_backend ? state->active_backend : "(null)",
             state->virgl_ready ? state->virgl_ready : "(null)",
@@ -270,6 +280,11 @@ static BOOL init_opengl(struct app_state *state)
             state->guest_gfx_mode ? state->guest_gfx_mode : "(null)",
             state->virgl_socket_ready ? state->virgl_socket_ready : "(null)",
             state->virgl_library_ready ? state->virgl_library_ready : "(null)",
+            state->frame_presenter ? state->frame_presenter : "(null)",
+            state->frame_zero_copy ? state->frame_zero_copy : "(null)",
+            state->frame_damage_upload ? state->frame_damage_upload : "(null)",
+            state->native_buffer_available ? state->native_buffer_available : "(null)",
+            state->frame_fallback ? state->frame_fallback : "(null)",
             state->frame_transport ? state->frame_transport : "(null)",
             state->force_gl ? 1 : 0,
             state->graphics_note ? state->graphics_note : "(null)");
