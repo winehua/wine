@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "../../../../shared/audio/audio_ipc_protocol.h"
+#include "audio_ipc_protocol.h"
 
 typedef struct OhosAudioClient
 {
