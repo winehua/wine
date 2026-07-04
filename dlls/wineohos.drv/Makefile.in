@@ -1,7 +1,7 @@
-EXTRAINCL    = -I$(srcdir)/../../../../shared
-
-UNIXLIB       = wineohos.so
-UNIX_LIBS     = $(PTHREAD_LIBS)
+EXTRADEFS    = -D_NTSYSTEM_ -D__WINESRC__
+MODULE       = wineohos.drv
+UNIXLIB      = wineohos.so
+UNIX_LIBS    = $(PTHREAD_LIBS)
 
 SOURCES = \
 	ohos_audio_client.c \
