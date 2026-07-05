@@ -534,9 +534,12 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
  */
 void WINAPI LdrInitializeThunk( CONTEXT *context, ULONG_PTR unk2, ULONG_PTR unk3, ULONG_PTR unk4 )
 {
+    FIXME( "[OHOS-DIAG] 32bit LdrInitializeThunk Eip=0x%lx\n", context->Eip );
     loader_init( context, (void **)&context->Eax );
+    FIXME( "[OHOS-DIAG] 32bit loader_init done Eax=0x%lx\n", context->Eax );
     TRACE_(relay)( "\1Starting thread proc %p (arg=%p)\n", (void *)context->Eax, (void *)context->Ebx );
     signal_start_thread( context );
+    FIXME( "[OHOS-DIAG] 32bit signal_start_thread returned!\n" );
 }
 
 

@@ -1807,7 +1807,10 @@ void server_init_process_done(void)
     SERVER_END_REQ;
 
     assert( !status );
+    MESSAGE( "[OHOS-DIAG] server_init_process_done: TransferAddress=0x%lx machine=0x%x TEB=%p\n",
+             main_image_info.TransferAddress, main_image_info.Machine, data->teb );
     signal_start_thread( main_image_info.TransferAddress, peb, data->teb );
+    MESSAGE( "[OHOS-DIAG] FATAL: signal_start_thread RETURNED unexpectedly!\n" );
 }
 
 

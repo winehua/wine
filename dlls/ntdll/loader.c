@@ -1700,6 +1700,8 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
     }
     else TRACE("(%p %s,%s,%p) - CALL\n", module, debugstr_w(wm->ldr.BaseDllName.Buffer),
                reason_names[reason], lpReserved );
+    MESSAGE( "[OHOS-DIAG] MODULE_InitDLL: %s reason=%s\n",
+             debugstr_w(wm->ldr.BaseDllName.Buffer), reason_names[reason] );
 
     __TRY
     {
@@ -1714,6 +1716,8 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
                       status, entry, module, reason_names[reason], lpReserved );
     }
     __ENDTRY
+    MESSAGE( "[OHOS-DIAG] MODULE_InitDLL: %s => ret=%d status=0x%x\n",
+             debugstr_w(wm->ldr.BaseDllName.Buffer), retv, status );
 
     /* The state of the module list may have changed due to the call
        to the dll. We cannot assume that this module has not been
@@ -1797,8 +1801,12 @@ static NTSTATUS process_attach( LDR_DDAG_NODE *node, LPVOID lpReserved )
     /* Call DLL entry point */
     if (status == STATUS_SUCCESS)
     {
+        MESSAGE( "[OHOS-DIAG] process_attach: calling DllMain for %s\n",
+                 debugstr_w(wm->ldr.BaseDllName.Buffer) );
         call_ldr_notifications( LDR_DLL_NOTIFICATION_REASON_LOADED, &wm->ldr );
         status = MODULE_InitDLL( wm, DLL_PROCESS_ATTACH, lpReserved );
+        MESSAGE( "[OHOS-DIAG] process_attach: %s DllMain status=0x%lx\n",
+                 debugstr_w(wm->ldr.BaseDllName.Buffer), status );
         if (status == STATUS_SUCCESS)
         {
             wm->ldr.Flags |= LDR_PROCESS_ATTACHED;
@@ -3346,6 +3354,7 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
     NTSTATUS nts = STATUS_DLL_NOT_FOUND;
     BOOL redirected;
     void *prev;
+    MESSAGE( "[OHOS-DIAG] load_dll: %s\n", debugstr_w(libname) );
 
     TRACE( "looking for %s in %s\n", debugstr_w(libname), debugstr_w(load_path) );
 
@@ -3394,6 +3403,7 @@ done:
         TRACE("Loaded module %s at %p\n", debugstr_us(&nt_name), (*pwm)->ldr.DllBase);
     else
         WARN("Failed to load module %s; status=%lx\n", debugstr_w(libname), nts);
+    MESSAGE( "[OHOS-DIAG] load_dll: %s => nts=0x%lx\n", debugstr_w(libname), nts );
 
     if (mapping) NtClose( mapping );
     RtlFreeUnicodeString( &nt_name );
@@ -4496,11 +4506,13 @@ void loader_init( CONTEXT *context, void **entry )
         update_load_config( wm->ldr.DllBase );
 #endif
 
+        MESSAGE( "[OHOS-DIAG] loader_init: loading kernel32\n" );
         if ((status = load_dll( NULL, L"kernel32.dll", 0, &kernel32, FALSE )) != STATUS_SUCCESS)
         {
             MESSAGE( "wine: could not load kernel32.dll, status %lx\n", status );
             NtTerminateProcess( GetCurrentProcess(), status );
         }
+        MESSAGE( "[OHOS-DIAG] loader_init: kernel32 loaded\n" );
         node_kernel32 = kernel32->ldr.DdagNode;
         pBaseThreadInitThunk = RtlFindExportedRoutineByName( kernel32->ldr.DllBase, "BaseThreadInitThunk" );
         LdrGetProcedureAddress( kernel32->ldr.DllBase, &ctrl_routine, 0, (void **)&pCtrlRoutine );
@@ -4510,10 +4522,12 @@ void loader_init( CONTEXT *context, void **entry )
         if (needs_elevation())
             elevate_token();
         get_env_var( L"WINESYSTEMDLLPATH", 0, &system_dll_path );
+        MESSAGE( "[OHOS-DIAG] loader_init: calling fixup_imports\n" );
         if (wm->ldr.Flags & LDR_COR_ILONLY)
             status = fixup_imports_ilonly( wm, NULL, entry );
         else
             status = fixup_imports( wm, NULL );
+        MESSAGE( "[OHOS-DIAG] loader_init: fixup status=0x%lx\n", (unsigned long)status );
 
         if (status)
         {
@@ -4556,10 +4570,14 @@ void loader_init( CONTEXT *context, void **entry )
         if (wm->ldr.ActivationContext)
             RtlActivateActivationContext( 0, wm->ldr.ActivationContext, &cookie );
 
+        MESSAGE( "[OHOS-DIAG] loader_init: attach(ntdll)\n" );
         status = process_attach( node_ntdll, context );
+        MESSAGE( "[OHOS-DIAG] loader_init: attach(ntdll)=0x%lx\n", (unsigned long)status );
         if (!status)
         {
+            MESSAGE( "[OHOS-DIAG] loader_init: attach(kernel32)\n" );
             status = process_attach( node_kernel32, context );
+            MESSAGE( "[OHOS-DIAG] loader_init: attach(kernel32)=0x%lx\n", (unsigned long)status );
         }
         if (status)
         {

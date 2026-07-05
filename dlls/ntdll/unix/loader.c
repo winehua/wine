@@ -322,6 +322,13 @@ static void set_dll_path(void)
         dll_path_maxlen = max( dll_path_maxlen, strlen(dll_paths[i]) );
     }
     dll_paths[count] = NULL;
+
+    /* OHOS-DIAG: dump DLL search paths */
+    MESSAGE( "[OHOS-DIAG] set_dll_path: build_dir=%s dll_dir=%s WINEDLLPATH=%s\n",
+             build_dir ? build_dir : "(null)", dll_dir ? dll_dir : "(null)",
+             getenv("WINEDLLPATH") ? getenv("WINEDLLPATH") : "(null)" );
+    for (i = 0; dll_paths[i]; i++)
+        MESSAGE( "[OHOS-DIAG]   dll_path[%d] = %s\n", i, dll_paths[i] );
 }
 
 
@@ -424,6 +431,11 @@ static void init_paths(void)
         wineloader = build_path( ntdll_dir, "wine" );
     }
 
+    MESSAGE( "[OHOS-DIAG] init_paths: build_dir=%s ntdll_dir=%s dll_dir=%s bin_dir=%s\n",
+             build_dir ? build_dir : "(null)",
+             ntdll_dir ? ntdll_dir : "(null)",
+             dll_dir ? dll_dir : "(null)",
+             bin_dir ? bin_dir : "(null)" );
     set_dll_path();
     set_system_dll_path();
     set_home_dir();
@@ -1286,6 +1298,7 @@ static NTSTATUS open_dll_file( const char *name, OBJECT_ATTRIBUTES *attr, HANDLE
             if (!stat( name, &st )) return status;
         }
         /* otherwise continue searching */
+        MESSAGE( "[OHOS-DIAG] open_dll_file NOT FOUND: %s status=0x%x\n", name, status );
         return STATUS_DLL_NOT_FOUND;
     }
 
@@ -1294,6 +1307,7 @@ static NTSTATUS open_dll_file( const char *name, OBJECT_ATTRIBUTES *attr, HANDLE
                               SECTION_MAP_READ | SECTION_MAP_EXECUTE,
                               NULL, &size, PAGE_EXECUTE_READ, SEC_IMAGE, handle );
     NtClose( handle );
+    MESSAGE( "[OHOS-DIAG] open_dll_file OK: %s mapping=%p\n", name, *mapping );
     return status;
 }
 
@@ -1382,6 +1396,11 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
 
     TRACE( "looking for %s for file %s\n", debugstr_a(file + pos + 1), debugstr_us(nt_name) );
 
+    /* OHOS-DIAG: log DLL search with machine and search type */
+    MESSAGE( "[OHOS-DIAG] find_builtin: name=%s search_machine=0x%x pe_dir=%s build_dir=%s alt_build_dir=%s\n",
+             file + pos + 1, search_machine, pe_dir ? pe_dir : "(null)",
+             build_dir ? build_dir : "(null)", alt_build_dir ? alt_build_dir : "(null)" );
+
     if (build_dir)
     {
         /* try as a dll */
@@ -1412,6 +1431,7 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
         ptr = prepend( ptr, dll_paths[i], strlen(dll_paths[i]) );
         status = open_builtin_pe_file( ptr, &attr, module, size_ptr, image_info, limit_low, limit_high,
                                        load_machine, prefer_native, offset );
+        MESSAGE( "[OHOS-DIAG] open_builtin_pe: path=%s status=0x%x\n", ptr, status );
         /* use so dir for unix lib */
         ptr = file + pos;
         ptr = prepend( ptr, so_dir, strlen(so_dir) );
@@ -1813,7 +1833,10 @@ static void load_ntdll_wow64_functions( HMODULE module )
 
     pLdrSystemDllInitBlock->ntdll_handle = (ULONG_PTR)module;
 
-#define GET_FUNC(name) pLdrSystemDllInitBlock->p##name = find_named_export( module, exports, #name )
+#define GET_FUNC(name) do { \
+    pLdrSystemDllInitBlock->p##name = find_named_export( module, exports, #name ); \
+    MESSAGE( "[OHOS-DIAG] wow64_func: %s=%p\n", #name, pLdrSystemDllInitBlock->p##name ); \
+} while(0)
     GET_FUNC( KiUserApcDispatcher );
     GET_FUNC( KiUserCallbackDispatcher );
     GET_FUNC( KiUserExceptionDispatcher );
@@ -1830,6 +1853,8 @@ static void load_ntdll_wow64_functions( HMODULE module )
     {
         unixlib_handle_t *p__wine_unixlib_handle = (void *)find_named_export( module, exports,
                                                                               "__wine_unixlib_handle" );
+        MESSAGE( "[OHOS-DIAG] wow64_func: __wine_unixlib_handle=%p unix_call_wow64_funcs=%p\n",
+                 p__wine_unixlib_handle, unix_call_wow64_funcs );
         *p__wine_unixlib_handle = (UINT_PTR)unix_call_wow64_funcs;
     }
 #endif
@@ -2020,7 +2045,10 @@ static void load_wow64_ntdll( USHORT machine )
     status = find_builtin_dll( &nt_name, NULL, &module, &size, &info, 0, 0, machine, 0, FALSE, 0 );
     if (status == STATUS_IMAGE_NOT_AT_BASE) status = virtual_relocate_module( module );
     if (status) fatal_error( "failed to load %s error %x\n", debugstr_w(path), status );
+    MESSAGE( "[OHOS-DIAG] load_wow64_ntdll: machine=0x%x path=%s module=%p OK\n",
+             machine, debugstr_w(path), module );
     load_ntdll_wow64_functions( module );
+    MESSAGE( "[OHOS-DIAG] load_wow64_ntdll: wow64 functions loaded OK\n" );
     TRACE("loaded %s at %p\n", debugstr_w(path), module );
     free( path );
 }
