@@ -23,6 +23,7 @@
 #endif
 
 #include <errno.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -42,6 +43,7 @@
 
 #include "../mmdevapi/unixlib.h"
 #include "ohos_audio_client.h"
+#include "ohos_midi.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(ohosaudio);
 
@@ -53,20 +55,25 @@ static const WCHAR render_device_name[] =
     'O','H','O','S',' ','A','u','d','i','o',' ','S','p','e','a','k','e','r',0
 };
 static const char render_device_id[] = "default";
+static const WCHAR capture_device_name[] =
+{
+    'O','H','O','S',' ','A','u','d','i','o',' ','M','i','c','r','o','p','h','o','n','e',0
+};
+static const char capture_device_id[] = "capture-default";
 #define MIX_FRAMES_ERROR (~0u)
 
 struct ohos_stream
 {
     OhosAudioClient *client;
     OhosAudioClientStream broker_stream;
+    EDataFlow flow;
     WAVEFORMATEXTENSIBLE *fmt;
     DWORD flags;
     AUDCLNT_SHAREMODE share;
     HANDLE event;
     BOOL started;
     BOOL stop_notify_thread;
-    BOOL notify_thread_started;
-    pthread_t notify_thread;
+    HANDLE notify_thread;
     UINT32 client_period_frames;
     UINT32 client_buffer_frames;
     UINT32 client_bytes_per_frame;
@@ -82,10 +89,24 @@ struct ohos_stream
     float channel_volume[2];
     float prev_frame[2];
     BOOL have_prev_frame;
+    UINT32 capture_read_offset_frames;
+    UINT32 capture_write_offset_frames;
+    UINT32 capture_held_frames;
+    UINT32 capture_wrap_buffer_frames;
+    UINT64 capture_mix_input_frames;
+    UINT64 capture_client_output_frames;
+    float capture_prev_frame[2];
+    BOOL capture_have_prev_frame;
     BYTE *local_buffer;
+    BYTE *capture_wrap_buffer;
     INT16 *mix_buffer;
     pthread_mutex_t lock;
 };
+
+static BOOL is_capture_stream(const struct ohos_stream *stream)
+{
+    return stream->flow == eCapture;
+}
 
 static NTSTATUS ohos_not_implemented(void *args)
 {
@@ -96,6 +117,8 @@ static struct ohos_stream *handle_get_stream(stream_handle handle)
 {
     return (struct ohos_stream *)(UINT_PTR)handle;
 }
+
+static void fill_capture_local_buffer_locked(struct ohos_stream *stream);
 
 static void ohos_lock(struct ohos_stream *stream)
 {
@@ -288,6 +311,93 @@ static INT16 clamp_s16_float(float sample)
     return (INT16)sample;
 }
 
+static float clamp_unit_float(float sample)
+{
+    if (sample > 1.0f) return 1.0f;
+    if (sample < -1.0f) return -1.0f;
+    return sample;
+}
+
+static void write_client_frame(struct ohos_stream *stream, BYTE *dst, float left, float right)
+{
+    UINT32 channels = stream->fmt->Format.nChannels;
+    UINT32 bytes_per_sample = stream->fmt->Format.wBitsPerSample / 8;
+    UINT16 valid_bits = get_valid_bits_per_sample(&stream->fmt->Format);
+    float samples[2];
+    UINT32 ch;
+
+    left = clamp_unit_float(left);
+    right = clamp_unit_float(right);
+    samples[0] = channels == 1 ? (left + right) * 0.5f : left;
+    samples[1] = channels == 1 ? samples[0] : right;
+
+    for (ch = 0; ch < channels; ++ch)
+    {
+        BYTE *out = dst + ch * bytes_per_sample;
+        float sample = samples[ch];
+
+        if (is_float_format(&stream->fmt->Format))
+        {
+            if (bytes_per_sample == 4)
+            {
+                memcpy(out, &sample, sizeof(sample));
+            }
+            else
+            {
+                double sample64 = sample;
+                memcpy(out, &sample64, sizeof(sample64));
+            }
+            continue;
+        }
+
+        switch (bytes_per_sample)
+        {
+        case 1:
+        {
+            int value = lrintf(sample * 127.0f) + 128;
+            if (value < 0) value = 0;
+            if (value > 255) value = 255;
+            out[0] = (BYTE)value;
+            break;
+        }
+        case 2:
+        {
+            INT16 value = clamp_s16_float(sample * 32767.0f);
+            memcpy(out, &value, sizeof(value));
+            break;
+        }
+        case 3:
+        {
+            INT32 value = lrintf(sample * 8388607.0f);
+            if (value < -8388608) value = -8388608;
+            if (value > 8388607) value = 8388607;
+            out[0] = value & 0xff;
+            out[1] = (value >> 8) & 0xff;
+            out[2] = (value >> 16) & 0xff;
+            break;
+        }
+        default:
+        {
+            INT32 value;
+
+            if (valid_bits == 24)
+            {
+                value = lrintf(sample * 8388607.0f) << 8;
+            }
+            else
+            {
+                double scaled = sample * 2147483647.0;
+                if (scaled > 2147483647.0) scaled = 2147483647.0;
+                if (scaled < -2147483648.0) scaled = -2147483648.0;
+                value = (INT32)scaled;
+            }
+            memcpy(out, &value, sizeof(value));
+            break;
+        }
+        }
+    }
+}
+
 static HRESULT map_broker_error(int err, HRESULT fallback)
 {
     switch (err < 0 ? -err : err)
@@ -364,6 +474,14 @@ static void reset_stream_counters_locked(struct ohos_stream *stream)
     stream->have_prev_frame = FALSE;
     stream->prev_frame[0] = 0.0f;
     stream->prev_frame[1] = 0.0f;
+    stream->capture_read_offset_frames = 0;
+    stream->capture_write_offset_frames = 0;
+    stream->capture_held_frames = 0;
+    stream->capture_mix_input_frames = 0;
+    stream->capture_client_output_frames = 0;
+    stream->capture_have_prev_frame = FALSE;
+    stream->capture_prev_frame[0] = 0.0f;
+    stream->capture_prev_frame[1] = 0.0f;
 }
 
 static UINT32 query_broker_padding_frames_locked(struct ohos_stream *stream)
@@ -384,40 +502,45 @@ static UINT32 query_broker_padding_frames_locked(struct ohos_stream *stream)
 
 static UINT32 query_client_padding_frames_locked(struct ohos_stream *stream)
 {
+    if (is_capture_stream(stream))
+    {
+        fill_capture_local_buffer_locked(stream);
+        return stream->capture_held_frames;
+    }
+
     return mix_frames_to_client_frames_ceil(stream, query_broker_padding_frames_locked(stream));
 }
 
-static void signal_if_room_locked(struct ohos_stream *stream)
+static void signal_period_event_locked(struct ohos_stream *stream)
 {
-    UINT32 padding;
-
     if (!stream->event || !stream->started) return;
-    padding = query_client_padding_frames_locked(stream);
-    if (padding < stream->client_buffer_frames)
-        NtSetEvent(stream->event, NULL);
+
+    NtSetEvent(stream->event, NULL);
 }
 
-static void *notify_thread_main(void *arg)
+static void notify_thread_main(void *arg)
 {
     struct ohos_stream *stream = arg;
+    LARGE_INTEGER delay;
+    UINT32 period_frames = max(1u, stream->client_period_frames);
+    UINT32 sample_rate = max(1u, stream->fmt->Format.nSamplesPerSec);
+    LONGLONG period_100ns = -max((LONGLONG)10000,
+                                 ((LONGLONG)period_frames * 10000000) / sample_rate);
 
     while (1)
     {
-        LARGE_INTEGER delay;
-
         ohos_lock(stream);
         if (stream->stop_notify_thread)
         {
             ohos_unlock(stream);
             break;
         }
-        signal_if_room_locked(stream);
+        signal_period_event_locked(stream);
         ohos_unlock(stream);
 
-        delay.QuadPart = -50000; /* 5 ms */
+        delay.QuadPart = period_100ns;
         NtDelayExecution(FALSE, &delay);
     }
-    return NULL;
 }
 
 static HRESULT create_broker_stream(struct ohos_stream *stream, UINT32 requested_client_buffer_frames)
@@ -431,7 +554,7 @@ static HRESULT create_broker_stream(struct ohos_stream *stream, UINT32 requested
     req.sample_format = WINEHUA_AUDIO_SAMPLE_S16LE;
     req.buffer_frames = client_frames_to_mix_frames_ceil(stream, requested_client_buffer_frames);
     req.period_frames = client_frames_to_mix_frames_ceil(stream, stream->client_period_frames);
-    req.flags = 0;
+    req.flags = is_capture_stream(stream) ? WINEHUA_AUDIO_STREAM_FLAG_CAPTURE : 0;
 
     ret = ohos_audio_client_connect(&stream->client);
     if (ret != 0)
@@ -625,16 +748,156 @@ static UINT32 convert_client_frames_to_mix_locked(struct ohos_stream *stream, co
     }
 }
 
+static void store_capture_prev_frame(struct ohos_stream *stream, const INT16 *buffer, UINT32 frames)
+{
+    if (!frames) return;
+
+    stream->capture_prev_frame[0] = buffer[(frames - 1) * 2] / 32768.0f;
+    stream->capture_prev_frame[1] = buffer[(frames - 1) * 2 + 1] / 32768.0f;
+    stream->capture_have_prev_frame = TRUE;
+}
+
+static void load_capture_source_frame(const struct ohos_stream *stream, const INT16 *buffer, UINT32 frames,
+                                      UINT64 src_base, INT64 abs_index, float out[2])
+{
+    if (!frames)
+    {
+        if (stream->capture_have_prev_frame)
+        {
+            out[0] = stream->capture_prev_frame[0];
+            out[1] = stream->capture_prev_frame[1];
+        }
+        else out[0] = out[1] = 0.0f;
+        return;
+    }
+
+    if (abs_index < (INT64)src_base)
+    {
+        if (stream->capture_have_prev_frame)
+        {
+            out[0] = stream->capture_prev_frame[0];
+            out[1] = stream->capture_prev_frame[1];
+            return;
+        }
+        abs_index = src_base;
+    }
+
+    if ((UINT64)abs_index >= src_base + frames)
+        abs_index = (INT64)(src_base + frames - 1);
+
+    abs_index = (INT64)((UINT64)abs_index - src_base);
+    out[0] = buffer[abs_index * 2] / 32768.0f;
+    out[1] = buffer[abs_index * 2 + 1] / 32768.0f;
+}
+
+static void append_capture_client_frame_locked(struct ohos_stream *stream, float left, float right)
+{
+    BYTE *dst = stream->local_buffer + stream->capture_write_offset_frames * stream->client_bytes_per_frame;
+
+    write_client_frame(stream, dst, left, right);
+    stream->capture_write_offset_frames = (stream->capture_write_offset_frames + 1) % stream->client_buffer_frames;
+    stream->capture_held_frames++;
+}
+
+static UINT32 convert_mix_frames_to_client_locked(struct ohos_stream *stream, const INT16 *src, UINT32 in_frames)
+{
+    UINT32 free_frames = stream->client_buffer_frames - stream->capture_held_frames;
+    UINT32 i;
+
+    if (!in_frames || !free_frames) return 0;
+
+    if (stream->fmt->Format.nSamplesPerSec == 48000)
+    {
+        if (in_frames > free_frames) return MIX_FRAMES_ERROR;
+
+        for (i = 0; i < in_frames; ++i)
+        {
+            float left = src[i * 2] / 32768.0f;
+            float right = src[i * 2 + 1] / 32768.0f;
+
+            append_capture_client_frame_locked(stream, left, right);
+        }
+
+        store_capture_prev_frame(stream, src, in_frames);
+        stream->capture_mix_input_frames += in_frames;
+        stream->capture_client_output_frames += in_frames;
+        stream->client_frames_submitted += in_frames;
+        return in_frames;
+    }
+    else
+    {
+        UINT64 src_base = stream->capture_mix_input_frames;
+        UINT64 src_total = src_base + in_frames;
+        UINT64 target_client_total = (src_total * stream->fmt->Format.nSamplesPerSec) / 48000ULL;
+        UINT64 needed = target_client_total - stream->capture_client_output_frames;
+
+        if (needed > free_frames) return MIX_FRAMES_ERROR;
+
+        for (i = 0; i < needed; ++i)
+        {
+            UINT64 out_abs = stream->capture_client_output_frames + i;
+            UINT64 scaled = out_abs * 48000ULL;
+            UINT64 i0 = scaled / stream->fmt->Format.nSamplesPerSec;
+            UINT64 rem = scaled % stream->fmt->Format.nSamplesPerSec;
+            float frac = rem / (float)stream->fmt->Format.nSamplesPerSec;
+            float a[2], b[2];
+            float left, right;
+
+            load_capture_source_frame(stream, src, in_frames, src_base, (INT64)i0, a);
+            load_capture_source_frame(stream, src, in_frames, src_base, (INT64)i0 + 1, b);
+            left = a[0] + (b[0] - a[0]) * frac;
+            right = a[1] + (b[1] - a[1]) * frac;
+            append_capture_client_frame_locked(stream, left, right);
+        }
+
+        store_capture_prev_frame(stream, src, in_frames);
+        stream->capture_mix_input_frames = src_total;
+        stream->capture_client_output_frames = target_client_total;
+        stream->client_frames_submitted += (UINT32)needed;
+        return (UINT32)needed;
+    }
+}
+
+static void fill_capture_local_buffer_locked(struct ohos_stream *stream)
+{
+    UINT32 free_frames;
+
+    if (!is_capture_stream(stream) || !stream->client) return;
+
+    free_frames = stream->client_buffer_frames - stream->capture_held_frames;
+    while (free_frames)
+    {
+        UINT32 available_mix_frames;
+        UINT32 mix_frames_to_read;
+        size_t got;
+
+        available_mix_frames = (UINT32)ohos_audio_client_get_queued_frames(&stream->broker_stream);
+        if (!available_mix_frames) break;
+
+        mix_frames_to_read = min(available_mix_frames, stream->mix_buffer_capacity_frames);
+        mix_frames_to_read = min(mix_frames_to_read,
+                                 client_frames_to_mix_frames_ceil(stream, free_frames));
+        if (!mix_frames_to_read) break;
+
+        got = ohos_audio_client_read_frames(&stream->broker_stream, stream->mix_buffer, mix_frames_to_read);
+        if (!got) break;
+        if (convert_mix_frames_to_client_locked(stream, stream->mix_buffer, got) == MIX_FRAMES_ERROR) break;
+        free_frames = stream->client_buffer_frames - stream->capture_held_frames;
+    }
+}
+
 static void destroy_stream(struct ohos_stream *stream)
 {
     if (!stream) return;
 
-    if (stream->notify_thread_started)
+    if (stream->notify_thread)
     {
         ohos_lock(stream);
         stream->stop_notify_thread = TRUE;
         ohos_unlock(stream);
-        pthread_join(stream->notify_thread, NULL);
+        NtWaitForSingleObject(stream->notify_thread, FALSE, NULL);
+        NtClose(stream->notify_thread);
+        stream->notify_thread = NULL;
     }
 
     if (stream->client)
@@ -645,6 +908,7 @@ static void destroy_stream(struct ohos_stream *stream)
     }
 
     free(stream->local_buffer);
+    free(stream->capture_wrap_buffer);
     free(stream->mix_buffer);
     free(stream->fmt);
     pthread_mutex_destroy(&stream->lock);
@@ -665,17 +929,35 @@ static NTSTATUS ohos_get_endpoint_ids(void *args)
 {
     struct get_endpoint_ids_params *params = args;
     unsigned int needed = 0;
+    const WCHAR *device_name;
+    const char *device_id;
+    UINT32 device_name_size;
+    UINT32 device_id_size;
 
     params->num = 0;
     params->default_idx = 0;
 
-    if (params->flow != eRender)
+    if (params->flow == eRender)
+    {
+        device_name = render_device_name;
+        device_id = render_device_id;
+        device_name_size = sizeof(render_device_name);
+        device_id_size = sizeof(render_device_id);
+    }
+    else if (params->flow == eCapture)
+    {
+        device_name = capture_device_name;
+        device_id = capture_device_id;
+        device_name_size = sizeof(capture_device_name);
+        device_id_size = sizeof(capture_device_id);
+    }
+    else
     {
         params->result = S_OK;
         return STATUS_SUCCESS;
     }
 
-    needed = sizeof(*params->endpoints) + sizeof(render_device_name) + ((sizeof(render_device_id) + 1) & ~1);
+    needed = sizeof(*params->endpoints) + device_name_size + ((device_id_size + 1) & ~1);
     params->num = 1;
 
     if (params->size < needed)
@@ -687,10 +969,10 @@ static NTSTATUS ohos_get_endpoint_ids(void *args)
 
     params->endpoints[0].name = sizeof(*params->endpoints);
     memcpy((char *)params->endpoints + params->endpoints[0].name,
-           render_device_name, sizeof(render_device_name));
-    params->endpoints[0].device = sizeof(*params->endpoints) + sizeof(render_device_name);
+           device_name, device_name_size);
+    params->endpoints[0].device = sizeof(*params->endpoints) + device_name_size;
     memcpy((char *)params->endpoints + params->endpoints[0].device,
-           render_device_id, sizeof(render_device_id));
+           device_id, device_id_size);
     params->default_idx = 0;
     params->result = S_OK;
     return STATUS_SUCCESS;
@@ -712,7 +994,7 @@ static NTSTATUS ohos_create_stream(void *args)
     *params->stream = 0;
     *params->channel_count = 0;
 
-    if (params->flow != eRender)
+    if (params->flow != eRender && params->flow != eCapture)
     {
         params->result = AUDCLNT_E_UNSUPPORTED_FORMAT;
         return STATUS_SUCCESS;
@@ -735,6 +1017,7 @@ static NTSTATUS ohos_create_stream(void *args)
     }
 
     pthread_mutex_init(&stream->lock, NULL);
+    stream->flow = params->flow;
     stream->share = params->share;
     stream->flags = params->flags;
     stream->client_period_frames = max(1u, (UINT32)((params->period * params->fmt->nSamplesPerSec) / 10000000));
@@ -770,10 +1053,19 @@ static NTSTATUS ohos_create_stream(void *args)
         goto fail;
     }
 
-    if (pthread_create(&stream->notify_thread, NULL, notify_thread_main, stream) == 0)
-        stream->notify_thread_started = TRUE;
-    else
-        WARN("failed to start notify thread for stream\n");
+    {
+        static const WCHAR name[] =
+        {
+            'a','u','d','i','o','_','c','l','i','e','n','t','_','t','i','m','e','r',0
+        };
+        NTSTATUS status = create_unix_thread(&stream->notify_thread, name, notify_thread_main, stream);
+
+        if (status)
+        {
+            stream->notify_thread = NULL;
+            WARN("failed to start notify thread for stream, status %#x\n", status);
+        }
+    }
 
     reset_stream_counters_locked(stream);
     *params->channel_count = params->fmt->nChannels;
@@ -817,7 +1109,7 @@ static NTSTATUS ohos_start(void *args)
     }
 
     stream->started = TRUE;
-    signal_if_room_locked(stream);
+    signal_period_event_locked(stream);
     return ohos_unlock_result(stream, &params->result, S_OK);
 }
 
@@ -935,29 +1227,89 @@ static NTSTATUS ohos_release_render_buffer(void *args)
 
     stream->client_frames_submitted += params->written_frames;
     stream->locked_frames = 0;
-    signal_if_room_locked(stream);
+    signal_period_event_locked(stream);
     return ohos_unlock_result(stream, &params->result, S_OK);
 }
 
 static NTSTATUS ohos_get_capture_buffer(void *args)
 {
     struct get_capture_buffer_params *params = args;
+    struct ohos_stream *stream = handle_get_stream(params->stream);
+    UINT32 chunk_bytes, chunk_frames;
 
-    *params->data = NULL;
+    ohos_lock(stream);
+
+    if (!is_capture_stream(stream))
+        return ohos_unlock_result(stream, &params->result, AUDCLNT_E_WRONG_ENDPOINT_TYPE);
+    if (stream->locked_frames)
+        return ohos_unlock_result(stream, &params->result, AUDCLNT_E_OUT_OF_ORDER);
+
+    fill_capture_local_buffer_locked(stream);
     *params->frames = 0;
     *params->flags = 0;
-    if (params->devpos) *params->devpos = 0;
-    if (params->qpcpos) *params->qpcpos = 0;
-    params->result = AUDCLNT_S_BUFFER_EMPTY;
-    return STATUS_SUCCESS;
+
+    if (stream->capture_held_frames < stream->client_period_frames)
+        return ohos_unlock_result(stream, &params->result, AUDCLNT_S_BUFFER_EMPTY);
+
+    chunk_frames = stream->client_buffer_frames - stream->capture_read_offset_frames;
+    if (chunk_frames < stream->client_period_frames)
+    {
+        chunk_bytes = chunk_frames * stream->client_bytes_per_frame;
+        if (stream->capture_wrap_buffer_frames < stream->client_period_frames)
+        {
+            free(stream->capture_wrap_buffer);
+            stream->capture_wrap_buffer =
+                calloc(stream->client_period_frames, stream->client_bytes_per_frame);
+            if (!stream->capture_wrap_buffer)
+                return ohos_unlock_result(stream, &params->result, E_OUTOFMEMORY);
+            stream->capture_wrap_buffer_frames = stream->client_period_frames;
+        }
+
+        *params->data = stream->capture_wrap_buffer;
+        memcpy(*params->data,
+               stream->local_buffer + stream->capture_read_offset_frames * stream->client_bytes_per_frame,
+               chunk_bytes);
+        memcpy(*params->data + chunk_bytes, stream->local_buffer,
+               stream->client_period_frames * stream->client_bytes_per_frame - chunk_bytes);
+    }
+    else
+    {
+        *params->data = stream->local_buffer + stream->capture_read_offset_frames * stream->client_bytes_per_frame;
+    }
+
+    stream->locked_frames = *params->frames = stream->client_period_frames;
+    if (params->devpos)
+        *params->devpos = stream->client_frames_submitted - stream->capture_held_frames;
+    if (params->qpcpos)
+        *params->qpcpos = query_qpc_100ns();
+    return ohos_unlock_result(stream, &params->result, S_OK);
 }
 
 static NTSTATUS ohos_release_capture_buffer(void *args)
 {
     struct release_capture_buffer_params *params = args;
+    struct ohos_stream *stream = handle_get_stream(params->stream);
 
-    params->result = params->done ? AUDCLNT_E_OUT_OF_ORDER : S_OK;
-    return STATUS_SUCCESS;
+    ohos_lock(stream);
+
+    if (!is_capture_stream(stream))
+        return ohos_unlock_result(stream, &params->result, AUDCLNT_E_WRONG_ENDPOINT_TYPE);
+    if (!params->done)
+    {
+        stream->locked_frames = 0;
+        return ohos_unlock_result(stream, &params->result, S_OK);
+    }
+    if (!stream->locked_frames)
+        return ohos_unlock_result(stream, &params->result, AUDCLNT_E_OUT_OF_ORDER);
+    if (stream->locked_frames != params->done)
+        return ohos_unlock_result(stream, &params->result, AUDCLNT_E_INVALID_SIZE);
+
+    stream->capture_held_frames -= params->done;
+    stream->capture_read_offset_frames += params->done;
+    stream->capture_read_offset_frames %= stream->client_buffer_frames;
+    stream->locked_frames = 0;
+    signal_period_event_locked(stream);
+    return ohos_unlock_result(stream, &params->result, S_OK);
 }
 
 static NTSTATUS ohos_is_format_supported(void *args)
@@ -976,7 +1328,7 @@ static NTSTATUS ohos_get_mix_format(void *args)
     struct get_mix_format_params *params = args;
     WAVEFORMATEXTENSIBLE *fmt = params->fmt;
 
-    if (params->flow != eRender)
+    if (params->flow != eRender && params->flow != eCapture)
     {
         params->result = E_NOTIMPL;
         return STATUS_SUCCESS;
@@ -1040,10 +1392,20 @@ static NTSTATUS ohos_get_current_padding(void *args)
 static NTSTATUS ohos_get_next_packet_size(void *args)
 {
     struct get_next_packet_size_params *params = args;
+    struct ohos_stream *stream = handle_get_stream(params->stream);
 
-    *params->frames = 0;
-    params->result = S_OK;
-    return STATUS_SUCCESS;
+    ohos_lock(stream);
+    if (is_capture_stream(stream))
+    {
+        fill_capture_local_buffer_locked(stream);
+        *params->frames = stream->capture_held_frames >= stream->client_period_frames ?
+            stream->client_period_frames : 0;
+    }
+    else
+    {
+        *params->frames = 0;
+    }
+    return ohos_unlock_result(stream, &params->result, S_OK);
 }
 
 static NTSTATUS ohos_get_frequency(void *args)
@@ -1112,7 +1474,7 @@ static NTSTATUS ohos_set_event_handle(void *args)
         return ohos_unlock_result(stream, &params->result, HRESULT_FROM_WIN32(ERROR_INVALID_NAME));
 
     stream->event = params->event;
-    signal_if_room_locked(stream);
+    signal_period_event_locked(stream);
     return ohos_unlock_result(stream, &params->result, S_OK);
 }
 
@@ -1147,79 +1509,32 @@ static NTSTATUS ohos_get_prop_value(void *args)
 
 static NTSTATUS ohos_midi_get_driver(void *args)
 {
-    ((WCHAR *)args)[0] = 0;
-    return STATUS_SUCCESS;
+    return ohos_midi_driver_get(args);
 }
 
 static NTSTATUS ohos_midi_init(void *args)
 {
-    struct midi_init_params *params = args;
-
-    *params->err = MMSYSERR_NOERROR;
-    return STATUS_SUCCESS;
+    return ohos_midi_driver_init(args);
 }
 
 static NTSTATUS ohos_midi_release(void *args)
 {
-    return STATUS_SUCCESS;
+    return ohos_midi_driver_release(args);
 }
 
 static NTSTATUS ohos_midi_out_message(void *args)
 {
-    struct midi_out_message_params *params = args;
-
-    switch (params->msg)
-    {
-    case DRVM_INIT:
-    case DRVM_EXIT:
-    case DRVM_ENABLE:
-    case DRVM_DISABLE:
-        *params->err = MMSYSERR_NOERROR;
-        break;
-    case MODM_GETNUMDEVS:
-        *params->err = 0;
-        break;
-    default:
-        *params->err = MMSYSERR_NOTSUPPORTED;
-        break;
-    }
-    return STATUS_SUCCESS;
+    return ohos_midi_driver_out_message(args);
 }
 
 static NTSTATUS ohos_midi_in_message(void *args)
 {
-    struct midi_in_message_params *params = args;
-
-    switch (params->msg)
-    {
-    case DRVM_INIT:
-    case DRVM_EXIT:
-    case DRVM_ENABLE:
-    case DRVM_DISABLE:
-        *params->err = MMSYSERR_NOERROR;
-        break;
-    case MIDM_GETNUMDEVS:
-        *params->err = 0;
-        break;
-    default:
-        *params->err = MMSYSERR_NOTSUPPORTED;
-        break;
-    }
-    return STATUS_SUCCESS;
+    return ohos_midi_driver_in_message(args);
 }
 
 static NTSTATUS ohos_midi_notify_wait(void *args)
 {
-    struct midi_notify_wait_params *params = args;
-
-    while (params->quit && !*params->quit)
-    {
-        LARGE_INTEGER delay;
-
-        delay.QuadPart = -1000000;
-        NtDelayExecution(FALSE, &delay);
-    }
-    return STATUS_SUCCESS;
+    return ohos_midi_driver_notify_wait(args);
 }
 
 static NTSTATUS ohos_aux_message(void *args)
