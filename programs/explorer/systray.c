@@ -1244,6 +1244,15 @@ void initialize_systray( BOOL arg_using_root, BOOL arg_enable_shell, BOOL arg_sh
         SystemParametersInfoW( SPI_GETWORKAREA, 0, &work_rect, 0 );
         SetRect( &primary_rect, 0, 0, GetSystemMetrics( SM_CXSCREEN ), GetSystemMetrics( SM_CYSCREEN ) );
         SubtractRect( &taskbar_rect, &primary_rect, &work_rect );
+        if (IsRectEmpty( &taskbar_rect ))
+        {
+            int height = max( icon_cy, GetSystemMetrics( SM_CYCAPTION ) );
+
+            WARN( "empty taskbar rect from work area %s, using bottom fallback\n",
+                  wine_dbgstr_rect( &work_rect ));
+            SetRect( &taskbar_rect, primary_rect.left, primary_rect.bottom - height,
+                     primary_rect.right, primary_rect.bottom );
+        }
 
         tray_window = CreateWindowExW( WS_EX_NOACTIVATE, shell_traywnd_class.lpszClassName, NULL, WS_POPUP,
                                        taskbar_rect.left, taskbar_rect.top, taskbar_rect.right - taskbar_rect.left,
