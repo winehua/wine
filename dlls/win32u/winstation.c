@@ -25,6 +25,7 @@
 #include <assert.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 #include <pthread.h>
 
@@ -925,6 +926,7 @@ static const WCHAR *get_default_desktop( void *buf, size_t buf_size )
     const WCHAR *p, *appname = RtlGetCurrentPeb()->ProcessParameters->ImagePathName.Buffer;
     KEY_VALUE_PARTIAL_INFORMATION *info = buf;
     WCHAR *buffer = buf;
+    const char *desktop_env;
     HKEY tmpkey, appkey;
     DWORD len;
 
@@ -949,6 +951,14 @@ static const WCHAR *get_default_desktop( void *buf, size_t buf_size )
             if (len) return (const WCHAR *)info->Data;
         }
     }
+
+#ifdef PAD_MODE
+    if ((desktop_env = getenv( "WINEHUA_DESKTOP" )) && *desktop_env)
+    {
+        asciiz_to_unicode( buffer, desktop_env );
+        return buffer;
+    }
+#endif
 
     /* @@ Wine registry key: HKCU\Software\Wine\Explorer */
     if ((appkey = reg_open_hkcu_key( "Software\\Wine\\Explorer" )))
