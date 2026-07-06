@@ -32,6 +32,12 @@ enum WinehuaAudioControlCmd
     WINEHUA_AUDIO_CMD_GET_STATUS = 7,
 };
 
+enum WinehuaAudioStreamFlags
+{
+    WINEHUA_AUDIO_STREAM_FLAG_NONE = 0,
+    WINEHUA_AUDIO_STREAM_FLAG_CAPTURE = 1u << 0,
+};
+
 enum WinehuaAudioSampleFormat
 {
     WINEHUA_AUDIO_SAMPLE_S16LE = 1,
