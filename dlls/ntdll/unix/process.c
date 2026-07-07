@@ -400,6 +400,78 @@ static BOOL is_unix_console_handle( HANDLE handle )
 }
 
 
+#ifdef PAD_MODE
+/***********************************************************************
+ *           send_spawn_request  (PAD_MODE)
+ *
+ * 通过 broker 的 Unix socket 发送一个 SPAWN 请求, 携带 entryParams 和
+ * N 个命名 fd (SCM_RIGHTS)。协议:
+ *   "SPAWN\n{entryParams}\nFDS:name0,name1,...\n" + cmsg{fds}
+ * fd 命名顺序与 fds[] 一一对应, broker 侧据此建 NativeChildProcess_FdList。
+ * 未来要给子进程多传 fd(GPU/剪贴板等), 只需在调用方往 fd_names[]/fds[] append。
+ * 成功返回 0 并置 *child_pid; 失败返回 -1。
+ */
+static int send_spawn_request( int broker_fd, const char *entryParams,
+                               const char **fd_names, const int *fds, int n_fds,
+                               int *child_pid )
+{
+    char req_hdr[] = "SPAWN\n";
+    size_t ep_len = entryParams ? strlen(entryParams) : 0;
+    char fds_line[512];
+    int fl_len, i;
+    struct iovec iov_parts[3];
+    struct msghdr msg;
+    union { char buf[CMSG_SPACE(sizeof(int) * 4)]; struct cmsghdr align; } ctrl;
+    ssize_t received;
+    int32_t response[2];
+
+    if (n_fds > 4) n_fds = 4;  /* ctrl 缓冲区上限 */
+
+    /* 构造 "\nFDS:name0,name1,...\n" (无 fd 时仅 "\n") */
+    if (n_fds > 0)
+    {
+        fl_len = snprintf( fds_line, sizeof(fds_line), "\nFDS:" );
+        for (i = 0; i < n_fds; i++)
+            fl_len += snprintf( fds_line + fl_len, sizeof(fds_line) - fl_len,
+                                "%s%s", i ? "," : "", fd_names[i] );
+        fl_len += snprintf( fds_line + fl_len, sizeof(fds_line) - fl_len, "\n" );
+    }
+    else fl_len = snprintf( fds_line, sizeof(fds_line), "\n" );
+
+    iov_parts[0].iov_base = req_hdr;
+    iov_parts[0].iov_len  = sizeof(req_hdr) - 1;
+    iov_parts[1].iov_base = (void *)(entryParams ? entryParams : "");
+    iov_parts[1].iov_len  = ep_len;
+    iov_parts[2].iov_base = fds_line;
+    iov_parts[2].iov_len  = fl_len;
+
+    memset( &msg, 0, sizeof(msg) );
+    msg.msg_iov = iov_parts;
+    msg.msg_iovlen = 3;
+    if (n_fds > 0)
+    {
+        struct cmsghdr *cmsg;
+        msg.msg_control = ctrl.buf;
+        msg.msg_controllen = CMSG_SPACE(sizeof(int) * n_fds);
+        cmsg = CMSG_FIRSTHDR( &msg );
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type  = SCM_RIGHTS;
+        cmsg->cmsg_len   = CMSG_LEN(sizeof(int) * n_fds);
+        memcpy( CMSG_DATA(cmsg), fds, sizeof(int) * n_fds );
+        msg.msg_controllen = cmsg->cmsg_len;
+    }
+
+    if (sendmsg( broker_fd, &msg, MSG_NOSIGNAL ) < 0) return -1;
+
+    received = recv( broker_fd, response, sizeof(response), MSG_WAITALL );
+    if (received != sizeof(response)) return -1;
+    if (response[1] != 0 || response[0] <= 0) return -1;
+    *child_pid = response[0];
+    return 0;
+}
+#endif
+
+
 /***********************************************************************
  *           spawn_process
  */
@@ -438,12 +510,12 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
         char *entryParams = NULL;
         int broker_fd;
         struct sockaddr_un addr;
-        struct msghdr msg;
-        union { char buf[CMSG_SPACE(sizeof(int))]; struct cmsghdr align; } ctrl;
-        struct cmsghdr *cmsg;
         int i, len;
-        ssize_t sent, received;
-        int32_t response[2];
+        /* 要传给子进程的命名 fd —— 目前仅 wineserver 通信 socket。
+         * 未来的宿主 fd 桥(GPU/剪贴板等)在此 append 即可, 协议无需再改。 */
+        const char *fd_names[4];
+        int fds[4];
+        int n_send_fds = 0;
 
         argv = build_argv( &params->CommandLine, 0 );
 
@@ -466,7 +538,12 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
                 p += snprintf(p, len + 1 - (p - entryParams), "|%s", argv[i]);
         }
 
-        /* 连接 broker */
+        /* 收集要传给子进程的命名 fd (目前仅 wineserver 通信 socket) */
+        fd_names[n_send_fds] = "wineserver_sock";
+        fds[n_send_fds] = socketfd;
+        n_send_fds++;
+
+        /* 连接 broker 并发送 SPAWN 请求 */
         broker_fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (broker_fd >= 0)
         {
@@ -476,47 +553,12 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
 
             if (connect(broker_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0)
             {
-                /* 构造请求: "SPAWN\n{entryParams}\n" + SCM_RIGHTS */
-                char req_hdr[32];
-                int hdr_len = snprintf(req_hdr, sizeof(req_hdr), "SPAWN\n");
-                size_t ep_len = entryParams ? strlen(entryParams) : 0;
-
-                struct iovec iov_parts[3];
-                iov_parts[0].iov_base = req_hdr;
-                iov_parts[0].iov_len = hdr_len;
-                iov_parts[1].iov_base = entryParams ? entryParams : (char*)"";
-                iov_parts[1].iov_len = ep_len;
-                iov_parts[2].iov_base = (char*)"\n";
-                iov_parts[2].iov_len = 1;
-
-                memset(&msg, 0, sizeof(msg));
-                msg.msg_iov = iov_parts;
-                msg.msg_iovlen = 3;
-                msg.msg_control = ctrl.buf;
-                msg.msg_controllen = sizeof(ctrl.buf);
-
-                cmsg = CMSG_FIRSTHDR(&msg);
-                cmsg->cmsg_level = SOL_SOCKET;
-                cmsg->cmsg_type = SCM_RIGHTS;
-                cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-                memcpy(CMSG_DATA(cmsg), &socketfd, sizeof(int));
-                msg.msg_controllen = cmsg->cmsg_len;
-
-                sent = sendmsg(broker_fd, &msg, MSG_NOSIGNAL);
-                if (sent >= 0)
-                {
-                    /* 接收响应: childPid + status (8 字节) */
-                    received = recv(broker_fd, response, sizeof(response), MSG_WAITALL);
-                    if (received == sizeof(response))
-                    {
-                        pid = response[0];
-                        int32_t broker_status = response[1];
-                        if (broker_status != 0 || pid <= 0)
-                            status = STATUS_UNSUCCESSFUL;
-                    }
-                    else status = STATUS_UNSUCCESSFUL;
-                }
-                else status = STATUS_UNSUCCESSFUL;
+                int child_pid = -1;
+                if (send_spawn_request(broker_fd, entryParams, fd_names, fds, n_send_fds, &child_pid) == 0)
+                    pid = child_pid;
+                else
+                    pid = -1;
+                if (pid <= 0) status = STATUS_UNSUCCESSFUL;
             }
             else status = STATUS_UNSUCCESSFUL;
             close(broker_fd);
