@@ -404,28 +404,29 @@ static BOOL is_unix_console_handle( HANDLE handle )
 /***********************************************************************
  *           send_spawn_request  (PAD_MODE)
  *
- * 通过 broker 的 Unix socket 发送一个 SPAWN 请求, 携带 entryParams 和
- * N 个命名 fd (SCM_RIGHTS)。协议:
- *   "SPAWN\n{entryParams}\nFDS:name0,name1,...\n" + cmsg{fds}
- * fd 命名顺序与 fds[] 一一对应, broker 侧据此建 NativeChildProcess_FdList。
+ * 通过 broker 的 Unix socket 发送一个 SPAWN 请求, 携带 entryParams、
+ * N 个命名 fd (SCM_RIGHTS) 和父进程的完整环境变量。协议:
+ *   "SPAWN\n{entryParams}\nFDS:name0,name1,...\nENV:{n}\n{blob}" + cmsg{fds}
+ * env blob 格式为 C environ 的 \0 分隔 KEY=VALUE, 与 fork+exec 继承的语义等价。
  * 未来要给子进程多传 fd(GPU/剪贴板等), 只需在调用方往 fd_names[]/fds[] append。
  * 成功返回 0 并置 *child_pid; 失败返回 -1。
  */
 static int send_spawn_request( int broker_fd, const char *entryParams,
                                const char **fd_names, const int *fds, int n_fds,
-                               int *child_pid )
+                               int *child_pid, char **envp )
 {
     char req_hdr[] = "SPAWN\n";
     size_t ep_len = entryParams ? strlen(entryParams) : 0;
     char fds_line[512];
-    int fl_len, i;
-    struct iovec iov_parts[3];
+    char env_hdr[64], *env_blob = NULL;
+    int fl_len, i, env_len, env_blob_len;
+    struct iovec iov_parts[5];
     struct msghdr msg;
-    union { char buf[CMSG_SPACE(sizeof(int) * 4)]; struct cmsghdr align; } ctrl;
+    union { char buf[CMSG_SPACE(sizeof(int) * 16)]; struct cmsghdr align; } ctrl;
     ssize_t received;
     int32_t response[2];
 
-    if (n_fds > 4) n_fds = 4;  /* ctrl 缓冲区上限 */
+    if (n_fds > 16) n_fds = 16;  /* ctrl 缓冲区上限, 对齐 broker 侧 */
 
     /* 构造 "\nFDS:name0,name1,...\n" (无 fd 时仅 "\n") */
     if (n_fds > 0)
@@ -438,16 +439,45 @@ static int send_spawn_request( int broker_fd, const char *entryParams,
     }
     else fl_len = snprintf( fds_line, sizeof(fds_line), "\n" );
 
+    /* 构造 "\nENV:{n}\n{blob}" —— 将 envp 序列化为 C environ 格式 (\0 分隔) */
+    env_blob_len = 0;
+    env_blob = NULL;
+    if (envp)
+    {
+        /* 第一遍: 统计总字节数 */
+        for (i = 0; envp[i]; i++)
+            env_blob_len += strlen(envp[i]) + 1;  /* +1 for \0 */
+        if (env_blob_len > 0)
+        {
+            env_blob = malloc(env_blob_len);
+            if (env_blob)
+            {
+                char *p = env_blob;
+                for (i = 0; envp[i]; i++)
+                {
+                    size_t l = strlen(envp[i]) + 1;  /* 含 \0 */
+                    memcpy(p, envp[i], l);
+                    p += l;
+                }
+            }
+        }
+    }
+    env_len = snprintf( env_hdr, sizeof(env_hdr), "\nENV:%d\n", env_blob ? env_blob_len : 0 );
+
     iov_parts[0].iov_base = req_hdr;
     iov_parts[0].iov_len  = sizeof(req_hdr) - 1;
     iov_parts[1].iov_base = (void *)(entryParams ? entryParams : "");
     iov_parts[1].iov_len  = ep_len;
     iov_parts[2].iov_base = fds_line;
     iov_parts[2].iov_len  = fl_len;
+    iov_parts[3].iov_base = env_hdr;
+    iov_parts[3].iov_len  = env_len;
+    iov_parts[4].iov_base = env_blob ? env_blob : "";
+    iov_parts[4].iov_len  = env_blob ? env_blob_len : 0;
 
     memset( &msg, 0, sizeof(msg) );
     msg.msg_iov = iov_parts;
-    msg.msg_iovlen = 3;
+    msg.msg_iovlen = 5;
     if (n_fds > 0)
     {
         struct cmsghdr *cmsg;
@@ -461,7 +491,8 @@ static int send_spawn_request( int broker_fd, const char *entryParams,
         msg.msg_controllen = cmsg->cmsg_len;
     }
 
-    if (sendmsg( broker_fd, &msg, MSG_NOSIGNAL ) < 0) return -1;
+    if (sendmsg( broker_fd, &msg, MSG_NOSIGNAL ) < 0) { free(env_blob); return -1; }
+    free(env_blob);
 
     received = recv( broker_fd, response, sizeof(response), MSG_WAITALL );
     if (received != sizeof(response)) return -1;
@@ -554,7 +585,8 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
             if (connect(broker_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0)
             {
                 int child_pid = -1;
-                if (send_spawn_request(broker_fd, entryParams, fd_names, fds, n_send_fds, &child_pid) == 0)
+                extern char **environ;
+                if (send_spawn_request(broker_fd, entryParams, fd_names, fds, n_send_fds, &child_pid, environ) == 0)
                     pid = child_pid;
                 else
                     pid = -1;
