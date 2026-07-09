@@ -3843,7 +3843,8 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
         {
             if (prefix[0] == 'z')
             {
-                const char *z_target = "/storage/Users/currentUser";
+                const char *z_target = getenv( "HOME" );
+                if (!z_target) z_target = "/storage/Users/currentUser";
                 strcpy( unix_name, z_target );
                 pos = strlen( z_target );
             }
