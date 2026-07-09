@@ -3806,7 +3806,6 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
         /* allow slash for unix namespace */
         if (pos > 4 && prefix[4] == '/') pos = 4;
         is_unix = pos == 4;
-        /* OHOS-DEBUG */
     }
     prefix_len = pos;
     prefix[prefix_len] = 0;
@@ -3844,7 +3843,8 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
         {
             if (prefix[0] == 'z')
             {
-                const char *z_target = "/storage/Users/currentUser";
+                const char *z_target = getenv( "HOME" );
+                if (!z_target) z_target = "/storage/Users/currentUser";
                 strcpy( unix_name, z_target );
                 pos = strlen( z_target );
             }
@@ -4379,7 +4379,6 @@ NTSTATUS unix_to_nt_file_name( const char *unix_name, WCHAR **nt, UINT dispositi
 
     if (!buffer)  /* dosdevices symlinks unavailable, fall back to \\?\unix path */
     {
-        /* OHOS-DEBUG */
         if (!(buffer = malloc( sizeof(unix_prefixW) + len * sizeof(WCHAR) ))) return STATUS_NO_MEMORY;
         memcpy( buffer, unix_prefixW, sizeof(unix_prefixW) );
         ntdll_umbstowcs( unix_name, len, buffer + ARRAY_SIZE(unix_prefixW), len );

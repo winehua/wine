@@ -21,14 +21,19 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <math.h>
+#include <limits.h>
 #include "windef.h"
 #include "winbase.h"
 #include "winuser.h"
+#include "mmsystem.h"
 #include "mmddk.h"
 #include "wine/debug.h"
 #include "mciqtz_private.h"
 #include "digitalv.h"
 #include "wownt32.h"
+
+#define MINIMP3_IMPLEMENTATION
+#include "minimp3.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(mciqtz);
 
@@ -89,6 +94,547 @@ static bool register_class(void)
     return RegisterClassW(&class) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
 }
 
+static BOOL MCIQTZ_is_wave_backend(const WINE_MCIQTZ *wma)
+{
+    return wma->backend == MCIQTZ_BACKEND_WAVEOUT;
+}
+
+static void MCIQTZ_cleanup_finished_thread(WINE_MCIQTZ *wma)
+{
+    if (wma->thread && WaitForSingleObject(wma->thread, 0) == WAIT_OBJECT_0)
+    {
+        CloseHandle(wma->thread);
+        wma->thread = NULL;
+    }
+}
+
+static void MCIQTZ_release_graph(WINE_MCIQTZ *wma, BOOL destroy_window)
+{
+    if (destroy_window && wma->window)
+    {
+        if (wma->vidwin)
+        {
+            IVideoWindow_put_MessageDrain(wma->vidwin, (OAHWND)NULL);
+            IVideoWindow_put_Owner(wma->vidwin, (OAHWND)NULL);
+        }
+        DestroyWindow(wma->window);
+        wma->window = NULL;
+    }
+
+    if (wma->vidwin)
+        IVideoWindow_Release(wma->vidwin);
+    wma->vidwin = NULL;
+    if (wma->vidbasic)
+        IBasicVideo_Release(wma->vidbasic);
+    wma->vidbasic = NULL;
+    if (wma->audio)
+        IBasicAudio_Release(wma->audio);
+    wma->audio = NULL;
+    if (wma->seek)
+        IMediaSeeking_Release(wma->seek);
+    wma->seek = NULL;
+    if (wma->mevent)
+        IMediaEvent_Release(wma->mevent);
+    wma->mevent = NULL;
+    if (wma->pgraph)
+        IGraphBuilder_Release(wma->pgraph);
+    wma->pgraph = NULL;
+    if (wma->pmctrl)
+        IMediaControl_Release(wma->pmctrl);
+    wma->pmctrl = NULL;
+
+    if (wma->uninit)
+        CoUninitialize();
+    wma->uninit = FALSE;
+    wma->parent = NULL;
+}
+
+static DWORD MCIQTZ_frames_to_time(const WINE_MCIQTZ *wma, DWORD frames)
+{
+    if (!wma->wave_format.nSamplesPerSec) return 0;
+    if (wma->time_format == MCI_FORMAT_FRAMES) return frames;
+    return (DWORD)(((ULONGLONG)frames * 1000) / wma->wave_format.nSamplesPerSec);
+}
+
+static DWORD MCIQTZ_time_to_frames(const WINE_MCIQTZ *wma, DWORD value)
+{
+    if (!wma->wave_format.nSamplesPerSec) return 0;
+    if (wma->time_format == MCI_FORMAT_FRAMES) return value;
+    return (DWORD)(((ULONGLONG)value * wma->wave_format.nSamplesPerSec) / 1000);
+}
+
+static DWORD MCIQTZ_get_wave_position_frames(const WINE_MCIQTZ *wma)
+{
+    MMTIME mmtime;
+    DWORD frames = 0;
+
+    if (!wma->wave_out) return 0;
+
+    memset(&mmtime, 0, sizeof(mmtime));
+    mmtime.wType = TIME_SAMPLES;
+    if (waveOutGetPosition(wma->wave_out, &mmtime, sizeof(mmtime)) == MMSYSERR_NOERROR)
+    {
+        if (mmtime.wType == TIME_SAMPLES)
+            frames = mmtime.u.sample;
+        else if (mmtime.wType == TIME_BYTES && wma->wave_format.nBlockAlign)
+            frames = mmtime.u.cb / wma->wave_format.nBlockAlign;
+    }
+
+    return frames;
+}
+
+static DWORD MCIQTZ_get_wave_playback_position_frames(const WINE_MCIQTZ *wma)
+{
+    DWORD frames = wma->wave_position_frames;
+
+    if (wma->wave_out && (wma->wave_state == MCIQTZ_WAVE_PLAYING ||
+        wma->wave_state == MCIQTZ_WAVE_PAUSED))
+        frames = wma->wave_play_start_frames + MCIQTZ_get_wave_position_frames(wma);
+
+    if (frames > wma->wave_play_stop_frames)
+        frames = wma->wave_play_stop_frames;
+    if (frames > wma->wave_total_frames)
+        frames = wma->wave_total_frames;
+    return frames;
+}
+
+static DWORD MCIQTZ_wait_for_thread(WINE_MCIQTZ *wma)
+{
+    DWORD exit_code = 0;
+
+    if (!wma->thread)
+        return 0;
+
+    WaitForSingleObject(wma->thread, INFINITE);
+    if (!GetExitCodeThread(wma->thread, &exit_code))
+        exit_code = MCIERR_INTERNAL;
+    CloseHandle(wma->thread);
+    wma->thread = NULL;
+    return exit_code;
+}
+
+static void MCIQTZ_close_wave_output(WINE_MCIQTZ *wma, BOOL reset_device)
+{
+    if (wma->wave_out)
+    {
+        if (reset_device)
+            waveOutReset(wma->wave_out);
+        if (wma->wave_header_prepared)
+        {
+            waveOutUnprepareHeader(wma->wave_out, &wma->wave_header, sizeof(wma->wave_header));
+            wma->wave_header_prepared = FALSE;
+        }
+        waveOutClose(wma->wave_out);
+        wma->wave_out = NULL;
+    }
+}
+
+static void MCIQTZ_reset_wave_fallback(WINE_MCIQTZ *wma)
+{
+    MCIQTZ_close_wave_output(wma, TRUE);
+
+    if (wma->wave_done_event)
+    {
+        CloseHandle(wma->wave_done_event);
+        wma->wave_done_event = NULL;
+    }
+
+    HeapFree(GetProcessHeap(), 0, wma->wave_pcm);
+    wma->wave_pcm = NULL;
+    memset(&wma->wave_format, 0, sizeof(wma->wave_format));
+    memset(&wma->wave_header, 0, sizeof(wma->wave_header));
+    wma->wave_pcm_bytes = 0;
+    wma->wave_total_frames = 0;
+    wma->wave_position_frames = 0;
+    wma->wave_play_start_frames = 0;
+    wma->wave_loop_start_frames = 0;
+    wma->wave_play_stop_frames = 0;
+    wma->wave_state = MCIQTZ_WAVE_STOPPED;
+}
+
+static BOOL MCIQTZ_has_extension(LPCWSTR path, LPCWSTR extension)
+{
+    const WCHAR *suffix;
+
+    if (!path || !extension) return FALSE;
+    suffix = wcsrchr(path, '.');
+    return suffix && !lstrcmpiW(suffix, extension);
+}
+
+static BOOL MCIQTZ_is_wave_fallback_candidate(LPCWSTR path)
+{
+    static const WCHAR ext_mp3[] = L".mp3";
+    static const WCHAR ext_wav[] = L".wav";
+
+    return MCIQTZ_has_extension(path, ext_mp3) || MCIQTZ_has_extension(path, ext_wav);
+}
+
+static DWORD MCIQTZ_load_file_bytes(LPCWSTR path, BYTE **out_data, DWORD *out_size)
+{
+    HANDLE file = INVALID_HANDLE_VALUE;
+    LARGE_INTEGER size;
+    BYTE *data = NULL;
+    DWORD bytes_read = 0;
+    DWORD ret = MCIERR_INVALID_FILE;
+
+    if (!out_data || !out_size) return MCIERR_INVALID_FILE;
+    *out_data = NULL;
+    *out_size = 0;
+
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                       FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_FILE_NOT_FOUND ? MCIERR_FILE_NOT_FOUND : MCIERR_INVALID_FILE;
+
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > INT_MAX)
+        goto done;
+
+    data = HeapAlloc(GetProcessHeap(), 0, size.QuadPart);
+    if (!data)
+    {
+        ret = MCIERR_OUT_OF_MEMORY;
+        goto done;
+    }
+
+    if (!ReadFile(file, data, size.QuadPart, &bytes_read, NULL) || bytes_read != size.QuadPart)
+        goto done;
+
+    *out_data = data;
+    *out_size = bytes_read;
+    data = NULL;
+    ret = 0;
+
+done:
+    HeapFree(GetProcessHeap(), 0, data);
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    return ret;
+}
+
+static DWORD MCIQTZ_decode_wav_file(LPCWSTR path, WAVEFORMATEX *format,
+                                    BYTE **out_pcm, DWORD *out_bytes, DWORD *out_frames)
+{
+    BYTE *file_bytes = NULL, *pcm = NULL;
+    DWORD file_size = 0, offset, data_offset = 0, data_size = 0;
+    DWORD fmt_offset = 0, fmt_size = 0, output_bytes, i;
+    WORD channels, bits_per_sample, format_tag;
+    DWORD sample_rate;
+    DWORD ret;
+
+    ret = MCIQTZ_load_file_bytes(path, &file_bytes, &file_size);
+    if (ret) return ret;
+
+    if (file_size < 44 || memcmp(file_bytes, "RIFF", 4) || memcmp(file_bytes + 8, "WAVE", 4))
+    {
+        ret = MCIERR_INVALID_FILE;
+        goto done;
+    }
+
+    for (offset = 12; offset + 8 <= file_size; )
+    {
+        DWORD chunk_size = file_bytes[offset + 4] | (file_bytes[offset + 5] << 8) |
+                           (file_bytes[offset + 6] << 16) | (file_bytes[offset + 7] << 24);
+        DWORD next = offset + 8 + chunk_size + (chunk_size & 1);
+
+        if (next < offset + 8 || next > file_size) break;
+        if (!memcmp(file_bytes + offset, "fmt ", 4) && chunk_size >= 16 && !fmt_offset)
+        {
+            fmt_offset = offset + 8;
+            fmt_size = chunk_size;
+        }
+        else if (!memcmp(file_bytes + offset, "data", 4) && !data_offset)
+        {
+            data_offset = offset + 8;
+            data_size = chunk_size;
+        }
+        offset = next;
+    }
+
+    if (!fmt_offset || !data_offset || data_offset + data_size > file_size)
+    {
+        ret = MCIERR_INVALID_FILE;
+        goto done;
+    }
+
+    format_tag = file_bytes[fmt_offset] | (file_bytes[fmt_offset + 1] << 8);
+    channels = file_bytes[fmt_offset + 2] | (file_bytes[fmt_offset + 3] << 8);
+    sample_rate = file_bytes[fmt_offset + 4] | (file_bytes[fmt_offset + 5] << 8) |
+                  (file_bytes[fmt_offset + 6] << 16) | (file_bytes[fmt_offset + 7] << 24);
+    bits_per_sample = file_bytes[fmt_offset + 14] | (file_bytes[fmt_offset + 15] << 8);
+
+    if (format_tag != WAVE_FORMAT_PCM || (channels != 1 && channels != 2) ||
+        (bits_per_sample != 8 && bits_per_sample != 16))
+    {
+        ret = MCIERR_INVALID_FILE;
+        goto done;
+    }
+
+    output_bytes = bits_per_sample == 16 ? data_size : data_size * sizeof(INT16);
+    pcm = HeapAlloc(GetProcessHeap(), 0, output_bytes);
+    if (!pcm)
+    {
+        ret = MCIERR_OUT_OF_MEMORY;
+        goto done;
+    }
+
+    if (bits_per_sample == 16)
+        memcpy(pcm, file_bytes + data_offset, data_size);
+    else
+    {
+        INT16 *dst = (INT16 *)pcm;
+        const BYTE *src = file_bytes + data_offset;
+
+        for (i = 0; i < data_size; ++i)
+            dst[i] = ((INT16)src[i] - 128) << 8;
+    }
+
+    memset(format, 0, sizeof(*format));
+    format->wFormatTag = WAVE_FORMAT_PCM;
+    format->nChannels = channels;
+    format->nSamplesPerSec = sample_rate;
+    format->wBitsPerSample = 16;
+    format->nBlockAlign = channels * sizeof(INT16);
+    format->nAvgBytesPerSec = format->nSamplesPerSec * format->nBlockAlign;
+    *out_pcm = pcm;
+    *out_bytes = output_bytes - (output_bytes % format->nBlockAlign);
+    *out_frames = *out_bytes / format->nBlockAlign;
+    pcm = NULL;
+    ret = 0;
+
+done:
+    HeapFree(GetProcessHeap(), 0, pcm);
+    HeapFree(GetProcessHeap(), 0, file_bytes);
+    return ret;
+}
+
+static DWORD MCIQTZ_decode_mp3_file(LPCWSTR path, WAVEFORMATEX *format,
+                                    BYTE **out_pcm, DWORD *out_bytes, DWORD *out_frames)
+{
+    BYTE *file_bytes = NULL;
+    DWORD file_size = 0;
+    mp3dec_t decoder;
+    mp3dec_frame_info_t info;
+    BYTE *cursor;
+    int remaining;
+    int channels = 0, sample_rate = 0;
+    size_t total_samples = 0, decoded_samples = 0;
+    INT16 *pcm = NULL;
+    DWORD ret;
+
+    ret = MCIQTZ_load_file_bytes(path, &file_bytes, &file_size);
+    if (ret) return ret;
+
+    mp3dec_init(&decoder);
+    cursor = file_bytes;
+    remaining = file_size;
+    while (remaining > 0)
+    {
+        INT16 frame[MINIMP3_MAX_SAMPLES_PER_FRAME];
+        int samples = mp3dec_decode_frame(&decoder, cursor, remaining, frame, &info);
+
+        if (info.frame_bytes <= 0) break;
+        if (samples > 0)
+        {
+            if (!channels)
+            {
+                channels = info.channels;
+                sample_rate = info.hz;
+            }
+            else if (channels != info.channels || sample_rate != info.hz)
+            {
+                ret = MCIERR_INVALID_FILE;
+                goto done;
+            }
+            total_samples += (size_t)samples * channels;
+        }
+
+        cursor += info.frame_bytes;
+        remaining -= info.frame_bytes;
+    }
+
+    if (!channels || !sample_rate || total_samples == 0 || (channels != 1 && channels != 2))
+    {
+        ret = MCIERR_INVALID_FILE;
+        goto done;
+    }
+
+    pcm = HeapAlloc(GetProcessHeap(), 0, total_samples * sizeof(*pcm));
+    if (!pcm)
+    {
+        ret = MCIERR_OUT_OF_MEMORY;
+        goto done;
+    }
+
+    mp3dec_init(&decoder);
+    cursor = file_bytes;
+    remaining = file_size;
+    while (remaining > 0)
+    {
+        int samples = mp3dec_decode_frame(&decoder, cursor, remaining, pcm + decoded_samples, &info);
+
+        if (info.frame_bytes <= 0) break;
+        if (samples > 0)
+            decoded_samples += (size_t)samples * channels;
+
+        cursor += info.frame_bytes;
+        remaining -= info.frame_bytes;
+    }
+
+    memset(format, 0, sizeof(*format));
+    format->wFormatTag = WAVE_FORMAT_PCM;
+    format->nChannels = channels;
+    format->nSamplesPerSec = sample_rate;
+    format->wBitsPerSample = 16;
+    format->nBlockAlign = channels * sizeof(INT16);
+    format->nAvgBytesPerSec = format->nSamplesPerSec * format->nBlockAlign;
+    *out_pcm = (BYTE *)pcm;
+    *out_bytes = decoded_samples * sizeof(*pcm);
+    *out_frames = decoded_samples / channels;
+    pcm = NULL;
+    ret = 0;
+
+done:
+    HeapFree(GetProcessHeap(), 0, pcm);
+    HeapFree(GetProcessHeap(), 0, file_bytes);
+    return ret;
+}
+
+static DWORD MCIQTZ_open_wave_fallback(WINE_MCIQTZ *wma, DWORD flags, const MCI_DGV_OPEN_PARMSW *params)
+{
+    BYTE *pcm = NULL;
+    DWORD pcm_bytes = 0, frames = 0;
+    DWORD ret;
+
+    if (MCIQTZ_has_extension(params->lpstrElementName, L".wav"))
+        ret = MCIQTZ_decode_wav_file(params->lpstrElementName, &wma->wave_format, &pcm, &pcm_bytes, &frames);
+    else if (MCIQTZ_has_extension(params->lpstrElementName, L".mp3"))
+        ret = MCIQTZ_decode_mp3_file(params->lpstrElementName, &wma->wave_format, &pcm, &pcm_bytes, &frames);
+    else
+        return MCIERR_INVALID_FILE;
+
+    if (ret) return ret;
+
+    wma->wave_done_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!wma->wave_done_event)
+    {
+        HeapFree(GetProcessHeap(), 0, pcm);
+        return MCIERR_OUT_OF_MEMORY;
+    }
+
+    wma->wave_pcm = pcm;
+    wma->wave_pcm_bytes = pcm_bytes;
+    wma->wave_total_frames = frames;
+    wma->wave_position_frames = 0;
+    wma->wave_play_start_frames = 0;
+    wma->wave_loop_start_frames = 0;
+    wma->wave_play_stop_frames = frames;
+    wma->wave_state = MCIQTZ_WAVE_STOPPED;
+    wma->backend = MCIQTZ_BACKEND_WAVEOUT;
+    wma->opened = TRUE;
+
+    if (flags & MCI_NOTIFY)
+        mciDriverNotify(HWND_32(LOWORD(params->dwCallback)), wma->wDevID, MCI_NOTIFY_SUCCESSFUL);
+
+    TRACE("using waveOut fallback for %s, rate=%lu channels=%u frames=%lu\n",
+          debugstr_w(params->lpstrElementName), wma->wave_format.nSamplesPerSec,
+          wma->wave_format.nChannels, frames);
+    return 0;
+}
+
+static DWORD CALLBACK MCIQTZ_wave_notifyThread(LPVOID parm)
+{
+    WINE_MCIQTZ *wma = parm;
+    HANDLE waits[2];
+    DWORD notify_status = 0;
+    DWORD ret = 0;
+
+    waits[0] = wma->stop_event;
+    waits[1] = wma->wave_done_event;
+
+    while (wma->wave_play_start_frames < wma->wave_play_stop_frames)
+    {
+        DWORD wait_result;
+        DWORD buffer_frames = wma->wave_play_stop_frames - wma->wave_play_start_frames;
+        MMRESULT mmr;
+
+        ResetEvent(wma->wave_done_event);
+
+        mmr = waveOutOpen(&wma->wave_out, WAVE_MAPPER, &wma->wave_format,
+                          (DWORD_PTR)wma->wave_done_event, 0, CALLBACK_EVENT);
+        if (mmr != MMSYSERR_NOERROR)
+        {
+            WARN("waveOutOpen failed: %u\n", mmr);
+            ret = MCIERR_INTERNAL;
+            break;
+        }
+
+        waveOutSetVolume(wma->wave_out, wma->wave_volume);
+        memset(&wma->wave_header, 0, sizeof(wma->wave_header));
+        wma->wave_header.lpData = (LPSTR)(wma->wave_pcm +
+            wma->wave_play_start_frames * wma->wave_format.nBlockAlign);
+        wma->wave_header.dwBufferLength = buffer_frames * wma->wave_format.nBlockAlign;
+        mmr = waveOutPrepareHeader(wma->wave_out, &wma->wave_header, sizeof(wma->wave_header));
+        if (mmr != MMSYSERR_NOERROR)
+        {
+            WARN("waveOutPrepareHeader failed: %u\n", mmr);
+            MCIQTZ_close_wave_output(wma, TRUE);
+            ret = MCIERR_INTERNAL;
+            break;
+        }
+
+        wma->wave_header_prepared = TRUE;
+        mmr = waveOutWrite(wma->wave_out, &wma->wave_header, sizeof(wma->wave_header));
+        if (mmr != MMSYSERR_NOERROR)
+        {
+            WARN("waveOutWrite failed: %u\n", mmr);
+            MCIQTZ_close_wave_output(wma, TRUE);
+            ret = MCIERR_INTERNAL;
+            break;
+        }
+
+        wma->wave_position_frames = wma->wave_play_start_frames;
+        wma->wave_state = MCIQTZ_WAVE_PLAYING;
+
+        wait_result = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+        if (wait_result == WAIT_OBJECT_0)
+        {
+            DWORD played = MCIQTZ_get_wave_position_frames(wma);
+            wma->wave_position_frames = min(wma->wave_play_start_frames + played, wma->wave_play_stop_frames);
+            notify_status = MCI_NOTIFY_ABORTED;
+            MCIQTZ_close_wave_output(wma, TRUE);
+            break;
+        }
+
+        if (wait_result != WAIT_OBJECT_0 + 1)
+        {
+            WARN("Unexpected wave wait result %#lx\n", wait_result);
+            ret = MCIERR_INTERNAL;
+            MCIQTZ_close_wave_output(wma, TRUE);
+            break;
+        }
+
+        wma->wave_position_frames = wma->wave_play_stop_frames;
+        MCIQTZ_close_wave_output(wma, FALSE);
+        if (wma->mci_flags & MCI_DGV_PLAY_REPEAT)
+        {
+            wma->wave_play_start_frames = wma->wave_loop_start_frames;
+            continue;
+        }
+
+        notify_status = MCI_NOTIFY_SUCCESSFUL;
+        break;
+    }
+
+    wma->wave_state = MCIQTZ_WAVE_STOPPED;
+    if (notify_status)
+    {
+        HANDLE old = InterlockedExchangePointer(&wma->callback, NULL);
+        if (old)
+            mciDriverNotify(old, wma->notify_devid, notify_status);
+    }
+
+    return ret;
+}
+
 /**************************************************************************
  *                              MCIQTZ_drvOpen                  [internal]
  */
@@ -110,8 +656,11 @@ static DWORD MCIQTZ_drvOpen(LPCWSTR str, LPMCI_OPEN_DRIVER_PARMSW modp)
         return 0;
 
     wma->stop_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    wma->time_format = MCI_FORMAT_MILLISECONDS;
+    wma->wave_volume = 0xffffffff;
     modp->wType = MCI_DEVTYPE_DIGITAL_VIDEO;
     wma->wDevID = modp->wDeviceID;
+    wma->notify_devid = modp->wDeviceID;
     modp->wCustomCommandTable = wma->command_table = mciLoadCommandResource(MCIQTZ_hInstance, L"MCIAVI", 0);
     mciSetDriverData(wma->wDevID, (DWORD_PTR)wma);
 
@@ -249,6 +798,7 @@ static DWORD MCIQTZ_mciOpen(UINT wDevID, DWORD dwFlags,
 {
     WINE_MCIQTZ* wma;
     HRESULT hr;
+    DWORD ret;
 
     TRACE("(%04x, %08lX, %p)\n", wDevID, dwFlags, lpOpenParms);
 
@@ -259,7 +809,18 @@ static DWORD MCIQTZ_mciOpen(UINT wDevID, DWORD dwFlags,
     if (!wma)
         return MCIERR_INVALID_DEVICE_ID;
 
+    wma->notify_devid = wDevID;
     MCIQTZ_mciStop(wDevID, MCI_WAIT, NULL);
+
+    if (!(dwFlags & MCI_OPEN_ELEMENT) || (dwFlags & MCI_OPEN_ELEMENT_ID)) {
+        TRACE("Wrong dwFlags %lx\n", dwFlags);
+        return MCIERR_INVALID_FILE;
+    }
+
+    if (!lpOpenParms->lpstrElementName || !lpOpenParms->lpstrElementName[0]) {
+        TRACE("Invalid filename specified\n");
+        return MCIERR_FILE_NOT_FOUND;
+    }
 
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     wma->uninit = SUCCEEDED(hr);
@@ -306,16 +867,6 @@ static DWORD MCIQTZ_mciOpen(UINT wDevID, DWORD dwFlags,
         goto err;
     }
 
-    if (!(dwFlags & MCI_OPEN_ELEMENT) || (dwFlags & MCI_OPEN_ELEMENT_ID)) {
-        TRACE("Wrong dwFlags %lx\n", dwFlags);
-        goto err;
-    }
-
-    if (!lpOpenParms->lpstrElementName || !lpOpenParms->lpstrElementName[0]) {
-        TRACE("Invalid filename specified\n");
-        goto err;
-    }
-
     TRACE("Open file %s\n", debugstr_w(lpOpenParms->lpstrElementName));
 
     hr = IGraphBuilder_RenderFile(wma->pgraph, lpOpenParms->lpstrElementName, NULL);
@@ -326,6 +877,7 @@ static DWORD MCIQTZ_mciOpen(UINT wDevID, DWORD dwFlags,
 
     if (!create_window(wma, dwFlags, lpOpenParms))
         goto err;
+    wma->backend = MCIQTZ_BACKEND_DSHOW;
     wma->opened = TRUE;
 
     if (dwFlags & MCI_NOTIFY)
@@ -334,31 +886,18 @@ static DWORD MCIQTZ_mciOpen(UINT wDevID, DWORD dwFlags,
     return 0;
 
 err:
-    if (wma->audio)
-        IBasicAudio_Release(wma->audio);
-    wma->audio = NULL;
-    if (wma->vidbasic)
-        IBasicVideo_Release(wma->vidbasic);
-    wma->vidbasic = NULL;
-    if (wma->seek)
-        IMediaSeeking_Release(wma->seek);
-    wma->seek = NULL;
-    if (wma->vidwin)
-        IVideoWindow_Release(wma->vidwin);
-    wma->vidwin = NULL;
-    if (wma->pgraph)
-        IGraphBuilder_Release(wma->pgraph);
-    wma->pgraph = NULL;
-    if (wma->mevent)
-        IMediaEvent_Release(wma->mevent);
-    wma->mevent = NULL;
-    if (wma->pmctrl)
-        IMediaControl_Release(wma->pmctrl);
-    wma->pmctrl = NULL;
+    MCIQTZ_release_graph(wma, TRUE);
+    wma->backend = MCIQTZ_BACKEND_NONE;
 
-    if (wma->uninit)
-        CoUninitialize();
-    wma->uninit = FALSE;
+    if (MCIQTZ_is_wave_fallback_candidate(lpOpenParms->lpstrElementName))
+    {
+        ret = MCIQTZ_open_wave_fallback(wma, dwFlags, lpOpenParms);
+        if (!ret)
+            return 0;
+        TRACE("waveOut fallback failed for %s, ret %#lx\n",
+              debugstr_w(lpOpenParms->lpstrElementName), ret);
+        return ret;
+    }
 
     return MCIERR_INTERNAL;
 }
@@ -379,23 +918,12 @@ static DWORD MCIQTZ_mciClose(UINT wDevID, DWORD dwFlags, LPMCI_GENERIC_PARMS lpP
     MCIQTZ_mciStop(wDevID, MCI_WAIT, NULL);
 
     if (wma->opened) {
-        if (wma->window)
-        {
-            IVideoWindow_put_MessageDrain(wma->vidwin, (OAHWND)NULL);
-            IVideoWindow_put_Owner(wma->vidwin, (OAHWND)NULL);
-            DestroyWindow(wma->window);
-            wma->window = NULL;
-        }
-        IVideoWindow_Release(wma->vidwin);
-        IBasicVideo_Release(wma->vidbasic);
-        IBasicAudio_Release(wma->audio);
-        IMediaSeeking_Release(wma->seek);
-        IMediaEvent_Release(wma->mevent);
-        IGraphBuilder_Release(wma->pgraph);
-        IMediaControl_Release(wma->pmctrl);
-        if (wma->uninit)
-            CoUninitialize();
+        if (MCIQTZ_is_wave_backend(wma))
+            MCIQTZ_reset_wave_fallback(wma);
+        else
+            MCIQTZ_release_graph(wma, TRUE);
         wma->opened = FALSE;
+        wma->backend = MCIQTZ_BACKEND_NONE;
     }
 
     return 0;
@@ -479,6 +1007,7 @@ static DWORD MCIQTZ_mciPlay(UINT wDevID, DWORD dwFlags, LPMCI_PLAY_PARMS lpParms
     HRESULT hr;
     GUID format;
     DWORD start_flags;
+    DWORD ret = 0;
 
     TRACE("(%04x, %08lX, %p)\n", wDevID, dwFlags, lpParms);
 
@@ -489,6 +1018,10 @@ static DWORD MCIQTZ_mciPlay(UINT wDevID, DWORD dwFlags, LPMCI_PLAY_PARMS lpParms
     if (!wma)
         return MCIERR_INVALID_DEVICE_ID;
 
+    if (MCIQTZ_is_wave_backend(wma))
+        MCIQTZ_mciStop(wDevID, MCI_WAIT, NULL);
+
+    MCIQTZ_cleanup_finished_thread(wma);
     ResetEvent(wma->stop_event);
     if (dwFlags & MCI_NOTIFY) {
         HANDLE old;
@@ -498,6 +1031,44 @@ static DWORD MCIQTZ_mciPlay(UINT wDevID, DWORD dwFlags, LPMCI_PLAY_PARMS lpParms
     }
 
     wma->mci_flags = dwFlags;
+    if (MCIQTZ_is_wave_backend(wma))
+    {
+        DWORD start, stop;
+
+        start = (dwFlags & MCI_FROM) ? MCIQTZ_time_to_frames(wma, lpParms->dwFrom) : wma->wave_position_frames;
+        if (!(dwFlags & MCI_FROM) && start >= wma->wave_total_frames)
+            start = 0;
+        stop = (dwFlags & MCI_TO) ? MCIQTZ_time_to_frames(wma, lpParms->dwTo) : wma->wave_total_frames;
+
+        start = min(start, wma->wave_total_frames);
+        stop = min(stop, wma->wave_total_frames);
+        if (stop < start)
+            stop = start;
+
+        wma->wave_position_frames = start;
+        wma->wave_play_start_frames = start;
+        wma->wave_loop_start_frames = start;
+        wma->wave_play_stop_frames = stop;
+        wma->wave_state = MCIQTZ_WAVE_STOPPED;
+
+        if (start < stop)
+        {
+            wma->thread = CreateThread(NULL, 0, MCIQTZ_wave_notifyThread, wma, 0, NULL);
+            if (!wma->thread) {
+                TRACE("Can't create thread\n");
+                return MCIERR_INTERNAL;
+            }
+        }
+        else if (dwFlags & MCI_NOTIFY)
+        {
+            MCIQTZ_mciNotify(lpParms->dwCallback, wma, MCI_NOTIFY_SUCCESSFUL);
+        }
+
+        if (dwFlags & MCI_WAIT)
+            ret = MCIQTZ_wait_for_thread(wma);
+        return ret;
+    }
+
     IMediaSeeking_GetTimeFormat(wma->seek, &format);
     if (dwFlags & MCI_FROM) {
         wma->seek_start = lpParms->dwFrom;
@@ -537,6 +1108,9 @@ static DWORD MCIQTZ_mciPlay(UINT wDevID, DWORD dwFlags, LPMCI_PLAY_PARMS lpParms
             return MCIERR_INTERNAL;
         }
     }
+
+    if (dwFlags & MCI_WAIT)
+        return MCIQTZ_wait_for_thread(wma);
     return 0;
 }
 
@@ -559,6 +1133,24 @@ static DWORD MCIQTZ_mciSeek(UINT wDevID, DWORD dwFlags, LPMCI_SEEK_PARMS lpParms
         return MCIERR_INVALID_DEVICE_ID;
 
     MCIQTZ_mciStop(wDevID, MCI_WAIT, NULL);
+
+    if (MCIQTZ_is_wave_backend(wma))
+    {
+        if (dwFlags & MCI_SEEK_TO_START)
+            wma->wave_position_frames = 0;
+        else if (dwFlags & MCI_SEEK_TO_END)
+            wma->wave_position_frames = wma->wave_total_frames;
+        else if (dwFlags & MCI_TO)
+            wma->wave_position_frames = min(MCIQTZ_time_to_frames(wma, lpParms->dwTo), wma->wave_total_frames);
+        else {
+            WARN("dwFlag doesn't tell where to seek to...\n");
+            return MCIERR_MISSING_PARAMETER;
+        }
+
+        if (dwFlags & MCI_NOTIFY)
+            MCIQTZ_mciNotify(lpParms->dwCallback, wma, MCI_NOTIFY_SUCCESSFUL);
+        return 0;
+    }
 
     if (dwFlags & MCI_SEEK_TO_START) {
         newpos = 0;
@@ -601,12 +1193,18 @@ static DWORD MCIQTZ_mciStop(UINT wDevID, DWORD dwFlags, LPMCI_GENERIC_PARMS lpPa
     if (!wma->opened)
         return 0;
 
+    MCIQTZ_cleanup_finished_thread(wma);
+
+    if (MCIQTZ_is_wave_backend(wma) && wma->wave_state != MCIQTZ_WAVE_STOPPED)
+        wma->wave_position_frames = MCIQTZ_get_wave_playback_position_frames(wma);
+
     if (wma->thread) {
         SetEvent(wma->stop_event);
-        WaitForSingleObject(wma->thread, INFINITE);
-        CloseHandle(wma->thread);
-        wma->thread = NULL;
+        MCIQTZ_wait_for_thread(wma);
     }
+
+    if (MCIQTZ_is_wave_backend(wma))
+        wma->wave_state = MCIQTZ_WAVE_STOPPED;
 
     return 0;
 }
@@ -624,6 +1222,18 @@ static DWORD MCIQTZ_mciPause(UINT wDevID, DWORD dwFlags, LPMCI_GENERIC_PARMS lpP
     wma = MCIQTZ_mciGetOpenDev(wDevID);
     if (!wma)
         return MCIERR_INVALID_DEVICE_ID;
+
+    if (MCIQTZ_is_wave_backend(wma))
+    {
+        if (wma->wave_out && wma->wave_state == MCIQTZ_WAVE_PLAYING)
+        {
+            wma->wave_position_frames = MCIQTZ_get_wave_playback_position_frames(wma);
+            if (waveOutPause(wma->wave_out) != MMSYSERR_NOERROR)
+                return MCIERR_INTERNAL;
+            wma->wave_state = MCIQTZ_WAVE_PAUSED;
+        }
+        return 0;
+    }
 
     hr = IMediaControl_Pause(wma->pmctrl);
     if (FAILED(hr)) {
@@ -647,6 +1257,17 @@ static DWORD MCIQTZ_mciResume(UINT wDevID, DWORD dwFlags, LPMCI_GENERIC_PARMS lp
     wma = MCIQTZ_mciGetOpenDev(wDevID);
     if (!wma)
         return MCIERR_INVALID_DEVICE_ID;
+
+    if (MCIQTZ_is_wave_backend(wma))
+    {
+        if (wma->wave_out && wma->wave_state == MCIQTZ_WAVE_PAUSED)
+        {
+            if (waveOutRestart(wma->wave_out) != MMSYSERR_NOERROR)
+                return MCIERR_INTERNAL;
+            wma->wave_state = MCIQTZ_WAVE_PLAYING;
+        }
+        return 0;
+    }
 
     hr = IMediaControl_Run(wma->pmctrl);
     if (FAILED(hr)) {
@@ -686,7 +1307,7 @@ static DWORD MCIQTZ_mciGetDevCaps(UINT wDevID, DWORD dwFlags, LPMCI_GETDEVCAPS_P
             TRACE("MCI_GETDEVCAPS_HAS_AUDIO = %08lx\n", lpParms->dwReturn);
             break;
         case MCI_GETDEVCAPS_HAS_VIDEO:
-            lpParms->dwReturn = MAKEMCIRESOURCE(TRUE, MCI_TRUE);
+            lpParms->dwReturn = MAKEMCIRESOURCE(!MCIQTZ_is_wave_backend(wma), !MCIQTZ_is_wave_backend(wma) ? MCI_TRUE : MCI_FALSE);
             TRACE("MCI_GETDEVCAPS_HAS_VIDEO = %08lx\n", lpParms->dwReturn);
             break;
         case MCI_GETDEVCAPS_DEVICE_TYPE:
@@ -698,7 +1319,7 @@ static DWORD MCIQTZ_mciGetDevCaps(UINT wDevID, DWORD dwFlags, LPMCI_GETDEVCAPS_P
             TRACE("MCI_GETDEVCAPS_USES_FILES = %08lx\n", lpParms->dwReturn);
             break;
         case MCI_GETDEVCAPS_COMPOUND_DEVICE:
-            lpParms->dwReturn = MAKEMCIRESOURCE(TRUE, MCI_TRUE);
+            lpParms->dwReturn = MAKEMCIRESOURCE(!MCIQTZ_is_wave_backend(wma), !MCIQTZ_is_wave_backend(wma) ? MCI_TRUE : MCI_FALSE);
             TRACE("MCI_GETDEVCAPS_COMPOUND_DEVICE = %08lx\n", lpParms->dwReturn);
             break;
         case MCI_GETDEVCAPS_CAN_EJECT:
@@ -742,7 +1363,7 @@ static DWORD MCIQTZ_mciGetDevCaps(UINT wDevID, DWORD dwFlags, LPMCI_GETDEVCAPS_P
             TRACE("MCI_DGV_GETDEVCAPS_CAN_TEST = %08lx\n", lpParms->dwReturn);
             break;
         case MCI_DGV_GETDEVCAPS_MAX_WINDOWS:
-            lpParms->dwReturn = 1;
+            lpParms->dwReturn = MCIQTZ_is_wave_backend(wma) ? 0 : 1;
             TRACE("MCI_DGV_GETDEVCAPS_MAX_WINDOWS = %lu\n", lpParms->dwReturn);
             return 0;
         default:
@@ -829,6 +1450,8 @@ static DWORD MCIQTZ_mciStatus(UINT wDevID, DWORD dwFlags, LPMCI_DGV_STATUS_PARMS
     if (!wma)
         return MCIERR_INVALID_DEVICE_ID;
 
+    MCIQTZ_cleanup_finished_thread(wma);
+
     if (!(dwFlags & MCI_STATUS_ITEM)) {
         WARN("No status item specified\n");
         return MCIERR_UNRECOGNIZED_COMMAND;
@@ -836,6 +1459,11 @@ static DWORD MCIQTZ_mciStatus(UINT wDevID, DWORD dwFlags, LPMCI_DGV_STATUS_PARMS
 
     switch (lpParms->dwItem) {
         case MCI_STATUS_LENGTH: {
+            if (MCIQTZ_is_wave_backend(wma))
+            {
+                lpParms->dwReturn = MCIQTZ_frames_to_time(wma, wma->wave_total_frames);
+                break;
+            }
             LONGLONG duration = -1;
             GUID format;
             switch (wma->time_format) {
@@ -860,20 +1488,39 @@ static DWORD MCIQTZ_mciStatus(UINT wDevID, DWORD dwFlags, LPMCI_DGV_STATUS_PARMS
             break;
         }
         case MCI_STATUS_POSITION: {
+            if (MCIQTZ_is_wave_backend(wma))
+            {
+                lpParms->dwReturn = MCIQTZ_frames_to_time(wma, MCIQTZ_get_wave_playback_position_frames(wma));
+                break;
+            }
             REFERENCE_TIME curpos;
+            GUID format;
 
             hr = IMediaSeeking_GetCurrentPosition(wma->seek, &curpos);
             if (FAILED(hr)) {
                 FIXME("Cannot get position (hr = %lx)\n", hr);
                 return MCIERR_INTERNAL;
             }
-            lpParms->dwReturn = curpos / 10000;
+            IMediaSeeking_GetTimeFormat(wma->seek, &format);
+            lpParms->dwReturn = IsEqualGUID(&format, &TIME_FORMAT_MEDIA_TIME) ? curpos / 10000 : curpos;
             break;
         }
         case MCI_STATUS_NUMBER_OF_TRACKS:
             FIXME("MCI_STATUS_NUMBER_OF_TRACKS not implemented yet\n");
             return MCIERR_UNRECOGNIZED_COMMAND;
         case MCI_STATUS_MODE: {
+            if (MCIQTZ_is_wave_backend(wma))
+            {
+                UINT mode = MCI_MODE_STOP;
+
+                if (wma->wave_state == MCIQTZ_WAVE_PLAYING && wma->thread)
+                    mode = MCI_MODE_PLAY;
+                else if (wma->wave_state == MCIQTZ_WAVE_PAUSED)
+                    mode = MCI_MODE_PAUSE;
+                lpParms->dwReturn = MAKEMCIRESOURCE(mode, mode);
+                ret = MCI_RESOURCE_RETURNED;
+                break;
+            }
             LONG state = State_Stopped;
             IMediaControl_GetState(wma->pmctrl, -1, &state);
             if (state == State_Stopped)
@@ -896,8 +1543,9 @@ static DWORD MCIQTZ_mciStatus(UINT wDevID, DWORD dwFlags, LPMCI_DGV_STATUS_PARMS
             ret = MCI_RESOURCE_RETURNED;
             break;
         case MCI_STATUS_READY:
-            FIXME("MCI_STATUS_READY not implemented yet\n");
-            return MCIERR_UNRECOGNIZED_COMMAND;
+            lpParms->dwReturn = MAKEMCIRESOURCE(TRUE, MCI_TRUE);
+            ret = MCI_RESOURCE_RETURNED;
+            break;
         case MCI_STATUS_CURRENT_TRACK:
             FIXME("MCI_STATUS_CURRENT_TRACK not implemented yet\n");
             return MCIERR_UNRECOGNIZED_COMMAND;
@@ -931,6 +1579,9 @@ static DWORD MCIQTZ_mciWhere(UINT wDevID, DWORD dwFlags, LPMCI_DGV_RECT_PARMS lp
     wma = MCIQTZ_mciGetOpenDev(wDevID);
     if (!wma)
         return MCIERR_INVALID_DEVICE_ID;
+
+    if (MCIQTZ_is_wave_backend(wma))
+        return MCIERR_NO_WINDOW;
 
     hr = IVideoWindow_get_Owner(wma->vidwin, (OAHWND*)&hWnd);
     if (FAILED(hr)) {
@@ -997,6 +1648,8 @@ static DWORD MCIQTZ_mciWindow(UINT wDevID, DWORD dwFlags, LPMCI_DGV_WINDOW_PARMS
 
     if (!wma)
         return MCIERR_INVALID_DEVICE_ID;
+    if (MCIQTZ_is_wave_backend(wma))
+        return MCIERR_NO_WINDOW;
     if (dwFlags & MCI_TEST)
         return 0;
 
@@ -1057,6 +1710,8 @@ static DWORD MCIQTZ_mciPut(UINT wDevID, DWORD dwFlags, MCI_GENERIC_PARMS *lpParm
 
     if (!wma)
         return MCIERR_INVALID_DEVICE_ID;
+    if (MCIQTZ_is_wave_backend(wma))
+        return MCIERR_NO_WINDOW;
 
     if (!(dwFlags & MCI_DGV_RECT)) {
         FIXME("No support for non-RECT MCI_PUT\n");
@@ -1107,6 +1762,8 @@ static DWORD MCIQTZ_mciUpdate(UINT wDevID, DWORD dwFlags, LPMCI_DGV_UPDATE_PARMS
     wma = MCIQTZ_mciGetOpenDev(wDevID);
     if (!wma)
         return MCIERR_INVALID_DEVICE_ID;
+    if (MCIQTZ_is_wave_backend(wma))
+        return MCIERR_NO_WINDOW;
 
     if (dwFlags & MCI_DGV_UPDATE_HDC) {
         LONG state, size;
@@ -1181,23 +1838,35 @@ static DWORD MCIQTZ_mciSetAudio(UINT wDevID, DWORD dwFlags, LPMCI_DGV_SETAUDIO_P
         switch (lpParms->dwItem) {
         case MCI_DGV_SETAUDIO_VOLUME:
             if (dwFlags & MCI_DGV_SETAUDIO_VALUE) {
-                long vol;
-                HRESULT hr;
                 if (lpParms->dwValue > 1000) {
                     ret = MCIERR_OUTOFRANGE;
                     break;
                 }
                 if (dwFlags & MCI_TEST)
                     break;
-                if (lpParms->dwValue != 0)
-                    vol = (long)(2000.0 * (log10(lpParms->dwValue) - 3.0));
+                if (MCIQTZ_is_wave_backend(wma))
+                {
+                    DWORD volume = MulDiv(lpParms->dwValue, 0xffff, 1000) & 0xffff;
+
+                    wma->wave_volume = volume | (volume << 16);
+                    if (wma->wave_out && waveOutSetVolume(wma->wave_out, wma->wave_volume) != MMSYSERR_NOERROR)
+                        ret = MCIERR_INTERNAL;
+                }
                 else
-                    vol = -10000;
-                TRACE("Setting volume to %ld\n", vol);
-                hr = IBasicAudio_put_Volume(wma->audio, vol);
-                if (FAILED(hr)) {
-                    WARN("Cannot set volume (hr = %lx)\n", hr);
-                    ret = MCIERR_INTERNAL;
+                {
+                    long vol;
+                    HRESULT hr;
+
+                    if (lpParms->dwValue != 0)
+                        vol = (long)(2000.0 * (log10(lpParms->dwValue) - 3.0));
+                    else
+                        vol = -10000;
+                    TRACE("Setting volume to %ld\n", vol);
+                    hr = IBasicAudio_put_Volume(wma->audio, vol);
+                    if (FAILED(hr)) {
+                        WARN("Cannot set volume (hr = %lx)\n", hr);
+                        ret = MCIERR_INTERNAL;
+                    }
                 }
             }
             break;

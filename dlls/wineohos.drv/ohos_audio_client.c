@@ -377,6 +377,16 @@ size_t ohos_audio_client_write_frames(OhosAudioClientStream *stream, const void 
     return written;
 }
 
+size_t ohos_audio_client_read_frames(OhosAudioClientStream *stream, void *data, size_t frames)
+{
+    size_t read;
+
+    if (!stream || !stream->ring) return 0;
+    read = winehua_audio_ring_read_frames(stream->ring, data, frames);
+    if (read < frames) winehua_audio_ring_increment_underrun(stream->ring);
+    return read;
+}
+
 size_t ohos_audio_client_get_free_frames(const OhosAudioClientStream *stream)
 {
     if (!stream || !stream->ring) return 0;

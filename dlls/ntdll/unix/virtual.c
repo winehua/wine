@@ -592,8 +592,10 @@ static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
 {
     void *ptr;
 
+#ifdef __OHOS__
 /* OHOS: Box64 wrapped mmap does not support MAP_FIXED_NOREPLACE */
 #undef MAP_FIXED_NOREPLACE
+#endif
 #ifdef MAP_FIXED_NOREPLACE
     ptr = mmap( start, size, prot, MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON | flags, -1, 0 );
 #elif defined(MAP_TRYFIXED)
@@ -4195,13 +4197,15 @@ struct thread_data *virtual_alloc_thread_data(void)
     {
         data = view->base;
     }
+#ifdef __OHOS__
+    /* OHOS: Box64 不支持 map_view, 回退到 anon_mmap */
     else
     {
-        /* OHOS: fallback to anon_mmap for Box64 compatibility */
         data = anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
         if (data != MAP_FAILED)
             status = 0;
     }
+#endif
     if (!status)
     {
         data->request_fd = -1;

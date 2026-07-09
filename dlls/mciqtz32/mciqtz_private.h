@@ -23,12 +23,28 @@
 
 #define COBJMACROS
 
+#include "windef.h"
 #include "dshow.h"
+
+enum mciqtz_backend
+{
+    MCIQTZ_BACKEND_NONE = 0,
+    MCIQTZ_BACKEND_DSHOW,
+    MCIQTZ_BACKEND_WAVEOUT,
+};
+
+enum mciqtz_wave_state
+{
+    MCIQTZ_WAVE_STOPPED = 0,
+    MCIQTZ_WAVE_PLAYING,
+    MCIQTZ_WAVE_PAUSED,
+};
 
 typedef struct {
     MCIDEVICEID    wDevID;
     BOOL           opened;
     BOOL           uninit;
+    enum mciqtz_backend backend;
     IGraphBuilder* pgraph;
     IMediaControl* pmctrl;
     IMediaSeeking* seek;
@@ -47,6 +63,20 @@ typedef struct {
     HANDLE         callback;
     HANDLE         thread;
     HANDLE         stop_event;
+    WAVEFORMATEX   wave_format;
+    BYTE          *wave_pcm;
+    DWORD          wave_pcm_bytes;
+    DWORD          wave_total_frames;
+    DWORD          wave_position_frames;
+    DWORD          wave_play_start_frames;
+    DWORD          wave_loop_start_frames;
+    DWORD          wave_play_stop_frames;
+    DWORD          wave_volume;
+    enum mciqtz_wave_state wave_state;
+    HWAVEOUT       wave_out;
+    HANDLE         wave_done_event;
+    WAVEHDR        wave_header;
+    BOOL           wave_header_prepared;
 } WINE_MCIQTZ;
 
 #endif  /* __WINE_PRIVATE_MCIQTZ_H */
