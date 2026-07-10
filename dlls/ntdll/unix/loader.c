@@ -37,7 +37,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
-#ifdef PAD_MODE
+#ifdef __OHOS__
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <dirent.h>
@@ -404,7 +404,7 @@ static void init_paths(void)
     else
     {
         if (!(dll_dir = remove_tail( ntdll_dir, get_so_dir(current_machine) ))) dll_dir = ntdll_dir;
-#ifdef PAD_MODE
+#ifdef __OHOS__
         {
             const char *wine_data_dir = getenv( "WINEDATADIR" );
             if (wine_data_dir) data_dir = strdup( wine_data_dir );
@@ -565,10 +565,10 @@ void start_server( BOOL debug )
     MESSAGE( "[OHOS-LOADER] start_server called, started=%d debug=%d\n", started, debug );
     if (!started)
     {
-#ifdef PAD_MODE
+#ifdef __OHOS__
         /* 问题起因: 标准 Linux 上 start_server() 通过 posix_spawn 启动 wineserver，
          * wineserver 自动 daemonize（double-fork），中间进程退出后 waitpid 返回，
-         * 此时 wineserver socket 已就绪。但 OHOS PAD_MODE 没有 execve，
+         * 此时 wineserver socket 已就绪。但 OHOS 没有 execve，
          * wineserver 是 libwineserver.so 库而非独立 ELF 可执行文件。
          *
          * 解决办法: 通过 Process Broker 请求主进程调用 StartNativeChildProcess
@@ -2207,7 +2207,7 @@ static int pre_exec(void)
 
 static int pre_exec(void)
 {
-#ifdef PAD_MODE
+#ifdef __OHOS__
     return 0;  /* Pad fork-only: no preloader, no execve */
 #elif defined(HAVE_WINE_PRELOADER)
     return 1;  /* we have a preloader */
@@ -2225,7 +2225,7 @@ static void reexec_loader( int argc, char *argv[], char *extra_arg )
     char **new_argv;
 
     /* have to exec if we have a preloader, or an argument, or if we are the initial wrapper */
-#ifdef PAD_MODE
+#ifdef __OHOS__
     if (!pre_exec() && !extra_arg) return;  // Pad: no preloader, skip default reexec
 #else
     if (!pre_exec() && !extra_arg && dlsym( RTLD_DEFAULT, "wine_main_preload_info" )) return;

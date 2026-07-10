@@ -1629,8 +1629,8 @@ size_t server_init_process(void)
         MESSAGE( "[OHOS-LOADER] server_init WINESERVERSOCKET=%s, using fd directly\n", env_socket );
         fd_socket = atoi( env_socket );
 
-#ifdef PAD_MODE
-        /* PAD_MODE: wineserver 可能在进程间传递 fd 期间退出。
+#ifdef __OHOS__
+        /* OHOS: wineserver 可能在进程间传递 fd 期间退出。
          * recv(MSG_PEEK|MSG_DONTWAIT) 检测: 对方关闭返回 0，存活且无数据
          * 返回 -1/EAGAIN，有数据返回 >0（MSG_PEEK 不消耗）。 */
         {

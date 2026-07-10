@@ -56,7 +56,7 @@
 # include <libprocstat.h>
 #endif
 #include <unistd.h>
-#ifdef PAD_MODE
+#ifdef __OHOS__
 #include <sys/un.h>
 #endif
 #ifdef HAVE_MACH_MACH_H
@@ -400,9 +400,9 @@ static BOOL is_unix_console_handle( HANDLE handle )
 }
 
 
-#ifdef PAD_MODE
+#ifdef __OHOS__
 /***********************************************************************
- *           send_spawn_request  (PAD_MODE)
+ *           send_spawn_request  (OHOS broker+NCP)
  *
  * 通过 broker 的 Unix socket 发送一个 SPAWN 请求, 携带 entryParams、
  * N 个命名 fd (SCM_RIGHTS) 和父进程的完整环境变量。协议:
@@ -522,7 +522,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
         isatty(1) && is_unix_console_handle( params->hStdOutput ))
         stdout_fd = 1;
 
-#ifdef PAD_MODE
+#ifdef __OHOS__
     /* Process Broker: 通过 Unix socket 请求主进程创建子进程。
      *
      * 问题起因: wineboot 是 appspawn 子进程，它在 --init 阶段通过
@@ -749,7 +749,7 @@ NTSTATUS wow64_wine_spawnvp( void *args )
 static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, int unixdir,
                                const RTL_USER_PROCESS_PARAMETERS *params )
 {
-#ifdef PAD_MODE
+#ifdef __OHOS__
     /* Pad: native Unix binary execution not supported (no execve).
      * This path is rarely hit for core Wine (most exes are PE). */
     return STATUS_UNSUCCESSFUL;
@@ -842,7 +842,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
     if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
     if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
     return status;
-#endif /* !PAD_MODE */
+#endif /* !__OHOS__ */
 }
 
 static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_t **handles, data_size_t *handles_len )
