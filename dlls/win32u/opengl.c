@@ -67,78 +67,6 @@ static void winehua_opengl_diag( const char *fmt, ... )
     fflush( stderr );
 }
 
-static BOOL winehua_wgl_force_gles(void)
-{
-    static int cached = -1;
-    const char *value;
-
-    if (cached != -1) return cached;
-
-    value = getenv( "WINEHUA_WGL_FORCE_GLES" );
-    cached = !!(value && value[0] && strcmp( value, "0" ));
-    return cached;
-}
-
-static EGLint winehua_wgl_gles_renderable_mask(void)
-{
-    EGLint mask = EGL_OPENGL_ES2_BIT;
-#ifdef EGL_OPENGL_ES3_BIT_KHR
-    mask |= EGL_OPENGL_ES3_BIT_KHR;
-#endif
-    return mask;
-}
-
-static BOOL winehua_wgl_config_supported( EGLint renderable )
-{
-    if (renderable & EGL_OPENGL_BIT) return TRUE;
-    return winehua_wgl_force_gles() && (renderable & winehua_wgl_gles_renderable_mask());
-}
-
-static BOOL winehua_egl_config_draws_to_window( const struct egl_platform *egl, EGLint surface_type, UINT flags )
-{
-    if (!flags) return FALSE;
-    if (surface_type & EGL_WINDOW_BIT) return TRUE;
-
-    /* On Pad's virpipe/GLES path the EGL configs can be pbuffer-only even
-     * though Winewayland presents through a window surface wrapper. Expose
-     * those GLES-backed formats as onscreen WGL formats only when this path is
-     * explicitly enabled. */
-    return egl->force_pbuffer_formats && winehua_wgl_force_gles();
-}
-
-static void winehua_preload_guest_egl_deps( const char *egl_path )
-{
-    static const char *deps[] =
-    {
-        "libffi.so.8",
-        "libdrm.so.2",
-        "libwayland-client.so.0",
-        "libwayland-server.so.0",
-        "libwayland-egl.so.1",
-        "libgallium-25.0.1.so",
-        "libGLESv2.so.2",
-        "libGLESv1_CM.so.1",
-    };
-    const char *slash;
-    char dir[4096], path[4096];
-    size_t len;
-    unsigned int i;
-
-    if (!egl_path || !(slash = strrchr( egl_path, '/' ))) return;
-    len = slash - egl_path;
-    if (!len || len >= sizeof(dir)) return;
-    memcpy( dir, egl_path, len );
-    dir[len] = 0;
-
-    for (i = 0; i < ARRAY_SIZE(deps); i++)
-    {
-        if (snprintf( path, sizeof(path), "%s/%s", dir, deps[i] ) >= sizeof(path)) continue;
-        if (access( path, R_OK )) continue;
-        if (!dlopen( path, RTLD_NOW | RTLD_GLOBAL ))
-            winehua_opengl_diag( "preload %s failed: %s", path, dlerror() );
-    }
-}
-
 struct pbuffer
 {
     struct opengl_drawable *drawable;
@@ -548,43 +476,6 @@ static EGLConfig egl_config_for_format( const struct egl_platform *egl, int form
     return egl->configs[(format - 1) % egl->config_count];
 }
 
-static EGLConfig winehua_wgl_first_config_for_api( const struct opengl_funcs *funcs, const struct egl_platform *egl )
-{
-    EGLConfig *configs, config = EGL_NO_CONFIG_KHR;
-    EGLint count, render, i;
-
-    if (!funcs->p_eglGetConfigs( egl->display, NULL, 0, &count ) || !count) return EGL_NO_CONFIG_KHR;
-    if (!(configs = malloc( count * sizeof(*configs) ))) return EGL_NO_CONFIG_KHR;
-    if (!funcs->p_eglGetConfigs( egl->display, configs, count, &count ) || !count)
-    {
-        free( configs );
-        return EGL_NO_CONFIG_KHR;
-    }
-
-    for (i = 0; i < count; i++)
-    {
-        funcs->p_eglGetConfigAttrib( egl->display, configs[i], EGL_RENDERABLE_TYPE, &render );
-        if (winehua_wgl_config_supported( render ))
-        {
-            config = configs[i];
-            break;
-        }
-    }
-
-    free( configs );
-    return config;
-}
-
-static EGLint winehua_wgl_default_gles_client_version( const struct opengl_funcs *funcs,
-                                                       const struct egl_platform *egl, EGLConfig config )
-{
-    (void)funcs;
-    (void)egl;
-    (void)config;
-
-    return 2;
-}
-
 static void egldrv_init_egl_platform( struct egl_platform *platform )
 {
     platform->type = EGL_PLATFORM_SURFACELESS_MESA;
@@ -610,8 +501,7 @@ static UINT egldrv_init_pixel_formats( UINT *onscreen_count )
     struct egl_platform *egl = &display_egl;
     EGLConfig *configs;
     EGLint i, j, render, count, total_count;
-    UINT opengl_count = 0, gles1_count = 0, gles2_count = 0, gles3_count = 0, gles_fallback_count = 0;
-    BOOL force_gles = winehua_wgl_force_gles();
+    UINT opengl_count = 0, gles1_count = 0, gles2_count = 0, gles3_count = 0;
 
     funcs->p_eglGetConfigs( egl->display, NULL, 0, &count );
     total_count = count;
@@ -634,12 +524,13 @@ static UINT egldrv_init_pixel_formats( UINT *onscreen_count )
 #ifdef EGL_OPENGL_ES3_BIT_KHR
         if (render & EGL_OPENGL_ES3_BIT_KHR) gles3_count++;
 #endif
-        if (!(render & EGL_OPENGL_BIT) && (render & winehua_wgl_gles_renderable_mask())) gles_fallback_count++;
-        if (winehua_wgl_config_supported( render )) configs[j++] = configs[i];
+        if (render & EGL_OPENGL_BIT) configs[j++] = configs[i];
     }
     count = j;
 
-    if (!count) winehua_opengl_diag( "no EGL configs usable for WGL; force_gles=%u", force_gles );
+    winehua_opengl_diag( "egl configs total=%d filtered_opengl=%d renderable_counts gl=%u es1=%u es2=%u es3=%u",
+                         total_count, count, opengl_count, gles1_count, gles2_count, gles3_count );
+    if (!count) winehua_opengl_diag( "no EGL configs advertise EGL_OPENGL_BIT; Wine WGL pixel format enumeration will be empty" );
 
     if (TRACE_ON(wgl)) for (i = 0; i < count; i++)
     {
@@ -682,7 +573,7 @@ static BOOL describe_egl_config( EGLConfig config, struct wgl_pixel_format *fmt,
     pfd->nSize = sizeof(*pfd);
     pfd->nVersion = 1;
     pfd->dwFlags = PFD_SUPPORT_OPENGL | PFD_SUPPORT_COMPOSITION | flags;
-    if (winehua_egl_config_draws_to_window( egl, surface_type, flags )) pfd->dwFlags |= PFD_DRAW_TO_WINDOW;
+    if (flags && surface_type & EGL_WINDOW_BIT) pfd->dwFlags |= PFD_DRAW_TO_WINDOW;
     pfd->iPixelType = PFD_TYPE_RGBA;
     pfd->iLayerType = PFD_MAIN_PLANE;
 
@@ -908,16 +799,12 @@ static BOOL egldrv_context_create( int format, void *share, const int *attribs, 
     const struct opengl_funcs *funcs = &display_funcs;
     const struct egl_platform *egl = &display_egl;
     EGLint err, egl_attribs[16], *attribs_end = egl_attribs;
-    BOOL force_gles = winehua_wgl_force_gles(), client_version_set = FALSE;
-    EGLConfig config = force_gles ? egl_config_for_format( egl, format ) : EGL_NO_CONFIG_KHR;
-    EGLenum api = force_gles ? EGL_OPENGL_ES_API : EGL_OPENGL_API;
-    EGLint default_client_version = force_gles ? winehua_wgl_default_gles_client_version( funcs, egl, config ) : 0;
 
     TRACE( "format %d, share %p, attribs %p\n", format, share, attribs );
 
     for (; attribs && attribs[0] != 0; attribs += 2)
     {
-        EGLint name, value = attribs[1];
+        EGLint name;
 
         TRACE( "%#x %#x\n", attribs[0], attribs[1] );
 
@@ -927,16 +814,10 @@ static BOOL egldrv_context_create( int format, void *share, const int *attribs, 
         switch (attribs[0])
         {
         case WGL_CONTEXT_MAJOR_VERSION_ARB:
-            if (force_gles)
-            {
-                name = EGL_CONTEXT_CLIENT_VERSION;
-                value = attribs[1] >= 3 ? 3 : 2;
-                client_version_set = TRUE;
-            }
-            else name = EGL_CONTEXT_MAJOR_VERSION_KHR;
+            name = EGL_CONTEXT_MAJOR_VERSION_KHR;
             break;
         case WGL_CONTEXT_MINOR_VERSION_ARB:
-            name = force_gles ? EGL_NONE : EGL_CONTEXT_MINOR_VERSION_KHR;
+            name = EGL_CONTEXT_MINOR_VERSION_KHR;
             break;
         case WGL_CONTEXT_FLAGS_ARB:
             name = EGL_CONTEXT_FLAGS_KHR;
@@ -945,26 +826,12 @@ static BOOL egldrv_context_create( int format, void *share, const int *attribs, 
             name = EGL_CONTEXT_OPENGL_NO_ERROR_KHR;
             break;
         case WGL_CONTEXT_PROFILE_MASK_ARB:
-            if (force_gles)
-            {
-                if (attribs[1] & WGL_CONTEXT_ES2_PROFILE_BIT_EXT)
-                {
-                    name = EGL_CONTEXT_CLIENT_VERSION;
-                    value = 2;
-                    client_version_set = TRUE;
-                }
-                else
-                {
-                    winehua_opengl_diag( "ignoring desktop WGL profile mask %#x for GLES fallback", attribs[1] );
-                    name = EGL_NONE;
-                }
-            }
-            else if (attribs[1] & WGL_CONTEXT_ES2_PROFILE_BIT_EXT)
+            if (attribs[1] & WGL_CONTEXT_ES2_PROFILE_BIT_EXT)
             {
                 ERR( "OpenGL ES contexts are not supported\n" );
                 return FALSE;
             }
-            else name = EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR;
+            name = EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR;
             break;
         default:
             name = EGL_NONE;
@@ -980,16 +847,9 @@ static BOOL egldrv_context_create( int format, void *share, const int *attribs, 
              * attributes we support (we merge repetitions), plus EGL_NONE. */
             assert( dst - egl_attribs <= ARRAY_SIZE(egl_attribs) - 3 );
             dst[0] = name;
-            dst[1] = value;
+            dst[1] = attribs[1];
             if (dst == attribs_end) attribs_end += 2;
         }
-    }
-    if (force_gles && !client_version_set)
-    {
-        assert( attribs_end - egl_attribs <= ARRAY_SIZE(egl_attribs) - 3 );
-        attribs_end[0] = EGL_CONTEXT_CLIENT_VERSION;
-        attribs_end[1] = default_client_version;
-        attribs_end += 2;
     }
     *attribs_end = EGL_NONE;
 
@@ -1000,14 +860,11 @@ static BOOL egldrv_context_create( int format, void *share, const int *attribs, 
      *    > EGL_OPENGL_API and EGL_OPENGL_ES_API are interchangeable for all
      *    > purposes except eglCreateContext.
      */
-    if (!funcs->p_eglBindAPI( api ))
-        winehua_opengl_diag( "eglBindAPI(%#x) failed error=%#x", api, funcs->p_eglGetError() );
-    *context = funcs->p_eglCreateContext( egl->display, config, share, (attribs || force_gles) ? egl_attribs : NULL );
+    funcs->p_eglBindAPI( EGL_OPENGL_API );
+    *context = funcs->p_eglCreateContext( egl->display, EGL_NO_CONFIG_KHR, share, attribs ? egl_attribs : NULL );
 
     if ((err = funcs->p_eglGetError()) != EGL_SUCCESS || !*context)
     {
-        winehua_opengl_diag( "eglCreateContext failed force_gles=%u client=%d api=%#x format=%d config=%p error=%#x",
-                             force_gles, default_client_version, api, format, config, err );
         WARN( "Context creation failed (error %#x).\n", err );
         return FALSE;
     }
@@ -1064,42 +921,22 @@ static const struct opengl_driver_funcs egldrv_funcs =
 static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
 {
     struct opengl_funcs *funcs = &display_funcs;
-    const char *egl_path = getenv( "WINEHUA_EGL_LIBRARY_PATH" );
-    const char *egl_name = SONAME_LIBEGL;
     const char *extensions;
-    BOOL override_egl = egl_path && egl_path[0];
 
-    if (egl_path && egl_path[0]) winehua_preload_guest_egl_deps( egl_path );
-
-    if (!(funcs->egl_handle = dlopen( egl_name, RTLD_NOW | RTLD_GLOBAL )))
+    if (!(funcs->egl_handle = dlopen( SONAME_LIBEGL, RTLD_NOW | RTLD_GLOBAL )))
     {
-        const char *error = dlerror();
-
-        if (override_egl && strchr( egl_path, '/' ))
-        {
-            winehua_opengl_diag( "dlopen(%s) failed: %s; trying override path %s",
-                                 egl_name, error ? error : "(null)", egl_path );
-            egl_name = egl_path;
-            funcs->egl_handle = dlopen( egl_name, RTLD_NOW | RTLD_GLOBAL );
-        }
-    }
-    if (!funcs->egl_handle)
-    {
-        const char *error = dlerror();
-
-        winehua_opengl_diag( "dlopen(%s) failed: %s", egl_name, error ? error : "(null)" );
-        ERR( "Failed to load %s: %s\n", egl_name, error ? error : "(null)" );
+        winehua_opengl_diag( "dlopen(%s) failed: %s", SONAME_LIBEGL, dlerror() );
+        ERR( "Failed to load %s: %s\n", SONAME_LIBEGL, dlerror() );
         return FALSE;
     }
 
-    winehua_opengl_diag( "loaded %s handle=%p", egl_name, funcs->egl_handle );
+    winehua_opengl_diag( "loaded %s handle=%p", SONAME_LIBEGL, funcs->egl_handle );
 
-#define LOAD_FUNCPTR( name )                                                        \
-    if (!(funcs->p_##name = dlsym( funcs->egl_handle, #name )))                     \
-    {                                                                               \
-        winehua_opengl_diag( "missing EGL function %s", #name );                    \
-        ERR( "Failed to find EGL function %s\n", #name );                          \
-        goto failed;                                                                \
+#define LOAD_FUNCPTR( name )                                    \
+    if (!(funcs->p_##name = dlsym( funcs->egl_handle, #name ))) \
+    {                                                           \
+        ERR( "Failed to find EGL function %s\n", #name );       \
+        goto failed;                                            \
     }
     LOAD_FUNCPTR( eglGetProcAddress );
     LOAD_FUNCPTR( eglQueryString );
@@ -1107,56 +944,27 @@ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
 
     if (!(extensions = funcs->p_eglQueryString( EGL_NO_DISPLAY, EGL_EXTENSIONS )))
     {
-        winehua_opengl_diag( "eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS) returned null error=%#x",
-                             funcs->p_eglGetError ? funcs->p_eglGetError() : 0 );
         ERR( "Failed to find client extensions\n" );
         goto failed;
     }
     TRACE( "EGL client extensions:\n" );
     dump_extensions( extensions );
 
-    if (!has_extension( extensions, "EGL_KHR_client_get_all_proc_addresses" ) &&
-        !has_extension( extensions, "EGL_KHR_get_all_proc_addresses" ))
-    {
-        winehua_opengl_diag( "missing EGL_KHR_client_get_all_proc_addresses and EGL_KHR_get_all_proc_addresses" );
-        ERR( "Failed to find required extension %s (or fallback %s)\n",
-             "EGL_KHR_client_get_all_proc_addresses", "EGL_KHR_get_all_proc_addresses" );
-        goto failed;
+#define CHECK_EXTENSION( ext )                                  \
+    if (!has_extension( extensions, #ext ))                     \
+    {                                                           \
+        ERR( "Failed to find required extension %s\n", #ext );  \
+        goto failed;                                            \
     }
-    if (!has_extension( extensions, "EGL_KHR_client_get_all_proc_addresses" ) &&
-        has_extension( extensions, "EGL_KHR_get_all_proc_addresses" ))
-    {
-        winehua_opengl_diag( "accepting EGL_KHR_get_all_proc_addresses as fallback client extension" );
-    }
-    if (!has_extension( extensions, "EGL_EXT_platform_base" ))
-    {
-        void *platform_display = dlsym( funcs->egl_handle, "eglGetPlatformDisplay" );
+    CHECK_EXTENSION( EGL_KHR_client_get_all_proc_addresses );
+    CHECK_EXTENSION( EGL_EXT_platform_base );
+#undef CHECK_EXTENSION
 
-        if (!platform_display) platform_display = (void *)funcs->p_eglGetProcAddress( "eglGetPlatformDisplay" );
-
-        if (has_extension( extensions, "EGL_KHR_platform_base" ))
-        {
-            winehua_opengl_diag( "accepting EGL_KHR_platform_base as fallback platform extension" );
-        }
-        else if (platform_display)
-        {
-            winehua_opengl_diag( "accepting missing EGL_EXT_platform_base because eglGetPlatformDisplay is available" );
-        }
-        else
-        {
-            winehua_opengl_diag( "missing EGL_EXT_platform_base and eglGetPlatformDisplay" );
-            ERR( "Failed to find required extension %s\n", "EGL_EXT_platform_base" );
-            goto failed;
-        }
-    }
-
-#define USE_GL_FUNC( func )                                                                                  \
-    if (!funcs->p_##func && !(funcs->p_##func = (void *)dlsym( funcs->egl_handle, #func )) &&                \
-        !(funcs->p_##func = (void *)funcs->p_eglGetProcAddress( #func )))                                    \
-    {                                                                                                        \
-        winehua_opengl_diag( "missing EGL symbol %s", #func );                                               \
-        ERR( "Failed to load symbol %s\n", #func );                                                         \
-        goto failed;                                                                                         \
+#define USE_GL_FUNC( func )                                                                     \
+    if (!funcs->p_##func && !(funcs->p_##func = (void *)funcs->p_eglGetProcAddress( #func )))   \
+    {                                                                                           \
+        ERR( "Failed to load symbol %s\n", #func );                                             \
+        goto failed;                                                                            \
     }
     ALL_EGL_FUNCS
 #undef USE_GL_FUNC
@@ -1165,7 +973,7 @@ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
     return TRUE;
 
 failed:
-    winehua_opengl_diag( "egl_init failed after loading %s", egl_name );
+    winehua_opengl_diag( "egl_init failed after loading %s", SONAME_LIBEGL );
     dlclose( funcs->egl_handle );
     funcs->egl_handle = NULL;
     return FALSE;
@@ -1326,8 +1134,6 @@ static void init_device_info( struct egl_platform *egl, const struct opengl_func
     int i, count, values[3] = {0};
     const char *extensions, *str;
     EGLConfig config;
-    BOOL force_gles = winehua_wgl_force_gles();
-    EGLint gles_context_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
 
     TRACE( "Initializing device %u (%p)\n", egl->index, egl->device);
 
@@ -1353,55 +1159,44 @@ static void init_device_info( struct egl_platform *egl, const struct opengl_func
         funcs->p_eglQueryDeviceBinaryEXT( egl->device, EGL_DRIVER_UUID_EXT, sizeof(egl->driver_uuid), &egl->driver_uuid, &count );
     }
 
-    funcs->p_eglBindAPI( force_gles ? EGL_OPENGL_ES_API : EGL_OPENGL_API );
-    config = winehua_wgl_first_config_for_api( funcs, egl );
-    if (force_gles) gles_context_attribs[1] = winehua_wgl_default_gles_client_version( funcs, egl, config );
+    funcs->p_eglBindAPI( EGL_OPENGL_API );
+    funcs->p_eglGetConfigs( egl->display, &config, 1, &count );
+    if (!count) config = EGL_NO_CONFIG_KHR;
 
-    if (!(context = funcs->p_eglCreateContext( egl->display, config, EGL_NO_CONTEXT,
-                                               force_gles ? gles_context_attribs : NULL )))
+    if (!(context = funcs->p_eglCreateContext( egl->display, config, EGL_NO_CONTEXT, NULL )))
     {
-        winehua_opengl_diag( "device probe context failed force_gles=%u client=%d config=%p error=%#x",
-                             force_gles, gles_context_attribs[1], config, funcs->p_eglGetError() );
         WARN( "Unable to create a context, ignoring device\n" );
         funcs->p_eglTerminate( egl->display );
         list_remove( &egl->entry );
         free( egl );
         return;
     }
-    if (force_gles)
-    {
-        egl->core_version = 20;
-        egl->compat_version = 20;
-    }
-    else
-    {
-        funcs->p_eglDestroyContext( egl->display, context );
-        context = EGL_NO_CONTEXT;
+    funcs->p_eglDestroyContext( egl->display, context );
+    context = EGL_NO_CONTEXT;
 
-        for (i = 0; i < ARRAY_SIZE(versions) && (!egl->core_version || !egl->compat_version); i++)
+    for (i = 0; i < ARRAY_SIZE(versions) && (!egl->core_version || !egl->compat_version); i++)
+    {
+        int context_attribs[] =
         {
-            int context_attribs[] =
-            {
-               EGL_CONTEXT_MAJOR_VERSION, versions[i] / 10,
-               EGL_CONTEXT_MINOR_VERSION, versions[i] % 10,
-               EGL_CONTEXT_OPENGL_PROFILE_MASK, 0,
-               EGL_NONE,
-            };
+           EGL_CONTEXT_MAJOR_VERSION, versions[i] / 10,
+           EGL_CONTEXT_MINOR_VERSION, versions[i] % 10,
+           EGL_CONTEXT_OPENGL_PROFILE_MASK, 0,
+           EGL_NONE,
+        };
 
-            if (!egl->compat_version && versions[i] >= 30)
-            {
-                context_attribs[5] = EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT;
-                compat_context = funcs->p_eglCreateContext( egl->display, config, EGL_NO_CONTEXT, context_attribs );
-                if (compat_context) egl->compat_version = versions[i];
-                if (!context) context = compat_context;
-            }
-            if (!egl->core_version)
-            {
-                context_attribs[5] = EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT;
-                core_context = funcs->p_eglCreateContext( egl->display, config, EGL_NO_CONTEXT, context_attribs );
-                if (core_context) egl->core_version = versions[i];
-                if (!context) context = core_context;
-            }
+        if (!egl->compat_version && versions[i] >= 30)
+        {
+            context_attribs[5] = EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT;
+            compat_context = funcs->p_eglCreateContext( egl->display, config, EGL_NO_CONTEXT, context_attribs );
+            if (compat_context) egl->compat_version = versions[i];
+            if (!context) context = compat_context;
+        }
+        if (!egl->core_version)
+        {
+            context_attribs[5] = EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT;
+            core_context = funcs->p_eglCreateContext( egl->display, config, EGL_NO_CONTEXT, context_attribs );
+            if (core_context) egl->core_version = versions[i];
+            if (!context) context = core_context;
         }
     }
     TRACE( "  - core_version: %u\n", egl->core_version );
@@ -1451,7 +1246,6 @@ static void init_device_info( struct egl_platform *egl, const struct opengl_func
 
     if (compat_context) funcs->p_eglDestroyContext( egl->display, compat_context );
     if (core_context) funcs->p_eglDestroyContext( egl->display, core_context );
-    if (force_gles && context) funcs->p_eglDestroyContext( egl->display, context );
 
     if (egl != &display_egl) funcs->p_eglTerminate( egl->display );
 }
@@ -1918,11 +1712,7 @@ static BOOL win32u_wglSetPixelFormat( HDC hdc, int new_format, const PIXELFORMAT
 
         if ((old_format = get_window_pixel_format( hwnd ))) return old_format == new_format;
 
-        if (!(drawable = get_window_unused_drawable( hwnd, new_format )))
-        {
-            winehua_opengl_diag( "wglSetPixelFormat drawable creation failed hwnd=%p format=%d", hwnd, new_format );
-            return FALSE;
-        }
+        if (!(drawable = get_window_unused_drawable( hwnd, new_format ))) return FALSE;
         set_window_opengl_drawable( hwnd, drawable, TRUE );
         set_window_opengl_drawable( hwnd, drawable, FALSE );
         opengl_drawable_release( drawable );

@@ -254,12 +254,9 @@ BOOL wayland_process_init(void)
 {
     struct wl_display *wl_display_wrapper;
 
-
     process_wayland.wl_display = wl_display_connect(NULL);
     if (!process_wayland.wl_display)
-    {
         return FALSE;
-    }
 
     TRACE("wl_display=%p\n", process_wayland.wl_display);
 
@@ -342,5 +339,6 @@ BOOL wayland_process_init(void)
         ERR("Wayland compositor doesn't support xdg_toplevel_icon_manager_v1 (window icons will not be supported)\n");
 
     process_wayland.initialized = TRUE;
+
     return TRUE;
 }

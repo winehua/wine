@@ -30,7 +30,6 @@
 
 #include "waylanddrv.h"
 
-
 char *process_name = NULL;
 
 static const struct user_driver_funcs waylanddrv_funcs =
@@ -94,9 +93,7 @@ static NTSTATUS waylanddrv_unix_init(void *arg)
 
     wayland_init_process_name();
 
-    if (!wayland_process_init()) {
-        goto err;
-    }
+    if (!wayland_process_init()) goto err;
 
     return 0;
 

@@ -1700,7 +1700,6 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
     }
     else TRACE("(%p %s,%s,%p) - CALL\n", module, debugstr_w(wm->ldr.BaseDllName.Buffer),
                reason_names[reason], lpReserved );
-
     __TRY
     {
         retv = call_dll_entry_point( entry, module, reason, lpReserved );
@@ -3346,7 +3345,6 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
     NTSTATUS nts = STATUS_DLL_NOT_FOUND;
     BOOL redirected;
     void *prev;
-
     TRACE( "looking for %s in %s\n", debugstr_w(libname), debugstr_w(load_path) );
 
     if (system && system_dll_path.Buffer)
@@ -4558,9 +4556,7 @@ void loader_init( CONTEXT *context, void **entry )
 
         status = process_attach( node_ntdll, context );
         if (!status)
-        {
             status = process_attach( node_kernel32, context );
-        }
         if (status)
         {
             ERR( "Initializing system dll for %s failed, status %lx\n",

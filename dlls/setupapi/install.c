@@ -807,6 +807,7 @@ static BOOL install_section_callback( HINF hinf, PCWSTR field, void *arg )
 {
     struct install_section_callback_info *info = arg;
 
+    TRACE( "installing %s\n", debugstr_w(field) );
     SetupInstallFromInfSectionW( info->hwnd, hinf, field, SPINST_ALL, NULL, NULL, SP_COPY_NEWER,
                                  info->callback, info->callback_context, NULL, NULL );
     return TRUE;
@@ -1287,19 +1288,16 @@ void WINAPI InstallHinfSectionW( HWND hwnd, HINSTANCE handle, LPCWSTR cmdline, I
     if (hinf == INVALID_HANDLE_VALUE) return;
 
     SetupDiGetActualSectionToInstallW( hinf, section, section, ARRAY_SIZE(section), NULL, NULL );
+    TRACE( "using section %s\n", debugstr_w(section) );
 
     iterate_section_fields( hinf, section, L"Include", include_callback, NULL );
 
     info.callback_context = SetupInitDefaultQueueCallback( hwnd );
     install_section_callback( hinf, section, &info );
-
     iterate_section_fields( hinf, section, L"Needs", install_section_callback, &info );
-
     SetupTermDefaultQueueCallback( info.callback_context );
-
     lstrcatW( section, L".Services" );
     SetupInstallServicesFromInfSectionW( hinf, section, 0 );
-
     SetupCloseInfFile( hinf );
 
     /* FIXME: should check the mode and maybe reboot */
@@ -1498,16 +1496,12 @@ BOOL WINAPI SetupInstallServicesFromInfSectionW( HINF hinf, PCWSTR section, DWOR
     INT section_flags;
     BOOL ret = TRUE;
 
-
     if (!SetupFindFirstLineW( hinf, section, NULL, &context ))
     {
         SetLastError( ERROR_SECTION_NOT_FOUND );
         return FALSE;
     }
-    if (!(scm = OpenSCManagerW( NULL, NULL, SC_MANAGER_ALL_ACCESS )))
-    {
-        return FALSE;
-    }
+    if (!(scm = OpenSCManagerW( NULL, NULL, SC_MANAGER_ALL_ACCESS ))) return FALSE;
 
     if (SetupFindFirstLineW( hinf, section, L"AddService", &context ))
     {
