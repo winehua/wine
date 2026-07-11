@@ -25,12 +25,15 @@
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "ntstatus.h"
+#include "windef.h"
+#include "winbase.h"
 #include "winternl.h"
 
 #include "mmdeviceapi.h"
@@ -61,6 +64,8 @@ static const WCHAR capture_device_name[] =
 };
 static const char capture_device_id[] = "capture-default";
 #define MIX_FRAMES_ERROR (~0u)
+
+static ULONG_PTR zero_bits = 0;
 
 struct ohos_stream
 {
@@ -116,6 +121,28 @@ static NTSTATUS ohos_not_implemented(void *args)
 static struct ohos_stream *handle_get_stream(stream_handle handle)
 {
     return (struct ohos_stream *)(UINT_PTR)handle;
+}
+
+static BYTE *alloc_client_buffer(UINT32 frames, UINT32 bytes_per_frame)
+{
+    SIZE_T size = (SIZE_T)frames * bytes_per_frame;
+    BYTE *buffer = NULL;
+
+    if (!size) return NULL;
+    if (NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&buffer, zero_bits,
+                                &size, MEM_COMMIT, PAGE_READWRITE))
+        return NULL;
+    memset(buffer, 0, (SIZE_T)frames * bytes_per_frame);
+    return buffer;
+}
+
+static void free_client_buffer(BYTE **buffer)
+{
+    SIZE_T size = 0;
+
+    if (!*buffer) return;
+    NtFreeVirtualMemory(GetCurrentProcess(), (void **)buffer, &size, MEM_RELEASE);
+    *buffer = NULL;
 }
 
 static void fill_capture_local_buffer_locked(struct ohos_stream *stream);
@@ -907,8 +934,8 @@ static void destroy_stream(struct ohos_stream *stream)
         stream->client = NULL;
     }
 
-    free(stream->local_buffer);
-    free(stream->capture_wrap_buffer);
+    free_client_buffer(&stream->local_buffer);
+    free_client_buffer(&stream->capture_wrap_buffer);
     free(stream->mix_buffer);
     free(stream->fmt);
     pthread_mutex_destroy(&stream->lock);
@@ -1039,7 +1066,7 @@ static NTSTATUS ohos_create_stream(void *args)
         goto fail;
     }
 
-    stream->local_buffer = calloc(stream->client_buffer_frames, stream->client_bytes_per_frame);
+    stream->local_buffer = alloc_client_buffer(stream->client_buffer_frames, stream->client_bytes_per_frame);
     if (!stream->local_buffer)
     {
         params->result = E_OUTOFMEMORY;
@@ -1257,9 +1284,10 @@ static NTSTATUS ohos_get_capture_buffer(void *args)
         chunk_bytes = chunk_frames * stream->client_bytes_per_frame;
         if (stream->capture_wrap_buffer_frames < stream->client_period_frames)
         {
-            free(stream->capture_wrap_buffer);
+            free_client_buffer(&stream->capture_wrap_buffer);
+            stream->capture_wrap_buffer_frames = 0;
             stream->capture_wrap_buffer =
-                calloc(stream->client_period_frames, stream->client_bytes_per_frame);
+                alloc_client_buffer(stream->client_period_frames, stream->client_bytes_per_frame);
             if (!stream->capture_wrap_buffer)
                 return ohos_unlock_result(stream, &params->result, E_OUTOFMEMORY);
             stream->capture_wrap_buffer_frames = stream->client_period_frames;
@@ -1601,3 +1629,738 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
 };
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
+
+#ifdef _WIN64
+
+typedef UINT PTR32;
+
+struct notify_context32
+{
+    BOOL send_notify;
+    WORD dev_id;
+    WORD msg;
+    UINT param_1;
+    UINT param_2;
+    UINT callback;
+    UINT flags;
+    PTR32 device;
+    UINT instance;
+};
+
+static void notify_to_notify32(struct notify_context32 *notify32,
+                               const struct notify_context *notify)
+{
+    notify32->send_notify = notify->send_notify;
+    notify32->dev_id = notify->dev_id;
+    notify32->msg = notify->msg;
+    notify32->param_1 = notify->param_1;
+    notify32->param_2 = notify->param_2;
+    notify32->callback = notify->callback;
+    notify32->flags = notify->flags;
+    notify32->device = PtrToUlong(notify->device);
+    notify32->instance = notify->instance;
+}
+
+struct midi_open_desc32
+{
+    PTR32 hMidi;
+    UINT dwCallback;
+    UINT dwInstance;
+    UINT dnDevNode;
+    UINT cIds;
+    MIDIOPENSTRMID rgIds;
+};
+
+struct midi_hdr32
+{
+    PTR32 lpData;
+    UINT dwBufferLength;
+    UINT dwBytesRecorded;
+    UINT dwUser;
+    UINT dwFlags;
+    PTR32 lpNext;
+    UINT reserved;
+    UINT dwOffset;
+    UINT dwReserved[8];
+};
+
+static NTSTATUS ohos_wow64_process_attach(void *args)
+{
+    SYSTEM_BASIC_INFORMATION info;
+
+    NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL);
+    zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
+    return ohos_process_attach(args);
+}
+
+static NTSTATUS ohos_wow64_get_endpoint_ids(void *args)
+{
+    struct
+    {
+        EDataFlow flow;
+        PTR32 endpoints;
+        unsigned int size;
+        HRESULT result;
+        unsigned int num;
+        unsigned int default_idx;
+    } *params32 = args;
+    struct get_endpoint_ids_params params =
+    {
+        .flow = params32->flow,
+        .endpoints = ULongToPtr(params32->endpoints),
+        .size = params32->size
+    };
+
+    ohos_get_endpoint_ids(&params);
+    params32->size = params.size;
+    params32->result = params.result;
+    params32->num = params.num;
+    params32->default_idx = params.default_idx;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_create_stream(void *args)
+{
+    struct
+    {
+        PTR32 name;
+        PTR32 device;
+        EDataFlow flow;
+        AUDCLNT_SHAREMODE share;
+        DWORD flags;
+        REFERENCE_TIME duration;
+        REFERENCE_TIME period;
+        PTR32 fmt;
+        HRESULT result;
+        PTR32 channel_count;
+        PTR32 stream;
+    } *params32 = args;
+    struct create_stream_params params =
+    {
+        .name = ULongToPtr(params32->name),
+        .device = ULongToPtr(params32->device),
+        .flow = params32->flow,
+        .share = params32->share,
+        .flags = params32->flags,
+        .duration = params32->duration,
+        .period = params32->period,
+        .fmt = ULongToPtr(params32->fmt),
+        .channel_count = ULongToPtr(params32->channel_count),
+        .stream = ULongToPtr(params32->stream)
+    };
+
+    ohos_create_stream(&params);
+    params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_release_stream(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        HRESULT result;
+    } *params32 = args;
+    struct release_stream_params params =
+    {
+        .stream = params32->stream,
+    };
+
+    ohos_release_stream(&params);
+    params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_get_render_buffer(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        UINT32 frames;
+        HRESULT result;
+        PTR32 data;
+    } *params32 = args;
+    BYTE *data = NULL;
+    struct get_render_buffer_params params =
+    {
+        .stream = params32->stream,
+        .frames = params32->frames,
+        .data = &data
+    };
+
+    ohos_get_render_buffer(&params);
+    params32->result = params.result;
+    *(unsigned int *)ULongToPtr(params32->data) = PtrToUlong(data);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_get_capture_buffer(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        HRESULT result;
+        PTR32 data;
+        PTR32 frames;
+        PTR32 flags;
+        PTR32 devpos;
+        PTR32 qpcpos;
+    } *params32 = args;
+    BYTE *data = NULL;
+    struct get_capture_buffer_params params =
+    {
+        .stream = params32->stream,
+        .data = &data,
+        .frames = ULongToPtr(params32->frames),
+        .flags = ULongToPtr(params32->flags),
+        .devpos = ULongToPtr(params32->devpos),
+        .qpcpos = ULongToPtr(params32->qpcpos)
+    };
+
+    ohos_get_capture_buffer(&params);
+    params32->result = params.result;
+    *(unsigned int *)ULongToPtr(params32->data) = PtrToUlong(data);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_is_format_supported(void *args)
+{
+    struct
+    {
+        PTR32 device;
+        EDataFlow flow;
+        AUDCLNT_SHAREMODE share;
+        PTR32 fmt_in;
+        HRESULT result;
+    } *params32 = args;
+    struct is_format_supported_params params =
+    {
+        .device = ULongToPtr(params32->device),
+        .flow = params32->flow,
+        .share = params32->share,
+        .fmt_in = ULongToPtr(params32->fmt_in),
+    };
+
+    ohos_is_format_supported(&params);
+    params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_get_mix_format(void *args)
+{
+    struct
+    {
+        PTR32 device;
+        EDataFlow flow;
+        PTR32 fmt;
+        HRESULT result;
+    } *params32 = args;
+    struct get_mix_format_params params =
+    {
+        .device = ULongToPtr(params32->device),
+        .flow = params32->flow,
+        .fmt = ULongToPtr(params32->fmt),
+    };
+
+    ohos_get_mix_format(&params);
+    params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_get_device_period(void *args)
+{
+    struct
+    {
+        PTR32 device;
+        EDataFlow flow;
+        HRESULT result;
+        PTR32 def_period;
+        PTR32 min_period;
+    } *params32 = args;
+    struct get_device_period_params params =
+    {
+        .device = ULongToPtr(params32->device),
+        .flow = params32->flow,
+        .def_period = ULongToPtr(params32->def_period),
+        .min_period = ULongToPtr(params32->min_period),
+    };
+
+    ohos_get_device_period(&params);
+    params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_get_buffer_size(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        HRESULT result;
+        PTR32 frames;
+    } *params32 = args;
+    struct get_buffer_size_params params =
+    {
+        .stream = params32->stream,
+        .frames = ULongToPtr(params32->frames)
+    };
+
+    ohos_get_buffer_size(&params);
+    params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_get_latency(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        HRESULT result;
+        PTR32 latency;
+    } *params32 = args;
+    struct get_latency_params params =
+    {
+        .stream = params32->stream,
+        .latency = ULongToPtr(params32->latency)
+    };
+
+    ohos_get_latency(&params);
+    params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_get_current_padding(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        HRESULT result;
+        PTR32 padding;
+    } *params32 = args;
+    struct get_current_padding_params params =
+    {
+        .stream = params32->stream,
+        .padding = ULongToPtr(params32->padding)
+    };
+
+    ohos_get_current_padding(&params);
+    params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_get_next_packet_size(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        HRESULT result;
+        PTR32 frames;
+    } *params32 = args;
+    struct get_next_packet_size_params params =
+    {
+        .stream = params32->stream,
+        .frames = ULongToPtr(params32->frames)
+    };
+
+    ohos_get_next_packet_size(&params);
+    params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_get_frequency(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        HRESULT result;
+        PTR32 freq;
+    } *params32 = args;
+    struct get_frequency_params params =
+    {
+        .stream = params32->stream,
+        .freq = ULongToPtr(params32->freq)
+    };
+
+    ohos_get_frequency(&params);
+    params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_get_position(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        BOOL device;
+        HRESULT result;
+        PTR32 pos;
+        PTR32 qpctime;
+    } *params32 = args;
+    struct get_position_params params =
+    {
+        .stream = params32->stream,
+        .device = params32->device,
+        .pos = ULongToPtr(params32->pos),
+        .qpctime = ULongToPtr(params32->qpctime)
+    };
+
+    ohos_get_position(&params);
+    params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_set_volumes(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        float master_volume;
+        PTR32 volumes;
+        PTR32 session_volumes;
+    } *params32 = args;
+    struct set_volumes_params params =
+    {
+        .stream = params32->stream,
+        .master_volume = params32->master_volume,
+        .volumes = ULongToPtr(params32->volumes),
+        .session_volumes = ULongToPtr(params32->session_volumes),
+    };
+
+    return ohos_set_volumes(&params);
+}
+
+static NTSTATUS ohos_wow64_set_event_handle(void *args)
+{
+    struct
+    {
+        stream_handle stream;
+        PTR32 event;
+        HRESULT result;
+    } *params32 = args;
+    struct set_event_handle_params params =
+    {
+        .stream = params32->stream,
+        .event = ULongToHandle(params32->event)
+    };
+
+    ohos_set_event_handle(&params);
+    params32->result = params.result;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_test_connect(void *args)
+{
+    struct
+    {
+        PTR32 name;
+        enum driver_priority priority;
+    } *params32 = args;
+    struct test_connect_params params =
+    {
+        .name = ULongToPtr(params32->name),
+    };
+
+    ohos_test_connect(&params);
+    params32->priority = params.priority;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_get_prop_value(void *args)
+{
+    struct propvariant32
+    {
+        WORD vt;
+        WORD pad1, pad2, pad3;
+        union
+        {
+            ULONG ulVal;
+            PTR32 ptr;
+            ULARGE_INTEGER uhVal;
+        };
+    } *value32;
+    struct
+    {
+        PTR32 device;
+        EDataFlow flow;
+        PTR32 guid;
+        PTR32 prop;
+        HRESULT result;
+        PTR32 value;
+        PTR32 buffer;
+        PTR32 buffer_size;
+    } *params32 = args;
+    PROPVARIANT value;
+    struct get_prop_value_params params =
+    {
+        .device = ULongToPtr(params32->device),
+        .flow = params32->flow,
+        .guid = ULongToPtr(params32->guid),
+        .prop = ULongToPtr(params32->prop),
+        .value = &value,
+        .buffer = ULongToPtr(params32->buffer),
+        .buffer_size = ULongToPtr(params32->buffer_size)
+    };
+
+    ohos_get_prop_value(&params);
+    params32->result = params.result;
+    if (SUCCEEDED(params.result))
+    {
+        value32 = ULongToPtr(params32->value);
+        value32->vt = value.vt;
+        switch (value.vt)
+        {
+        case VT_UI4:
+            value32->ulVal = value.ulVal;
+            break;
+        case VT_LPWSTR:
+            value32->ptr = params32->buffer;
+            break;
+        default:
+            FIXME("Unhandled vt %04x\n", value.vt);
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
+static UINT wow64_midi_out_prepare(WORD dev_id, struct midi_hdr32 *hdr, UINT hdr_size)
+{
+    if (hdr_size < offsetof(struct midi_hdr32, dwOffset) || !hdr || !hdr->lpData)
+        return MMSYSERR_INVALPARAM;
+    if (hdr->dwFlags & MHDR_PREPARED) return MMSYSERR_NOERROR;
+
+    hdr->lpNext = 0;
+    hdr->dwFlags |= MHDR_PREPARED;
+    hdr->dwFlags &= ~(MHDR_DONE | MHDR_INQUEUE);
+    return MMSYSERR_NOERROR;
+}
+
+static UINT wow64_midi_out_unprepare(WORD dev_id, struct midi_hdr32 *hdr, UINT hdr_size)
+{
+    if (hdr_size < offsetof(struct midi_hdr32, dwOffset) || !hdr || !hdr->lpData)
+        return MMSYSERR_INVALPARAM;
+    if (!(hdr->dwFlags & MHDR_PREPARED)) return MMSYSERR_NOERROR;
+    if (hdr->dwFlags & MHDR_INQUEUE) return MIDIERR_STILLPLAYING;
+
+    hdr->dwFlags &= ~MHDR_PREPARED;
+    return MMSYSERR_NOERROR;
+}
+
+static NTSTATUS ohos_wow64_midi_init(void *args)
+{
+    struct
+    {
+        PTR32 err;
+    } *params32 = args;
+    struct midi_init_params params =
+    {
+        .err = ULongToPtr(params32->err),
+    };
+
+    return ohos_midi_init(&params);
+}
+
+static NTSTATUS ohos_wow64_midi_out_message(void *args)
+{
+    struct
+    {
+        UINT dev_id;
+        UINT msg;
+        UINT user;
+        UINT param_1;
+        UINT param_2;
+        PTR32 err;
+        PTR32 notify;
+    } *params32 = args;
+    struct notify_context32 *notify32 = ULongToPtr(params32->notify);
+    struct midi_open_desc32 *desc32;
+    struct midi_hdr32 *hdr32;
+    struct notify_context notify;
+    MIDIOPENDESC open_desc;
+    MIDIHDR hdr;
+    struct midi_out_message_params params =
+    {
+        .dev_id = params32->dev_id,
+        .msg = params32->msg,
+        .user = params32->user,
+        .param_1 = params32->param_1,
+        .param_2 = params32->param_2,
+        .err = ULongToPtr(params32->err),
+        .notify = &notify
+    };
+
+    notify.send_notify = FALSE;
+    if (notify32) notify32->send_notify = FALSE;
+
+    switch (params32->msg)
+    {
+    case MODM_OPEN:
+        desc32 = ULongToPtr(params32->param_1);
+        open_desc.hMidi = ULongToPtr(desc32->hMidi);
+        open_desc.dwCallback = desc32->dwCallback;
+        open_desc.dwInstance = desc32->dwInstance;
+        open_desc.dnDevNode = desc32->dnDevNode;
+        open_desc.cIds = desc32->cIds;
+        open_desc.rgIds.dwStreamID = desc32->rgIds.dwStreamID;
+        open_desc.rgIds.wDeviceID = desc32->rgIds.wDeviceID;
+        params.param_1 = (UINT_PTR)&open_desc;
+        break;
+    case MODM_LONGDATA:
+        hdr32 = ULongToPtr(params32->param_1);
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.lpData = ULongToPtr(hdr32->lpData);
+        hdr.dwBufferLength = hdr32->dwBufferLength;
+        hdr.dwBytesRecorded = hdr32->dwBytesRecorded;
+        hdr.dwUser = hdr32->dwUser;
+        hdr.dwFlags = hdr32->dwFlags;
+        hdr.dwOffset = hdr32->dwOffset;
+        params.param_1 = (UINT_PTR)&hdr;
+        params.param_2 = sizeof(hdr);
+        break;
+    case MODM_PREPARE:
+        hdr32 = ULongToPtr(params32->param_1);
+        *params.err = wow64_midi_out_prepare(params32->dev_id, hdr32, params32->param_2);
+        return STATUS_SUCCESS;
+    case MODM_UNPREPARE:
+        hdr32 = ULongToPtr(params32->param_1);
+        *params.err = wow64_midi_out_unprepare(params32->dev_id, hdr32, params32->param_2);
+        return STATUS_SUCCESS;
+    }
+
+    ohos_midi_out_message(&params);
+
+    if (params32->msg == MODM_LONGDATA)
+    {
+        hdr32 = ULongToPtr(params32->param_1);
+        hdr32->dwBytesRecorded = hdr.dwBytesRecorded;
+        hdr32->dwFlags = hdr.dwFlags;
+    }
+
+    if (notify32 && notify.send_notify)
+    {
+        notify_to_notify32(notify32, &notify);
+        if (notify.msg == MOM_DONE) notify32->param_1 = params32->param_1;
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_midi_in_message(void *args)
+{
+    struct
+    {
+        UINT dev_id;
+        UINT msg;
+        UINT user;
+        UINT param_1;
+        UINT param_2;
+        PTR32 err;
+        PTR32 notify;
+    } *params32 = args;
+    struct notify_context32 *notify32 = ULongToPtr(params32->notify);
+    struct notify_context notify;
+    struct midi_in_message_params params =
+    {
+        .dev_id = params32->dev_id,
+        .msg = params32->msg,
+        .user = params32->user,
+        .param_1 = params32->param_1,
+        .param_2 = params32->param_2,
+        .err = ULongToPtr(params32->err),
+        .notify = &notify
+    };
+
+    notify.send_notify = FALSE;
+    if (notify32) notify32->send_notify = FALSE;
+    ohos_midi_in_message(&params);
+    if (notify32 && notify.send_notify) notify_to_notify32(notify32, &notify);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_midi_notify_wait(void *args)
+{
+    struct
+    {
+        PTR32 quit;
+        PTR32 notify;
+    } *params32 = args;
+    struct notify_context32 *notify32 = ULongToPtr(params32->notify);
+    struct notify_context notify;
+    struct midi_notify_wait_params params =
+    {
+        .quit = ULongToPtr(params32->quit),
+        .notify = &notify
+    };
+
+    notify.send_notify = FALSE;
+    if (notify32) notify32->send_notify = FALSE;
+    ohos_midi_notify_wait(&params);
+    if (notify32 && notify.send_notify) notify_to_notify32(notify32, &notify);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ohos_wow64_aux_message(void *args)
+{
+    struct
+    {
+        UINT dev_id;
+        UINT msg;
+        UINT user;
+        UINT param_1;
+        UINT param_2;
+        PTR32 err;
+    } *params32 = args;
+    struct aux_message_params params =
+    {
+        .dev_id = params32->dev_id,
+        .msg = params32->msg,
+        .user = params32->user,
+        .param_1 = params32->param_1,
+        .param_2 = params32->param_2,
+        .err = ULongToPtr(params32->err),
+    };
+
+    return ohos_aux_message(&params);
+}
+
+const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+{
+    ohos_wow64_process_attach,
+    ohos_process_detach,
+    ohos_not_implemented,
+    ohos_not_implemented,
+    ohos_wow64_get_endpoint_ids,
+    ohos_wow64_create_stream,
+    ohos_wow64_release_stream,
+    ohos_start,
+    ohos_stop,
+    ohos_reset,
+    ohos_wow64_get_render_buffer,
+    ohos_release_render_buffer,
+    ohos_wow64_get_capture_buffer,
+    ohos_release_capture_buffer,
+    ohos_wow64_is_format_supported,
+    ohos_not_implemented,
+    ohos_wow64_get_mix_format,
+    ohos_wow64_get_device_period,
+    ohos_wow64_get_buffer_size,
+    ohos_wow64_get_latency,
+    ohos_wow64_get_current_padding,
+    ohos_wow64_get_next_packet_size,
+    ohos_wow64_get_frequency,
+    ohos_wow64_get_position,
+    ohos_wow64_set_volumes,
+    ohos_wow64_set_event_handle,
+    ohos_not_implemented,
+    ohos_wow64_test_connect,
+    ohos_is_started,
+    ohos_wow64_get_prop_value,
+    ohos_midi_get_driver,
+    ohos_wow64_midi_init,
+    ohos_midi_release,
+    ohos_wow64_midi_out_message,
+    ohos_wow64_midi_in_message,
+    ohos_wow64_midi_notify_wait,
+    ohos_wow64_aux_message,
+};
+
+C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
+
+#endif /* _WIN64 */

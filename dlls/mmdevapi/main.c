@@ -207,15 +207,17 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
             if (drvs.module_unixlib)
             {
                 wine_unix_call( process_detach, NULL );
-                if (midi_driver.module != drvs.module) MIDI_CALL( process_detach, NULL );
+                if (midi_driver.module_unixlib && midi_driver.module != drvs.module)
+                    MIDI_CALL( process_detach, NULL );
             }
             if (lpvReserved) break;
 
-            wine_unix_call( main_loop_stop, NULL );
             if (drvs.module_unixlib)
             {
+                wine_unix_call( main_loop_stop, NULL );
                 __wine_unload_unix_lib( drvs.module );
-                if (midi_driver.module != drvs.module) __wine_unload_unix_lib( midi_driver.module );
+                if (midi_driver.module_unixlib && midi_driver.module != drvs.module)
+                    __wine_unload_unix_lib( midi_driver.module );
             }
             MMDevEnum_Free();
             break;
