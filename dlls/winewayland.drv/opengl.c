@@ -30,6 +30,9 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "ntstatus.h"
 #include "waylanddrv.h"
@@ -165,6 +168,142 @@ static void winehua_wayland_diag(const char *fmt, ...)
     fflush(stderr);
 }
 
+enum winehua_gl_stage
+{
+    WINEHUA_GL_IDLE,
+    WINEHUA_GL_SWAP_ENTER,
+    WINEHUA_GL_FLUSH,
+    WINEHUA_GL_READBACK,
+    WINEHUA_GL_CPU_COPY,
+    WINEHUA_GL_SHM_COMMIT,
+};
+
+static pthread_once_t winehua_gl_diag_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t winehua_gl_diag_mutex = PTHREAD_MUTEX_INITIALIZER;
+static enum winehua_gl_stage winehua_gl_current_stage;
+static uint64_t winehua_gl_stage_started_ms;
+static uint64_t winehua_gl_last_stall_report_ms;
+static uint64_t winehua_gl_last_slow_report_ms;
+static unsigned long winehua_gl_thread;
+static HWND winehua_gl_hwnd;
+static unsigned long winehua_gl_commits;
+static unsigned long winehua_gl_releases;
+static unsigned long winehua_gl_drops;
+static LONG winehua_gl_in_flight;
+
+static uint64_t winehua_gl_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static const char *winehua_gl_stage_name(enum winehua_gl_stage stage)
+{
+    switch (stage)
+    {
+    case WINEHUA_GL_SWAP_ENTER: return "swap-enter";
+    case WINEHUA_GL_FLUSH: return "glFlush";
+    case WINEHUA_GL_READBACK: return "glReadPixels";
+    case WINEHUA_GL_CPU_COPY: return "cpu-copy";
+    case WINEHUA_GL_SHM_COMMIT: return "shm-commit";
+    default: return "idle";
+    }
+}
+
+static void *winehua_gl_watchdog(void *unused)
+{
+    for (;;)
+    {
+        enum winehua_gl_stage stage;
+        uint64_t now, started;
+        unsigned long thread, commits, releases, drops;
+        LONG in_flight;
+        HWND hwnd;
+
+        usleep(250000);
+        now = winehua_gl_now_ms();
+        pthread_mutex_lock(&winehua_gl_diag_mutex);
+        stage = winehua_gl_current_stage;
+        started = winehua_gl_stage_started_ms;
+        thread = winehua_gl_thread;
+        hwnd = winehua_gl_hwnd;
+        commits = winehua_gl_commits;
+        releases = winehua_gl_releases;
+        drops = winehua_gl_drops;
+        in_flight = winehua_gl_in_flight;
+        if (stage != WINEHUA_GL_IDLE && now - started >= 1000 &&
+            now - winehua_gl_last_stall_report_ms >= 1000)
+            winehua_gl_last_stall_report_ms = now;
+        else
+            stage = WINEHUA_GL_IDLE;
+        pthread_mutex_unlock(&winehua_gl_diag_mutex);
+
+        if (stage != WINEHUA_GL_IDLE)
+        {
+            fprintf(stderr,
+                    "winehua_gl_stall: stage=%s age_ms=%llu thread=%lu hwnd=%p in_flight=%ld commits=%lu releases=%lu drops=%lu\n",
+                    winehua_gl_stage_name(stage), (unsigned long long)(now - started),
+                    thread, hwnd, in_flight, commits, releases, drops);
+            fflush(stderr);
+        }
+    }
+    return NULL;
+}
+
+static void winehua_gl_diag_init(void)
+{
+    pthread_t thread;
+    if (!winehua_env_enabled("WINEHUA_GL_STALL_DIAG")) return;
+    if (!pthread_create(&thread, NULL, winehua_gl_watchdog, NULL)) pthread_detach(thread);
+}
+
+static uint64_t winehua_gl_stage_begin(enum winehua_gl_stage stage, HWND hwnd, LONG in_flight)
+{
+    uint64_t now;
+    if (!winehua_env_enabled("WINEHUA_GL_STALL_DIAG")) return 0;
+    pthread_once(&winehua_gl_diag_once, winehua_gl_diag_init);
+    now = winehua_gl_now_ms();
+    pthread_mutex_lock(&winehua_gl_diag_mutex);
+    winehua_gl_current_stage = stage;
+    winehua_gl_stage_started_ms = now;
+    winehua_gl_thread = (unsigned long)pthread_self();
+    winehua_gl_hwnd = hwnd;
+    winehua_gl_in_flight = in_flight;
+    pthread_mutex_unlock(&winehua_gl_diag_mutex);
+    return now;
+}
+
+static void winehua_gl_stage_end(enum winehua_gl_stage stage, uint64_t started)
+{
+    uint64_t now;
+    BOOL report = FALSE;
+    if (!started) return;
+    now = winehua_gl_now_ms();
+    pthread_mutex_lock(&winehua_gl_diag_mutex);
+    if (winehua_gl_current_stage == stage) winehua_gl_current_stage = WINEHUA_GL_IDLE;
+    if (now - started >= 50 && now - winehua_gl_last_slow_report_ms >= 1000)
+    {
+        winehua_gl_last_slow_report_ms = now;
+        report = TRUE;
+    }
+    pthread_mutex_unlock(&winehua_gl_diag_mutex);
+    if (report)
+    {
+        fprintf(stderr, "winehua_gl_slow: stage=%s duration_ms=%llu\n",
+                winehua_gl_stage_name(stage), (unsigned long long)(now - started));
+        fflush(stderr);
+    }
+}
+
+static void winehua_gl_diag_idle(void)
+{
+    if (!winehua_env_enabled("WINEHUA_GL_STALL_DIAG")) return;
+    pthread_mutex_lock(&winehua_gl_diag_mutex);
+    winehua_gl_current_stage = WINEHUA_GL_IDLE;
+    pthread_mutex_unlock(&winehua_gl_diag_mutex);
+}
+
 static void wayland_drawable_flush(struct opengl_drawable *base, UINT flags)
 {
     struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
@@ -231,10 +370,18 @@ static void winehua_readback_drawable_flush(struct opengl_drawable *base, UINT f
 static void winehua_readback_buffer_release(void *data, struct wl_buffer *buffer)
 {
     struct winehua_readback_submission *submission = data;
+    LONG in_flight;
 
     submission->buffer->busy = FALSE;
     wayland_shm_buffer_unref(submission->buffer);
-    InterlockedDecrement(&submission->state->in_flight);
+    in_flight = InterlockedDecrement(&submission->state->in_flight);
+    if (winehua_env_enabled("WINEHUA_GL_STALL_DIAG"))
+    {
+        pthread_mutex_lock(&winehua_gl_diag_mutex);
+        winehua_gl_releases++;
+        winehua_gl_in_flight = in_flight;
+        pthread_mutex_unlock(&winehua_gl_diag_mutex);
+    }
     winehua_readback_state_unref(submission->state);
     free(submission);
 }
@@ -253,6 +400,7 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     BYTE *rgba = NULL, *src, *dst;
     RECT rect = {0};
     BOOL slot_acquired = FALSE, submitted = FALSE, ret = FALSE;
+    uint64_t stage_started;
     GLint pack_alignment, pack_buffer, pack_row_length, pack_skip_pixels, pack_skip_rows;
     GLint read_fbo;
     int x, y;
@@ -264,6 +412,8 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     NtUserGetClientRect(base->client->hwnd, &rect, NtUserGetDpiForWindow(base->client->hwnd));
     gl->width = max(1, rect.right - rect.left);
     gl->height = max(1, rect.bottom - rect.top);
+    stage_started = winehua_gl_stage_begin(WINEHUA_GL_SWAP_ENTER, base->client->hwnd,
+                                           gl->state->in_flight);
 
     if (!(rgba = malloc(gl->width * gl->height * 4)))
     {
@@ -296,8 +446,15 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
 
     /* Virpipe submits queued guest commands on flush. Ensure the host has
      * completed this frame before the synchronous readback starts. */
+    winehua_gl_stage_end(WINEHUA_GL_SWAP_ENTER, stage_started);
+    stage_started = winehua_gl_stage_begin(WINEHUA_GL_FLUSH, base->client->hwnd,
+                                           gl->state->in_flight);
     funcs->p_glFlush();
+    winehua_gl_stage_end(WINEHUA_GL_FLUSH, stage_started);
+    stage_started = winehua_gl_stage_begin(WINEHUA_GL_READBACK, base->client->hwnd,
+                                           gl->state->in_flight);
     funcs->p_glReadPixels(0, 0, gl->width, gl->height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    winehua_gl_stage_end(WINEHUA_GL_READBACK, stage_started);
 
     if (read_fbo) funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
     if (pack_skip_rows) funcs->p_glPixelStorei(GL_PACK_SKIP_ROWS, pack_skip_rows);
@@ -312,6 +469,13 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     if (InterlockedIncrement(&gl->state->in_flight) > WINEHUA_READBACK_MAX_IN_FLIGHT)
     {
         InterlockedDecrement(&gl->state->in_flight);
+        if (winehua_env_enabled("WINEHUA_GL_STALL_DIAG"))
+        {
+            pthread_mutex_lock(&winehua_gl_diag_mutex);
+            winehua_gl_drops++;
+            winehua_gl_in_flight = gl->state->in_flight;
+            pthread_mutex_unlock(&winehua_gl_diag_mutex);
+        }
         ret = TRUE;
         goto done;
     }
@@ -326,6 +490,8 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
 
     /* OpenGL readback starts at the lower-left; Wayland SHM starts at the
      * upper-left. Wayland ARGB8888 is BGRA in little-endian memory. */
+    stage_started = winehua_gl_stage_begin(WINEHUA_GL_CPU_COPY, base->client->hwnd,
+                                           gl->state->in_flight);
     for (y = 0; y < gl->height; ++y)
     {
         src = rgba + (gl->height - 1 - y) * gl->width * 4;
@@ -338,6 +504,7 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
             dst[x * 4 + 3] = src[x * 4 + 3];
         }
     }
+    winehua_gl_stage_end(WINEHUA_GL_CPU_COPY, stage_started);
 
     submission->state = gl->state;
     submission->buffer = buffer;
@@ -352,14 +519,25 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     buffer->busy = TRUE;
     wayland_shm_buffer_ref(buffer);
     winehua_readback_state_ref(gl->state);
+    stage_started = winehua_gl_stage_begin(WINEHUA_GL_SHM_COMMIT, base->client->hwnd,
+                                           gl->state->in_flight);
     wl_surface_attach(client->wl_surface, buffer->wl_buffer, 0, 0);
     wl_surface_damage_buffer(client->wl_surface, 0, 0, gl->width, gl->height);
     if (client->wp_viewport) wp_viewport_set_destination(client->wp_viewport, gl->width, gl->height);
     wl_surface_commit(client->wl_surface);
     wl_display_flush(process_wayland.wl_display);
+    winehua_gl_stage_end(WINEHUA_GL_SHM_COMMIT, stage_started);
+    if (winehua_env_enabled("WINEHUA_GL_STALL_DIAG"))
+    {
+        pthread_mutex_lock(&winehua_gl_diag_mutex);
+        winehua_gl_commits++;
+        winehua_gl_in_flight = gl->state->in_flight;
+        pthread_mutex_unlock(&winehua_gl_diag_mutex);
+    }
     submitted = ret = TRUE;
 
 done:
+    winehua_gl_diag_idle();
     free(rgba);
     if (buffer) wayland_shm_buffer_unref(buffer);
     if (!submitted)
