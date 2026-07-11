@@ -506,43 +506,6 @@ static int send_spawn_request( int broker_fd, const char *entryParams,
 /***********************************************************************
  *           spawn_process
  */
-#ifdef PAD_MODE
-static const char * const broker_inherited_env[] =
-{
-    "BOX64_EMULATED_LIBS",
-    "BOX64_LD_LIBRARY_PATH",
-    "EGL_DRIVERS_PATH",
-    "EGL_PLATFORM",
-    "GALLIUM_DRIVER",
-    "LIBGL_ALWAYS_SOFTWARE",
-    "LIBGL_DRIVERS_PATH",
-    "MESA_LOADER_DRIVER_OVERRIDE",
-    "VTEST_SOCKET_NAME",
-    "WINEHUA_FRAME_TRANSPORT",
-    "WINEHUA_FRAME_ZERO_COPY",
-    "WINEHUA_GRAPHICS_ACTIVE",
-    "WINEHUA_GRAPHICS_BACKEND",
-    "WINEHUA_GRAPHICS_NOTE",
-    "WINEHUA_EGL_LIBRARY_PATH",
-    "WINEHUA_GUEST_GFX_DIR",
-    "WINEHUA_GUEST_GFX_MODE",
-    "WINEHUA_GUEST_GFX_READY",
-    "WINEHUA_SHM_FALLBACK",
-    "WINEHUA_VIRGL_LIBRARY_READY",
-    "WINEHUA_VIRGL_READY",
-    "WINEHUA_VIRGL_SOCKET",
-    "WINEHUA_VIRGL_SOCKET_READY",
-    "WINEHUA_VIRGLRENDERER_LIB",
-    "WINEHUA_WGL_FORCE_GLES",
-    "__EGL_VENDOR_LIBRARY_DIRS",
-};
-
-static int broker_env_value_safe( const char *value )
-{
-    return value && !strchr( value, '|' ) && !strchr( value, '\n' );
-}
-#endif
-
 static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int socketfd,
                                int unixdir, char *winedebug, const struct pe_image_info *pe_info )
 {
@@ -594,12 +557,6 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
         if (!getenv("USE_LIBBOX64"))
             len += 5; /* + "|wine" */
         for (i = 0; argv[i]; i++) len += strlen(argv[i]) + 1;
-        for (i = 0; i < ARRAY_SIZE(broker_inherited_env); i++)
-        {
-            const char *value = getenv( broker_inherited_env[i] );
-            if (broker_env_value_safe( value ))
-                len += strlen( broker_inherited_env[i] ) + strlen( value ) + 8; /* |__env= + = */
-        }
         entryParams = malloc(len + 1);
         if (entryParams)
         {
@@ -610,13 +567,6 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
                 p += snprintf(p, len + 1, "%s|wine", binDir);
             for (i = 0; argv[i]; i++)
                 p += snprintf(p, len + 1 - (p - entryParams), "|%s", argv[i]);
-            for (i = 0; i < ARRAY_SIZE(broker_inherited_env); i++)
-            {
-                const char *value = getenv( broker_inherited_env[i] );
-                if (broker_env_value_safe( value ))
-                    p += snprintf(p, len + 1 - (p - entryParams), "|__env=%s=%s",
-                                  broker_inherited_env[i], value);
-            }
         }
 
         /* 收集要传给子进程的命名 fd (目前仅 wineserver 通信 socket) */
