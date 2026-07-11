@@ -67,6 +67,39 @@ static void winehua_opengl_diag( const char *fmt, ... )
     fflush( stderr );
 }
 
+static void winehua_preload_guest_egl_deps( const char *egl_path )
+{
+    static const char *deps[] =
+    {
+        "libffi.so.8",
+        "libdrm.so.2",
+        "libwayland-client.so.0",
+        "libwayland-server.so.0",
+        "libwayland-egl.so.1",
+        "libgallium-25.0.1.so",
+        "libGLESv2.so.2",
+        "libGLESv1_CM.so.1",
+    };
+    const char *slash;
+    char dir[4096], path[4096];
+    size_t len;
+    unsigned int i;
+
+    if (!egl_path || !(slash = strrchr( egl_path, '/' ))) return;
+    len = slash - egl_path;
+    if (!len || len >= sizeof(dir)) return;
+    memcpy( dir, egl_path, len );
+    dir[len] = 0;
+
+    for (i = 0; i < ARRAY_SIZE(deps); i++)
+    {
+        if (snprintf( path, sizeof(path), "%s/%s", dir, deps[i] ) >= sizeof(path)) continue;
+        if (access( path, R_OK )) continue;
+        if (!dlopen( path, RTLD_NOW | RTLD_GLOBAL ))
+            winehua_opengl_diag( "preload %s failed: %s", path, dlerror() );
+    }
+}
+
 struct pbuffer
 {
     struct opengl_drawable *drawable;
@@ -921,16 +954,25 @@ static const struct opengl_driver_funcs egldrv_funcs =
 static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
 {
     struct opengl_funcs *funcs = &display_funcs;
+    const char *egl_path = getenv( "WINEHUA_EGL_LIBRARY_PATH" );
+    const char *egl_name = SONAME_LIBEGL;
     const char *extensions;
 
-    if (!(funcs->egl_handle = dlopen( SONAME_LIBEGL, RTLD_NOW | RTLD_GLOBAL )))
+    if (egl_path && egl_path[0])
     {
-        winehua_opengl_diag( "dlopen(%s) failed: %s", SONAME_LIBEGL, dlerror() );
-        ERR( "Failed to load %s: %s\n", SONAME_LIBEGL, dlerror() );
+        winehua_preload_guest_egl_deps( egl_path );
+        egl_name = egl_path;
+    }
+
+    if (!(funcs->egl_handle = dlopen( egl_name, RTLD_NOW | RTLD_GLOBAL )))
+    {
+        const char *error = dlerror();
+        winehua_opengl_diag( "dlopen(%s) failed: %s", egl_name, error ? error : "(null)" );
+        ERR( "Failed to load %s: %s\n", egl_name, error ? error : "(null)" );
         return FALSE;
     }
 
-    winehua_opengl_diag( "loaded %s handle=%p", SONAME_LIBEGL, funcs->egl_handle );
+    winehua_opengl_diag( "loaded %s handle=%p", egl_name, funcs->egl_handle );
 
 #define LOAD_FUNCPTR( name )                                    \
     if (!(funcs->p_##name = dlsym( funcs->egl_handle, #name ))) \
@@ -973,7 +1015,7 @@ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
     return TRUE;
 
 failed:
-    winehua_opengl_diag( "egl_init failed after loading %s", SONAME_LIBEGL );
+    winehua_opengl_diag( "egl_init failed after loading %s", egl_name );
     dlclose( funcs->egl_handle );
     funcs->egl_handle = NULL;
     return FALSE;

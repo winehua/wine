@@ -952,7 +952,7 @@ static const WCHAR *get_default_desktop( void *buf, size_t buf_size )
         }
     }
 
-#ifdef PAD_MODE
+#ifdef __OHOS__
     if ((desktop_env = getenv( "WINEHUA_DESKTOP" )) && *desktop_env)
     {
         asciiz_to_unicode( buffer, desktop_env );
