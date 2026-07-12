@@ -44,8 +44,14 @@ struct app_state
     const char *frame_fallback;
     const char *frame_transport;
     const char *graphics_note;
+    const char *display_fps_file;
     BOOL force_gl;
     double current_fps;
+    double producer_fps;
+    double display_fps;
+    unsigned long long display_sequence;
+    BOOL display_sequence_seen;
+    BOOL has_display_fps;
 };
 
 enum seven_segment_bits
@@ -91,8 +97,43 @@ static void load_graphics_env(struct app_state *state)
     state->frame_fallback = getenv("WINEHUA_FRAME_FALLBACK");
     state->frame_transport = getenv("WINEHUA_FRAME_TRANSPORT");
     state->graphics_note = getenv("WINEHUA_GRAPHICS_NOTE");
+    state->display_fps_file = getenv("WINEHUA_DISPLAY_FPS_FILE");
     force_gl = getenv("WINEHUA_GRAPHICS_FORCE_GL");
     state->force_gl = force_gl && !lstrcmpA(force_gl, "1");
+}
+
+static BOOL update_display_fps(struct app_state *state)
+{
+    char buffer[128];
+    DWORD bytes_read;
+    HANDLE file;
+    unsigned long long sequence;
+    unsigned int toplevel_id;
+    double fps;
+
+    if (!state->display_fps_file || !state->display_fps_file[0]) return FALSE;
+    file = CreateFileA(state->display_fps_file, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    if (!ReadFile(file, buffer, sizeof(buffer) - 1, &bytes_read, NULL)) bytes_read = 0;
+    CloseHandle(file);
+    buffer[bytes_read] = 0;
+    if (sscanf(buffer, "%llu %lf %u", &sequence, &fps, &toplevel_id) != 3) return FALSE;
+
+    if (!state->display_sequence_seen)
+    {
+        state->display_sequence = sequence;
+        state->display_sequence_seen = TRUE;
+        return FALSE;
+    }
+    if (sequence != state->display_sequence)
+    {
+        state->display_sequence = sequence;
+        state->display_fps = fps;
+        state->has_display_fps = TRUE;
+    }
+    return state->has_display_fps;
 }
 
 static BOOL validate_graphics_backend(const struct app_state *state, char *reason, size_t reason_size)
@@ -678,6 +719,7 @@ int main(int argc, char **argv)
 
     state.running = TRUE;
     state.current_fps = 0.0;
+    state.producer_fps = 0.0;
     QueryPerformanceCounter(&start);
     last_fps = start;
     set_window_title_once(&state);
@@ -715,9 +757,17 @@ int main(int argc, char **argv)
             unsigned int report_frames = frames - last_report_frames;
             double fps = report_seconds > 0.0 ? report_frames / report_seconds : 0.0;
 
-            state.current_fps = fps;
-            fprintf(stderr, "winehua_graphics_smoke: fps=%.2f size=%dx%d frames=%u\n",
-                    fps, state.width, state.height, frames);
+            state.producer_fps = fps;
+            if (update_display_fps(&state)) state.current_fps = state.display_fps;
+            else if (!state.display_fps_file) state.current_fps = state.producer_fps;
+            if (state.has_display_fps)
+                fprintf(stderr,
+                        "winehua_graphics_smoke: producer_fps=%.2f displayed_fps=%.2f size=%dx%d frames=%u\n",
+                        state.producer_fps, state.display_fps, state.width, state.height, frames);
+            else
+                fprintf(stderr,
+                        "winehua_graphics_smoke: producer_fps=%.2f displayed_fps=unavailable size=%dx%d frames=%u\n",
+                        state.producer_fps, state.width, state.height, frames);
             last_fps = now;
             last_report_frames = frames;
         }
