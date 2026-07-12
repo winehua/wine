@@ -464,7 +464,7 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     uint64_t stage_started;
     GLint pack_alignment, pack_buffer, pack_row_length, pack_skip_pixels, pack_skip_rows;
     GLint read_fbo;
-    int x, y;
+    int y;
 
     if (!base->client || !base->client->hwnd) return FALSE;
     client = CONTAINING_RECORD(base->client, struct wayland_client_surface, client);
@@ -524,7 +524,7 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     winehua_gl_stage_end(WINEHUA_GL_FLUSH, stage_started);
     stage_started = winehua_gl_stage_begin(WINEHUA_GL_READBACK, base->client->hwnd,
                                            gl->state->in_flight);
-    funcs->p_glReadPixels(0, 0, gl->width, gl->height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    funcs->p_glReadPixels(0, 0, gl->width, gl->height, GL_BGRA, GL_UNSIGNED_BYTE, rgba);
     winehua_gl_stage_end(WINEHUA_GL_READBACK, stage_started);
 
     if (read_fbo) funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
@@ -553,20 +553,14 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     buffer = slot->buffer;
 
     /* OpenGL readback starts at the lower-left; Wayland SHM starts at the
-     * upper-left. Wayland ARGB8888 is BGRA in little-endian memory. */
+     * upper-left. BGRA readback already matches little-endian ARGB8888. */
     stage_started = winehua_gl_stage_begin(WINEHUA_GL_CPU_COPY, base->client->hwnd,
                                            gl->state->in_flight);
     for (y = 0; y < gl->height; ++y)
     {
         src = rgba + (gl->height - 1 - y) * gl->width * 4;
         dst = (BYTE *)buffer->map_data + y * gl->width * 4;
-        for (x = 0; x < gl->width; ++x)
-        {
-            dst[x * 4 + 0] = src[x * 4 + 2];
-            dst[x * 4 + 1] = src[x * 4 + 1];
-            dst[x * 4 + 2] = src[x * 4 + 0];
-            dst[x * 4 + 3] = src[x * 4 + 3];
-        }
+        memcpy(dst, src, gl->width * 4);
     }
     winehua_gl_stage_end(WINEHUA_GL_CPU_COPY, stage_started);
 
