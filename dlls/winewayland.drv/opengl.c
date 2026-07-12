@@ -322,22 +322,28 @@ struct winehua_readback_drawable
     struct opengl_drawable base;
     int width;
     int height;
+    BYTE *rgba;
+    SIZE_T rgba_size;
     struct winehua_readback_state *state;
 };
+
+struct winehua_readback_slot
+{
+    struct winehua_readback_state *state;
+    struct wayland_shm_buffer *buffer;
+    LONG busy;
+};
+
+#define WINEHUA_READBACK_MAX_IN_FLIGHT 3
 
 struct winehua_readback_state
 {
     LONG ref;
     LONG in_flight;
+    int width;
+    int height;
+    struct winehua_readback_slot slots[WINEHUA_READBACK_MAX_IN_FLIGHT];
 };
-
-struct winehua_readback_submission
-{
-    struct winehua_readback_state *state;
-    struct wayland_shm_buffer *buffer;
-};
-
-#define WINEHUA_READBACK_MAX_IN_FLIGHT 3
 
 static void winehua_readback_state_ref(struct winehua_readback_state *state)
 {
@@ -346,7 +352,12 @@ static void winehua_readback_state_ref(struct winehua_readback_state *state)
 
 static void winehua_readback_state_unref(struct winehua_readback_state *state)
 {
-    if (!InterlockedDecrement(&state->ref)) free(state);
+    unsigned int i;
+
+    if (InterlockedDecrement(&state->ref)) return;
+    for (i = 0; i < ARRAY_SIZE(state->slots); ++i)
+        if (state->slots[i].buffer) wayland_shm_buffer_unref(state->slots[i].buffer);
+    free(state);
 }
 
 static struct winehua_readback_drawable *winehua_readback_from_drawable(struct opengl_drawable *base)
@@ -359,6 +370,7 @@ static void winehua_readback_drawable_destroy(struct opengl_drawable *base)
     struct winehua_readback_drawable *gl = winehua_readback_from_drawable(base);
 
     if (base->surface) funcs->p_eglDestroySurface(egl->display, base->surface);
+    free(gl->rgba);
     if (gl->state) winehua_readback_state_unref(gl->state);
 }
 
@@ -369,12 +381,12 @@ static void winehua_readback_drawable_flush(struct opengl_drawable *base, UINT f
 
 static void winehua_readback_buffer_release(void *data, struct wl_buffer *buffer)
 {
-    struct winehua_readback_submission *submission = data;
+    struct winehua_readback_slot *slot = data;
     LONG in_flight;
 
-    submission->buffer->busy = FALSE;
-    wayland_shm_buffer_unref(submission->buffer);
-    in_flight = InterlockedDecrement(&submission->state->in_flight);
+    slot->buffer->busy = FALSE;
+    InterlockedExchange(&slot->busy, FALSE);
+    in_flight = InterlockedDecrement(&slot->state->in_flight);
     if (winehua_env_enabled("WINEHUA_GL_STALL_DIAG"))
     {
         pthread_mutex_lock(&winehua_gl_diag_mutex);
@@ -382,8 +394,7 @@ static void winehua_readback_buffer_release(void *data, struct wl_buffer *buffer
         winehua_gl_in_flight = in_flight;
         pthread_mutex_unlock(&winehua_gl_diag_mutex);
     }
-    winehua_readback_state_unref(submission->state);
-    free(submission);
+    winehua_readback_state_unref(slot->state);
 }
 
 static const struct wl_buffer_listener winehua_readback_buffer_listener =
@@ -391,15 +402,65 @@ static const struct wl_buffer_listener winehua_readback_buffer_listener =
     winehua_readback_buffer_release,
 };
 
+static struct winehua_readback_state *winehua_readback_state_create(HWND hwnd,
+                                                                    int width, int height)
+{
+    struct winehua_readback_state *state;
+    unsigned int i;
+
+    if (!(state = calloc(1, sizeof(*state)))) return NULL;
+    state->ref = 1;
+    state->width = width;
+    state->height = height;
+
+    for (i = 0; i < ARRAY_SIZE(state->slots); ++i)
+    {
+        struct winehua_readback_slot *slot = &state->slots[i];
+
+        slot->state = state;
+        if (!(slot->buffer = wayland_shm_buffer_create(width, height, WL_SHM_FORMAT_ARGB8888)))
+        {
+            winehua_wayland_diag("readback shm pool allocation failed hwnd=%p size=%dx%d slot=%u",
+                                 hwnd, width, height, i);
+            winehua_readback_state_unref(state);
+            return NULL;
+        }
+        wl_proxy_set_queue((struct wl_proxy *)slot->buffer->wl_buffer,
+                           process_wayland.wl_event_queue);
+        if (wl_buffer_add_listener(slot->buffer->wl_buffer,
+                                   &winehua_readback_buffer_listener, slot) < 0)
+        {
+            winehua_wayland_diag("readback buffer listener registration failed hwnd=%p slot=%u",
+                                 hwnd, i);
+            winehua_readback_state_unref(state);
+            return NULL;
+        }
+    }
+    return state;
+}
+
+static struct winehua_readback_slot *winehua_readback_acquire_slot(
+    struct winehua_readback_state *state)
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(state->slots); ++i)
+        if (!InterlockedCompareExchange(&state->slots[i].busy, TRUE, FALSE))
+            return &state->slots[i];
+    return NULL;
+}
+
 static BOOL winehua_readback_present(struct opengl_drawable *base)
 {
     struct winehua_readback_drawable *gl = winehua_readback_from_drawable(base);
-    struct winehua_readback_submission *submission = NULL;
+    struct winehua_readback_state *new_state;
+    struct winehua_readback_slot *slot = NULL;
     struct wayland_client_surface *client;
     struct wayland_shm_buffer *buffer = NULL;
     BYTE *rgba = NULL, *src, *dst;
     RECT rect = {0};
-    BOOL slot_acquired = FALSE, submitted = FALSE, ret = FALSE;
+    BOOL submitted = FALSE, ret = FALSE;
+    SIZE_T rgba_size;
     uint64_t stage_started;
     GLint pack_alignment, pack_buffer, pack_row_length, pack_skip_pixels, pack_skip_rows;
     GLint read_fbo;
@@ -412,21 +473,31 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     NtUserGetClientRect(base->client->hwnd, &rect, NtUserGetDpiForWindow(base->client->hwnd));
     gl->width = max(1, rect.right - rect.left);
     gl->height = max(1, rect.bottom - rect.top);
+
+    if (gl->state->width != gl->width || gl->state->height != gl->height)
+    {
+        if (!(new_state = winehua_readback_state_create(base->client->hwnd,
+                                                        gl->width, gl->height)))
+            return FALSE;
+        winehua_readback_state_unref(gl->state);
+        gl->state = new_state;
+    }
     stage_started = winehua_gl_stage_begin(WINEHUA_GL_SWAP_ENTER, base->client->hwnd,
                                            gl->state->in_flight);
 
-    if (!(rgba = malloc(gl->width * gl->height * 4)))
+    rgba_size = (SIZE_T)gl->width * gl->height * 4;
+    if (gl->rgba_size < rgba_size)
     {
-        winehua_wayland_diag("readback rgba allocation failed hwnd=%p size=%dx%d",
-                             base->client->hwnd, gl->width, gl->height);
-        goto done;
+        if (!(rgba = realloc(gl->rgba, rgba_size)))
+        {
+            winehua_wayland_diag("readback rgba allocation failed hwnd=%p size=%dx%d",
+                                 base->client->hwnd, gl->width, gl->height);
+            goto done;
+        }
+        gl->rgba = rgba;
+        gl->rgba_size = rgba_size;
     }
-    if (!(submission = malloc(sizeof(*submission))))
-    {
-        winehua_wayland_diag("readback submission allocation failed hwnd=%p",
-                             base->client->hwnd);
-        goto done;
-    }
+    rgba = gl->rgba;
 
     funcs->p_glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer);
     funcs->p_glGetIntegerv(GL_PACK_ALIGNMENT, &pack_alignment);
@@ -466,9 +537,8 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     /* The readback above is the VirGL completion point. If all display
      * buffers are busy, drop only this presentation copy; never skip the GL
      * flush/readback and never wait for Wayland while holding Wine GL state. */
-    if (InterlockedIncrement(&gl->state->in_flight) > WINEHUA_READBACK_MAX_IN_FLIGHT)
+    if (!(slot = winehua_readback_acquire_slot(gl->state)))
     {
-        InterlockedDecrement(&gl->state->in_flight);
         if (winehua_env_enabled("WINEHUA_GL_STALL_DIAG"))
         {
             pthread_mutex_lock(&winehua_gl_diag_mutex);
@@ -479,14 +549,8 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
         ret = TRUE;
         goto done;
     }
-    slot_acquired = TRUE;
-
-    if (!(buffer = wayland_shm_buffer_create(gl->width, gl->height, WL_SHM_FORMAT_ARGB8888)))
-    {
-        winehua_wayland_diag("readback shm allocation failed hwnd=%p size=%dx%d",
-                             base->client->hwnd, gl->width, gl->height);
-        goto done;
-    }
+    InterlockedIncrement(&gl->state->in_flight);
+    buffer = slot->buffer;
 
     /* OpenGL readback starts at the lower-left; Wayland SHM starts at the
      * upper-left. Wayland ARGB8888 is BGRA in little-endian memory. */
@@ -506,18 +570,7 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     }
     winehua_gl_stage_end(WINEHUA_GL_CPU_COPY, stage_started);
 
-    submission->state = gl->state;
-    submission->buffer = buffer;
-    wl_proxy_set_queue((struct wl_proxy *)buffer->wl_buffer, process_wayland.wl_event_queue);
-    if (wl_buffer_add_listener(buffer->wl_buffer, &winehua_readback_buffer_listener,
-                               submission) < 0)
-    {
-        winehua_wayland_diag("readback buffer listener registration failed hwnd=%p",
-                             base->client->hwnd);
-        goto done;
-    }
     buffer->busy = TRUE;
-    wayland_shm_buffer_ref(buffer);
     winehua_readback_state_ref(gl->state);
     stage_started = winehua_gl_stage_begin(WINEHUA_GL_SHM_COMMIT, base->client->hwnd,
                                            gl->state->in_flight);
@@ -538,12 +591,14 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
 
 done:
     winehua_gl_diag_idle();
-    free(rgba);
-    if (buffer) wayland_shm_buffer_unref(buffer);
     if (!submitted)
     {
-        free(submission);
-        if (slot_acquired) InterlockedDecrement(&gl->state->in_flight);
+        if (slot)
+        {
+            buffer->busy = FALSE;
+            InterlockedExchange(&slot->busy, FALSE);
+            InterlockedDecrement(&gl->state->in_flight);
+        }
     }
     return ret;
 }
@@ -577,18 +632,16 @@ static BOOL winehua_readback_surface_create(HWND hwnd, int format, struct opengl
         client_surface_release(&client->client);
         return FALSE;
     }
-    if (!(gl->state = calloc(1, sizeof(*gl->state))))
+    NtUserGetClientRect(hwnd, &rect, NtUserGetDpiForWindow(hwnd));
+    gl->width = max(1, rect.right - rect.left);
+    gl->height = max(1, rect.bottom - rect.top);
+    if (!(gl->state = winehua_readback_state_create(hwnd, gl->width, gl->height)))
     {
         winehua_wayland_diag("readback state allocation failed hwnd=%p", hwnd);
         opengl_drawable_release(&gl->base);
         client_surface_release(&client->client);
         return FALSE;
     }
-    gl->state->ref = 1;
-
-    NtUserGetClientRect(hwnd, &rect, NtUserGetDpiForWindow(hwnd));
-    gl->width = max(1, rect.right - rect.left);
-    gl->height = max(1, rect.bottom - rect.top);
     attribs[0] = EGL_WIDTH;
     attribs[1] = gl->width;
     attribs[2] = EGL_HEIGHT;
