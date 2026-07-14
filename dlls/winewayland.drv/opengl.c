@@ -26,11 +26,13 @@
 
 #include <assert.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -52,6 +54,21 @@ static const struct opengl_drawable_funcs wayland_drawable_funcs;
 static const struct opengl_drawable_funcs winehua_readback_drawable_funcs;
 static struct opengl_driver_funcs winehua_readback_driver_funcs;
 static const struct opengl_driver_funcs *winehua_base_driver_funcs;
+
+#define WINEHUA_PRESENT_SURFACE_MAGIC 0x57535053u
+#define WINEHUA_PRESENT_SURFACE_VERSION 1u
+
+struct winehua_present_surface_page
+{
+    uint32_t magic;
+    uint32_t version;
+    uint32_t surface_id;
+    uint32_t reserved;
+};
+
+static pthread_once_t winehua_present_surface_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t winehua_present_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct winehua_present_surface_page *winehua_present_surface_page;
 
 struct wayland_gl_drawable
 {
@@ -154,6 +171,72 @@ static BOOL winehua_env_enabled(const char *name)
     return value && value[0] && strcmp(value, "0");
 }
 
+static uint32_t winehua_prepare_present_surface(struct wayland_client_surface *client)
+{
+    return client && client->wl_surface
+        ? wl_proxy_get_id((struct wl_proxy *)client->wl_surface) : 0;
+}
+
+static void winehua_init_present_surface_page(void)
+{
+    const char *tmp_dir = getenv("TMPDIR");
+    struct winehua_present_surface_page *page;
+    char path[256];
+    int fd;
+
+    if (!tmp_dir || !tmp_dir[0] ||
+        snprintf(path, sizeof(path), "%s/winehua_present_surface_%u.shm",
+                 tmp_dir, (uint32_t)getpid()) >= sizeof(path))
+        return;
+    if ((fd = open(path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0600)) < 0)
+        return;
+    if (ftruncate(fd, sizeof(*page)) ||
+        (page = mmap(NULL, sizeof(*page), PROT_READ | PROT_WRITE,
+                     MAP_SHARED, fd, 0)) == MAP_FAILED)
+    {
+        close(fd);
+        return;
+    }
+    close(fd);
+
+    page->version = WINEHUA_PRESENT_SURFACE_VERSION;
+    page->reserved = 0;
+    __atomic_store_n(&page->surface_id, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&page->magic, WINEHUA_PRESENT_SURFACE_MAGIC, __ATOMIC_RELEASE);
+    winehua_present_surface_page = page;
+}
+
+static void winehua_begin_present_surface(uint32_t surface_id)
+{
+    pthread_once(&winehua_present_surface_once, winehua_init_present_surface_page);
+    pthread_mutex_lock(&winehua_present_surface_mutex);
+    if (winehua_present_surface_page)
+        __atomic_store_n(&winehua_present_surface_page->surface_id,
+                         surface_id, __ATOMIC_RELEASE);
+}
+
+static void winehua_finish_present_surface(void)
+{
+    if (winehua_present_surface_page)
+        __atomic_store_n(&winehua_present_surface_page->surface_id,
+                         0, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&winehua_present_surface_mutex);
+}
+
+static BOOL winehua_surface_zero_copy_ready(uint32_t surface_id)
+{
+    const char *ready_dir = getenv("WINEHUA_ZERO_COPY_READY_DIR");
+    char path[256];
+    uint64_t surface_key;
+
+    if (!surface_id || !ready_dir || !ready_dir[0]) return FALSE;
+    surface_key = ((uint64_t)(uint32_t)getpid() << 32) | surface_id;
+    if (snprintf(path, sizeof(path), "%s/winehua_zc_surface_%llu.ready",
+                 ready_dir, (unsigned long long)surface_key) >= sizeof(path))
+        return FALSE;
+    return access(path, F_OK) == 0;
+}
+
 static void winehua_wayland_diag(const char *fmt, ...)
 {
     va_list args;
@@ -190,6 +273,8 @@ static unsigned long winehua_gl_commits;
 static unsigned long winehua_gl_releases;
 static unsigned long winehua_gl_drops;
 static LONG winehua_gl_in_flight;
+static LONG winehua_gl_zero_copy_presents;
+static LONG winehua_gl_readbacks;
 
 static uint64_t winehua_gl_now_ms(void)
 {
@@ -242,9 +327,9 @@ static void *winehua_gl_watchdog(void *unused)
         if (stage != WINEHUA_GL_IDLE)
         {
             fprintf(stderr,
-                    "winehua_gl_stall: stage=%s age_ms=%llu thread=%lu hwnd=%p in_flight=%ld commits=%lu releases=%lu drops=%lu\n",
+                    "winehua_gl_stall: stage=%s age_ms=%llu thread=%lu hwnd=%p in_flight=%d commits=%lu releases=%lu drops=%lu\n",
                     winehua_gl_stage_name(stage), (unsigned long long)(now - started),
-                    thread, hwnd, in_flight, commits, releases, drops);
+                    thread, hwnd, (int)in_flight, commits, releases, drops);
             fflush(stderr);
         }
     }
@@ -462,8 +547,11 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     BOOL submitted = FALSE, ret = FALSE;
     SIZE_T rgba_size;
     uint64_t stage_started;
+    uint32_t surface_id;
     GLint pack_alignment, pack_buffer, pack_row_length, pack_skip_pixels, pack_skip_rows;
     GLint read_fbo;
+    BOOL swap_ok;
+    LONG presents, readbacks;
     int y;
 
     if (!base->client || !base->client->hwnd) return FALSE;
@@ -473,6 +561,29 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     NtUserGetClientRect(base->client->hwnd, &rect, NtUserGetDpiForWindow(base->client->hwnd));
     gl->width = max(1, rect.right - rect.left);
     gl->height = max(1, rect.bottom - rect.top);
+    surface_id = winehua_prepare_present_surface(client);
+
+    if (surface_id && winehua_surface_zero_copy_ready(surface_id))
+    {
+        winehua_begin_present_surface(surface_id);
+        /* Pbuffer swap alone does not reliably flush the front resource. */
+        funcs->p_glFlush();
+        swap_ok = funcs->p_eglSwapBuffers(egl->display, base->surface);
+        presents = InterlockedIncrement(&winehua_gl_zero_copy_presents);
+        winehua_finish_present_surface();
+        if (presents == 1 || !(presents % 120))
+        {
+            fprintf(stderr,
+                    "winehua_gl_zero_copy: presents=%d readbacks=%d pid=%u surface=%u size=%dx%d\n",
+                    (int)presents, (int)winehua_gl_readbacks, (uint32_t)getpid(), surface_id,
+                    gl->width, gl->height);
+            fflush(stderr);
+        }
+        if (!swap_ok)
+            winehua_wayland_diag("zero-copy pbuffer swap failed hwnd=%p surface=%u error=%#x",
+                                 base->client->hwnd, surface_id, funcs->p_eglGetError());
+        return swap_ok;
+    }
 
     if (gl->state->width != gl->width || gl->state->height != gl->height)
     {
@@ -520,12 +631,31 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     winehua_gl_stage_end(WINEHUA_GL_SWAP_ENTER, stage_started);
     stage_started = winehua_gl_stage_begin(WINEHUA_GL_FLUSH, base->client->hwnd,
                                            gl->state->in_flight);
+    winehua_begin_present_surface(surface_id);
     funcs->p_glFlush();
+    winehua_finish_present_surface();
     winehua_gl_stage_end(WINEHUA_GL_FLUSH, stage_started);
     stage_started = winehua_gl_stage_begin(WINEHUA_GL_READBACK, base->client->hwnd,
                                            gl->state->in_flight);
+    readbacks = InterlockedIncrement(&winehua_gl_readbacks);
     funcs->p_glReadPixels(0, 0, gl->width, gl->height, GL_BGRA, GL_UNSIGNED_BYTE, rgba);
     winehua_gl_stage_end(WINEHUA_GL_READBACK, stage_started);
+
+    /* Keep the pbuffer's WSI present semantics active so the virpipe winsys
+     * receives the exact front resource while readback remains the fallback. */
+    winehua_begin_present_surface(surface_id);
+    if (!funcs->p_eglSwapBuffers(egl->display, base->surface))
+        winehua_wayland_diag("readback pbuffer swap failed hwnd=%p error=%#x",
+                             base->client->hwnd, funcs->p_eglGetError());
+    winehua_finish_present_surface();
+    if (readbacks == 1 || !(readbacks % 120))
+    {
+        fprintf(stderr,
+                "winehua_gl_present_bridge: readbacks=%d pid=%u surface=%u mapped=%s\n",
+                (int)readbacks, (uint32_t)getpid(), surface_id,
+                winehua_present_surface_page ? "yes" : "no");
+        fflush(stderr);
+    }
 
     if (read_fbo) funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
     if (pack_skip_rows) funcs->p_glPixelStorei(GL_PACK_SKIP_ROWS, pack_skip_rows);
@@ -620,6 +750,7 @@ static BOOL winehua_readback_surface_create(HWND hwnd, int format, struct opengl
 
     if ((previous = *drawable) && previous->format == format) return TRUE;
     if (!(client = wayland_client_surface_create(hwnd))) return FALSE;
+    pthread_once(&winehua_present_surface_once, winehua_init_present_surface_page);
     if (!(gl = opengl_drawable_create(sizeof(*gl), &winehua_readback_drawable_funcs,
                                       format, &client->client)))
     {
