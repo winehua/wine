@@ -503,7 +503,9 @@ static struct winehua_readback_state *winehua_readback_state_create(HWND hwnd,
         struct winehua_readback_slot *slot = &state->slots[i];
 
         slot->state = state;
-        if (!(slot->buffer = wayland_shm_buffer_create(width, height, WL_SHM_FORMAT_ARGB8888)))
+        /* GL readback is opaque window content. Its alpha byte is undefined,
+         * so advertising ARGB can make valid RGB pixels fully transparent. */
+        if (!(slot->buffer = wayland_shm_buffer_create(width, height, WL_SHM_FORMAT_XRGB8888)))
         {
             winehua_wayland_diag("readback shm pool allocation failed hwnd=%p size=%dx%d slot=%u",
                                  hwnd, width, height, i);
@@ -683,7 +685,8 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     buffer = slot->buffer;
 
     /* OpenGL readback starts at the lower-left; Wayland SHM starts at the
-     * upper-left. BGRA readback already matches little-endian ARGB8888. */
+     * upper-left. BGRA readback matches little-endian XRGB8888; the unused
+     * high byte is ignored by the compositor. */
     stage_started = winehua_gl_stage_begin(WINEHUA_GL_CPU_COPY, base->client->hwnd,
                                            gl->state->in_flight);
     for (y = 0; y < gl->height; ++y)
