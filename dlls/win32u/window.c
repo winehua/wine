@@ -55,6 +55,125 @@ static void *client_objects[MAX_USER_HANDLES];
 static volatile unsigned int startup_info_flags;
 static unsigned int startup_show_window;
 
+/* Wayland compositors do not let clients switch the physical output mode.
+ * Preserve the pre-fullscreen client size as the process-local Win32 mode
+ * when a popup is expanded to cover the output. */
+struct winehua_fullscreen_mode_state
+{
+    HWND candidate;
+    LONG candidate_width;
+    LONG candidate_height;
+    HWND active;
+    LONG logical_width;
+    LONG logical_height;
+};
+
+static struct winehua_fullscreen_mode_state winehua_fullscreen_mode;
+
+static BOOL winehua_fullscreen_mode_emulation_enabled(void)
+{
+    const char *value = getenv( "WINEHUA_FULLSCREEN_MODE_EMULATION" );
+
+    return value && *value && strcmp( value, "0" );
+}
+
+static void winehua_clear_fullscreen_mode(void)
+{
+    InterlockedExchange( &winehua_fullscreen_mode.logical_width, 0 );
+    InterlockedExchange( &winehua_fullscreen_mode.logical_height, 0 );
+    InterlockedExchange( &winehua_fullscreen_mode.candidate_width, 0 );
+    InterlockedExchange( &winehua_fullscreen_mode.candidate_height, 0 );
+    InterlockedExchangePointer( (void **)&winehua_fullscreen_mode.active, NULL );
+    InterlockedExchangePointer( (void **)&winehua_fullscreen_mode.candidate, NULL );
+}
+
+static void winehua_note_fullscreen_mode( HWND hwnd, BOOL child, DWORD style, DWORD ex_style,
+                                          const struct window_rects *old_rects,
+                                          const struct window_rects *new_rects, BOOL fullscreen )
+{
+    HWND active, candidate;
+    int old_width, old_height, new_width, new_height;
+
+    if (!winehua_fullscreen_mode_emulation_enabled() || child) return;
+
+    old_width = old_rects->client.right - old_rects->client.left;
+    old_height = old_rects->client.bottom - old_rects->client.top;
+    new_width = new_rects->client.right - new_rects->client.left;
+    new_height = new_rects->client.bottom - new_rects->client.top;
+
+    if (!fullscreen)
+    {
+        active = InterlockedCompareExchangePointer(
+            (void **)&winehua_fullscreen_mode.active, NULL, NULL );
+        if (active == hwnd)
+        {
+            MESSAGE( "winehua_fullscreen_mode: deactivated hwnd=%p\n", hwnd );
+            winehua_clear_fullscreen_mode();
+        }
+
+        if ((style & WS_VISIBLE) && (style & WS_POPUP) &&
+            !(style & (WS_CHILD | WS_CAPTION)) && new_width > 0 && new_height > 0)
+        {
+            InterlockedExchange( &winehua_fullscreen_mode.candidate_width, new_width );
+            InterlockedExchange( &winehua_fullscreen_mode.candidate_height, new_height );
+            InterlockedExchangePointer( (void **)&winehua_fullscreen_mode.candidate, hwnd );
+        }
+        return;
+    }
+
+    if (!(style & WS_VISIBLE) || !(style & WS_POPUP) ||
+        (style & (WS_CHILD | WS_CAPTION)) ||
+        !(ex_style & (WS_EX_TOPMOST | WS_EX_APPWINDOW)) ||
+        InterlockedCompareExchange( &winehua_fullscreen_mode.logical_width, 0, 0 ))
+        return;
+
+    candidate = InterlockedCompareExchangePointer(
+        (void **)&winehua_fullscreen_mode.candidate, NULL, NULL );
+    if (candidate == hwnd)
+    {
+        old_width = InterlockedCompareExchange(
+            &winehua_fullscreen_mode.candidate_width, 0, 0 );
+        old_height = InterlockedCompareExchange(
+            &winehua_fullscreen_mode.candidate_height, 0, 0 );
+    }
+    if (candidate != hwnd || old_width <= 0 || old_height <= 0 ||
+        new_width < old_width || new_height < old_height ||
+        (new_width == old_width && new_height == old_height))
+        return;
+
+    InterlockedExchangePointer( (void **)&winehua_fullscreen_mode.active, hwnd );
+    InterlockedExchange( &winehua_fullscreen_mode.logical_height, old_height );
+    InterlockedExchange( &winehua_fullscreen_mode.logical_width, old_width );
+    MESSAGE( "winehua_fullscreen_mode: activated hwnd=%p logical=%dx%d physical=%dx%d "
+             "style=%#lx ex=%#lx\n", hwnd, old_width, old_height, new_width, new_height,
+             (unsigned long)style, (unsigned long)ex_style );
+}
+
+BOOL get_emulated_fullscreen_mode( int *width, int *height )
+{
+    LONG logical_width;
+
+    if (!winehua_fullscreen_mode_emulation_enabled()) return FALSE;
+    logical_width = InterlockedCompareExchange(
+        &winehua_fullscreen_mode.logical_width, 0, 0 );
+    if (!logical_width) return FALSE;
+    *width = logical_width;
+    *height = InterlockedCompareExchange(
+        &winehua_fullscreen_mode.logical_height, 0, 0 );
+    return *height > 0;
+}
+
+static void winehua_forget_fullscreen_window( HWND hwnd )
+{
+    HWND active = InterlockedCompareExchangePointer(
+        (void **)&winehua_fullscreen_mode.active, NULL, NULL );
+    HWND candidate = InterlockedCompareExchangePointer(
+        (void **)&winehua_fullscreen_mode.candidate, NULL, NULL );
+
+    if (active != hwnd && candidate != hwnd) return;
+    winehua_clear_fullscreen_mode();
+}
+
 static unsigned int set_startup_info_flags( unsigned int mask, unsigned int flags )
 {
     unsigned int prev, new;
@@ -2324,6 +2443,9 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             if (is_fullscreen( &monitor_info, &new_rects->window )) swp_flags &= ~WINE_SWP_RESIZABLE;
             monitor_rects = map_window_rects_virt_to_raw( *new_rects, dpi );
         }
+        winehua_note_fullscreen_mode( hwnd, is_child, win->dwStyle, win->dwExStyle,
+                                      &old_rects, new_rects,
+                                      !!(swp_flags & WINE_SWP_FULLSCREEN) );
     }
 
     release_win_ptr( win );
@@ -5281,6 +5403,8 @@ LRESULT destroy_window( HWND hwnd )
     HWND *children, toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
 
     TRACE( "%p\n", hwnd );
+
+    winehua_forget_fullscreen_window( hwnd );
 
     unregister_imm_window( hwnd );
 

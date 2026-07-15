@@ -6932,6 +6932,7 @@ int get_system_metrics( int index )
     RECT rect;
     UINT ret;
     HDC hdc;
+    int logical_width, logical_height;
 
     /* some metrics are dynamic */
     switch (index)
@@ -7132,10 +7133,14 @@ int get_system_metrics( int index )
         return 1;
     case SM_CXSCREEN:
         rect = get_primary_monitor_rect( get_thread_dpi() );
-        return rect.right - rect.left;
+        ret = rect.right - rect.left;
+        if (get_emulated_fullscreen_mode( &logical_width, &logical_height )) ret = logical_width;
+        return ret;
     case SM_CYSCREEN:
         rect = get_primary_monitor_rect( get_thread_dpi() );
-        return rect.bottom - rect.top;
+        ret = rect.bottom - rect.top;
+        if (get_emulated_fullscreen_mode( &logical_width, &logical_height )) ret = logical_height;
+        return ret;
     case SM_XVIRTUALSCREEN:
         rect = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
         return rect.left;
@@ -7143,9 +7148,11 @@ int get_system_metrics( int index )
         rect = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
         return rect.top;
     case SM_CXVIRTUALSCREEN:
+        if (get_emulated_fullscreen_mode( &logical_width, &logical_height )) return logical_width;
         rect = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
         return rect.right - rect.left;
     case SM_CYVIRTUALSCREEN:
+        if (get_emulated_fullscreen_mode( &logical_width, &logical_height )) return logical_height;
         rect = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
         return rect.bottom - rect.top;
     case SM_CMONITORS:
