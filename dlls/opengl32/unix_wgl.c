@@ -1100,7 +1100,7 @@ static void make_context_current( TEB *teb, const struct opengl_funcs *funcs, HD
     {
         enum opengl_extension extensions[GL_EXTENSION_COUNT];
         size_t extension_count = parse_extensions( (const char *)funcs->p_glGetString( GL_EXTENSIONS ), extensions);
-        for (i = 0; i < extension_count; i++) client->extensions[i] = TRUE;
+        for (i = 0; i < extension_count; i++) client->extensions[extensions[i]] = TRUE;
     }
 
     pthread_once( &once, init_enabled_extensions );
