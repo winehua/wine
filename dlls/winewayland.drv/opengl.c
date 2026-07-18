@@ -561,6 +561,57 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     NtUserGetClientRect(base->client->hwnd, &rect, NtUserGetDpiForWindow(base->client->hwnd));
     gl->width = max(1, rect.right - rect.left);
     gl->height = max(1, rect.bottom - rect.top);
+
+    /* The pbuffer is sized at drawable creation and never followed window
+     * resizes (only the SHM state did). After a display mode change the
+     * guest keeps rendering at pbuffer dimensions while glReadPixels(0, 0,
+     * client_w, client_h) reads the bottom-left corner — frames appear
+     * shifted down by (old_h - new_h) with their bottom rows lost.
+     * Recreate the pbuffer and rebind the current context when the client
+     * size changes; skip this frame (it was rendered at the old size), the
+     * next one renders correctly. */
+    {
+        EGLint pb_w = 0, pb_h = 0;
+        funcs->p_eglQuerySurface(egl->display, base->surface, EGL_WIDTH, &pb_w);
+        funcs->p_eglQuerySurface(egl->display, base->surface, EGL_HEIGHT, &pb_h);
+        if (pb_w != gl->width || pb_h != gl->height)
+        {
+            EGLint attribs[5];
+            EGLSurface new_surface;
+            EGLContext ctx = funcs->p_eglGetCurrentContext();
+
+            attribs[0] = EGL_WIDTH;
+            attribs[1] = gl->width;
+            attribs[2] = EGL_HEIGHT;
+            attribs[3] = gl->height;
+            attribs[4] = EGL_NONE;
+            new_surface = funcs->p_eglCreatePbufferSurface(egl->display,
+                                                           egl_config_for_format(base->format),
+                                                           attribs);
+            if (!new_surface)
+            {
+                winehua_wayland_diag("readback pbuffer resize alloc failed hwnd=%p size=%dx%d error=%#x",
+                                     base->client->hwnd, gl->width, gl->height,
+                                     funcs->p_eglGetError());
+            }
+            else if (ctx == EGL_NO_CONTEXT ||
+                     !funcs->p_eglMakeCurrent(egl->display, new_surface, new_surface, ctx))
+            {
+                winehua_wayland_diag("readback pbuffer rebind failed hwnd=%p error=%#x",
+                                     base->client->hwnd, funcs->p_eglGetError());
+                funcs->p_eglDestroySurface(egl->display, new_surface);
+            }
+            else
+            {
+                fprintf(stderr, "winehua_readback: pbuffer resized %dx%d -> %dx%d hwnd=%p\n",
+                        (int)pb_w, (int)pb_h, gl->width, gl->height, base->client->hwnd);
+                fflush(stderr);
+                funcs->p_eglDestroySurface(egl->display, base->surface);
+                base->surface = new_surface;
+                return TRUE;
+            }
+        }
+    }
     surface_id = winehua_prepare_present_surface(client);
 
     if (surface_id && winehua_surface_zero_copy_ready(surface_id))
@@ -638,6 +689,21 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     stage_started = winehua_gl_stage_begin(WINEHUA_GL_READBACK, base->client->hwnd,
                                            gl->state->in_flight);
     readbacks = InterlockedIncrement(&winehua_gl_readbacks);
+    /* 诊断 (#246 画面下移): 锁定 stale 高度基准在哪一环 —
+     * client rect vs pbuffer 实际尺寸 vs 应用最后设置的 viewport */
+    if (readbacks == 1 || !(readbacks % 300))
+    {
+        EGLint pb_w = 0, pb_h = 0;
+        GLint vp[4] = {0};
+        funcs->p_eglQuerySurface(egl->display, base->surface, EGL_WIDTH, &pb_w);
+        funcs->p_eglQuerySurface(egl->display, base->surface, EGL_HEIGHT, &pb_h);
+        funcs->p_glGetIntegerv(GL_VIEWPORT, vp);
+        fprintf(stderr,
+                "winehua_readback_diag: hwnd=%p client=%dx%d pbuf=%dx%d viewport=%d,%d %dx%d\n",
+                base->client->hwnd, gl->width, gl->height, (int)pb_w, (int)pb_h,
+                (int)vp[0], (int)vp[1], (int)vp[2], (int)vp[3]);
+        fflush(stderr);
+    }
     funcs->p_glReadPixels(0, 0, gl->width, gl->height, GL_BGRA, GL_UNSIGNED_BYTE, rgba);
     winehua_gl_stage_end(WINEHUA_GL_READBACK, stage_started);
 
