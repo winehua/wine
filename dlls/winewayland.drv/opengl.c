@@ -689,8 +689,9 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     stage_started = winehua_gl_stage_begin(WINEHUA_GL_READBACK, base->client->hwnd,
                                            gl->state->in_flight);
     readbacks = InterlockedIncrement(&winehua_gl_readbacks);
-    /* 诊断 (#246 画面下移): 锁定 stale 高度基准在哪一环 —
-     * client rect vs pbuffer 实际尺寸 vs 应用最后设置的 viewport */
+    /* 尺寸管线哨兵: client rect / pbuffer / viewport 三者必须一致 —
+     * 任何一环滞后 (如显示模式切换后未跟随) 都会造成画面偏移,
+     * 低频打印便于第一时间发现 (曾潜伏 7 天: pbuffer 未随 resize 重建) */
     if (readbacks == 1 || !(readbacks % 300))
     {
         EGLint pb_w = 0, pb_h = 0;
