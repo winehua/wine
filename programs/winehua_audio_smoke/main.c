@@ -13,6 +13,8 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 
+#include "../winehua_smoke_protocol.h"
+
 #define MAX_WAV_SIZE (32 * 1024 * 1024)
 #define PRIMARY_MP3_PATH "Z:\\Documents\\Media\\Alarm01.mp3"
 #define FALLBACK_MP3_PATH "C:\\Documents\\Media\\Alarm01.mp3"
@@ -381,10 +383,95 @@ fail:
     return 3;
 }
 
-int main(void)
+static double smoke_sqrt(double value)
+{
+    double estimate = value > 1.0 ? value : 1.0;
+    int i;
+    for (i = 0; i < 16; ++i) estimate = 0.5 * (estimate + value / estimate);
+    return estimate;
+}
+
+static BOOL generate_deterministic_pcm(struct wav_file *wav, DWORD seconds,
+                                       double *out_rms, int *out_peak)
+{
+    const DWORD sample_rate = 48000;
+    const WORD channels = 2;
+    const DWORD frames = sample_rate * seconds;
+    DWORD frame;
+    unsigned long long sum_squares = 0;
+    int peak = 0;
+    short *samples;
+
+    memset(wav, 0, sizeof(*wav));
+    wav->format = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*wav->format));
+    wav->data_size = frames * channels * sizeof(short);
+    wav->data = HeapAlloc(GetProcessHeap(), 0, wav->data_size);
+    if (!wav->format || !wav->data)
+    {
+        free_wav_file(wav);
+        return FALSE;
+    }
+
+    wav->format_size = sizeof(*wav->format);
+    wav->format->wFormatTag = WAVE_FORMAT_PCM;
+    wav->format->nChannels = channels;
+    wav->format->nSamplesPerSec = sample_rate;
+    wav->format->wBitsPerSample = 16;
+    wav->format->nBlockAlign = channels * sizeof(short);
+    wav->format->nAvgBytesPerSec = sample_rate * wav->format->nBlockAlign;
+    lstrcpynA(wav->path, "generated:triangle-440hz-s16le-stereo", MAX_PATH);
+
+    samples = (short *)wav->data;
+    for (frame = 0; frame < frames; ++frame)
+    {
+        unsigned int phase = (unsigned int)(((unsigned long long)frame * 440ULL * 65536ULL / sample_rate) & 0xffff);
+        int triangle = phase < 32768 ? (int)phase * 2 - 32768 : 98303 - (int)phase * 2;
+        int sample = triangle * 12000 / 32768;
+        int absolute = sample < 0 ? -sample : sample;
+        samples[frame * 2] = (short)sample;
+        samples[frame * 2 + 1] = (short)sample;
+        sum_squares += (unsigned long long)((long long)sample * sample) * 2ULL;
+        if (absolute > peak) peak = absolute;
+    }
+
+    *out_rms = smoke_sqrt((double)sum_squares / (double)(frames * channels));
+    *out_peak = peak;
+    return TRUE;
+}
+
+int main(int argc, char **argv)
 {
     struct wav_file wav;
+    struct winehua_smoke_options smoke;
+    char metrics[768];
+    double rms = 0.0;
+    int peak = 0;
     int ret;
+
+    if (!winehua_smoke_parse_options(&smoke, argc, argv, 3)) return 6;
+    winehua_smoke_write_result(&smoke, "STARTED", "startup", "audio smoke starting", "{}");
+
+    if (smoke.automation)
+    {
+        if (!generate_deterministic_pcm(&wav, smoke.seconds, &rms, &peak))
+        {
+            winehua_smoke_write_result(&smoke, "FAIL", "startup", "deterministic PCM allocation failed", "{}");
+            return 1;
+        }
+        ret = play_wav_via_audioclient(&wav);
+        snprintf(metrics, sizeof(metrics),
+                 "{\"sampleRate\":48000,\"channels\":2,\"framesSubmitted\":%lu,"
+                 "\"rms\":%.3f,\"peak\":%d,\"underrunCount\":-1,"
+                 "\"hostConsumptionVerified\":%s}",
+                 (unsigned long)(wav.data_size / wav.format->nBlockAlign), rms, peak,
+                 ret == 0 ? "true" : "false");
+        free_wav_file(&wav);
+        winehua_smoke_write_result(&smoke, ret == 0 ? "PASS" : "FAIL", "audio",
+                                   ret == 0 ? "AudioClient stream drained through AudioBroker" :
+                                              "AudioClient playback failed",
+                                   metrics);
+        return ret;
+    }
 
     ret = play_alarm_mp3();
     if (ret == 0) return 0;

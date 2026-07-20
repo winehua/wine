@@ -89,7 +89,7 @@ struct VkDevice_T
 #include "wine/list.h"
 
 /* Wine internal vulkan driver version, needs to be bumped upon vulkan_funcs changes. */
-#define WINE_VULKAN_DRIVER_VERSION 47
+#define WINE_VULKAN_DRIVER_VERSION 48
 
 struct vulkan_object
 {
@@ -340,7 +340,10 @@ struct vulkan_funcs
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR;
     PFN_vkGetPhysicalDeviceSurfaceFormats2KHR p_vkGetPhysicalDeviceSurfaceFormats2KHR;
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR p_vkGetPhysicalDeviceSurfaceFormatsKHR;
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR p_vkGetPhysicalDeviceSurfacePresentModesKHR;
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR p_vkGetPhysicalDeviceSurfaceSupportKHR;
     PFN_vkGetPhysicalDeviceWin32PresentationSupportKHR p_vkGetPhysicalDeviceWin32PresentationSupportKHR;
+    PFN_vkGetSwapchainImagesKHR p_vkGetSwapchainImagesKHR;
     PFN_vkGetSemaphoreWin32HandleKHR p_vkGetSemaphoreWin32HandleKHR;
     PFN_vkImportFenceWin32HandleKHR p_vkImportFenceWin32HandleKHR;
     PFN_vkImportSemaphoreWin32HandleKHR p_vkImportSemaphoreWin32HandleKHR;

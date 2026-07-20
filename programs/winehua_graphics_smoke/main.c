@@ -15,6 +15,8 @@
 #include <windows.h>
 #include <GL/gl.h>
 
+#include "../winehua_smoke_protocol.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -644,11 +646,37 @@ static void render_frame(const struct app_state *state, float angle_deg, float c
     (void)SwapBuffers(state->hdc);
 }
 
-static void parse_args(struct app_state *state, int argc, char **argv)
+static void render_fixed_frame(const struct app_state *state)
+{
+    int width = state->width > 0 ? state->width : 1;
+    int height = state->height > 0 ? state->height : 1;
+
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_SCISSOR_TEST);
+    glViewport(0, 0, width, height);
+    glScissor(0, height / 2, width / 2, height - height / 2);
+    glClearColor(0.92f, 0.08f, 0.12f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glScissor(width / 2, height / 2, width - width / 2, height - height / 2);
+    glClearColor(0.08f, 0.88f, 0.18f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glScissor(0, 0, width / 2, height / 2);
+    glClearColor(0.10f, 0.20f, 0.94f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glScissor(width / 2, 0, width - width / 2, height / 2);
+    glClearColor(0.96f, 0.82f, 0.08f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+    (void)SwapBuffers(state->hdc);
+}
+
+static BOOL parse_args(struct app_state *state, struct winehua_smoke_options *smoke,
+                       int argc, char **argv)
 {
     int i;
 
-    state->duration_ms = 20000;
+    if (!winehua_smoke_parse_options(smoke, argc, argv, 20)) return FALSE;
+    state->duration_ms = smoke->seconds * 1000;
     state->loop_forever = FALSE;
 
     for (i = 1; i < argc; ++i)
@@ -663,30 +691,38 @@ static void parse_args(struct app_state *state, int argc, char **argv)
             if (seconds > 0) state->duration_ms = (DWORD)seconds * 1000;
         }
     }
+    return TRUE;
 }
 
 int main(int argc, char **argv)
 {
     struct app_state state = {0};
+    struct winehua_smoke_options smoke;
     char reason[1024] = {0};
+    char metrics[1536];
     MSG msg;
     LARGE_INTEGER start, now, last_fps;
     unsigned int frames = 0;
     unsigned int last_report_frames = 0;
     BOOL forced_continue = FALSE;
+    BOOL fixed_frame_announced = FALSE;
 
-    parse_args(&state, argc, argv);
+    if (!parse_args(&state, &smoke, argc, argv)) return 6;
+    winehua_smoke_write_result(&smoke, "STARTED", "startup", "graphics smoke starting", "{}");
     load_graphics_env(&state);
     if (!QueryPerformanceFrequency(&state.freq) || !state.freq.QuadPart)
     {
         fprintf(stderr, "winehua_graphics_smoke: QueryPerformanceFrequency failed\n");
+        winehua_smoke_write_result(&smoke, "FAIL", "startup", "QueryPerformanceFrequency failed", "{}");
         return 1;
     }
 
     if (!validate_graphics_backend(&state, reason, sizeof(reason)))
     {
         fprintf(stderr, "winehua_graphics_smoke: %s\n", reason);
-        MessageBoxA(NULL, reason, "WineHua Graphics Smoke", MB_OK | MB_ICONWARNING);
+        if (!smoke.automation)
+            MessageBoxA(NULL, reason, "WineHua Graphics Smoke", MB_OK | MB_ICONWARNING);
+        winehua_smoke_write_result(&smoke, "FAIL", "startup", reason, "{\"fallbackDetected\":true}");
         return 4;
     }
     if (state.force_gl && reason[0])
@@ -695,7 +731,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "winehua_graphics_smoke: forced diagnostics mode: %s\n", reason);
     }
 
-    if (!init_window(&state)) return 2;
+    if (!init_window(&state))
+    {
+        winehua_smoke_write_result(&smoke, "FAIL", "startup", "Win32 window creation failed", "{}");
+        return 2;
+    }
     if (forced_continue)
         fprintf(stderr, "winehua_graphics_smoke: continuing past readiness gate without modal dialog\n");
     if (!init_opengl(&state))
@@ -713,7 +753,9 @@ int main(int argc, char **argv)
                  state.frame_transport ? state.frame_transport : "?",
                  state.force_gl ? 1 : 0,
                  state.graphics_note ? state.graphics_note : "(none)");
-        MessageBoxA(state.hwnd, reason, "WineHua Graphics Smoke", MB_OK | MB_ICONERROR);
+        if (!smoke.automation)
+            MessageBoxA(state.hwnd, reason, "WineHua Graphics Smoke", MB_OK | MB_ICONERROR);
+        winehua_smoke_write_result(&smoke, "FAIL", "startup", reason, "{}");
         return 3;
     }
 
@@ -740,6 +782,24 @@ int main(int argc, char **argv)
         {
             LONGLONG elapsed_ms = (now.QuadPart - start.QuadPart) * 1000 / state.freq.QuadPart;
             if (elapsed_ms >= state.duration_ms) break;
+            if (smoke.automation && state.duration_ms >= 2500 && elapsed_ms >= state.duration_ms - 2000)
+            {
+                render_fixed_frame(&state);
+                frames++;
+                if (!fixed_frame_announced)
+                {
+                    snprintf(metrics, sizeof(metrics),
+                             "{\"frames\":%u,\"width\":%d,\"height\":%d,"
+                             "\"cpuReadBytes\":-1,\"cpuUploadBytes\":-1,\"gpuCopyCount\":-1,"
+                             "\"queueSubmitCount\":-1,\"fallbackDetected\":false,"
+                             "\"fixedFrame\":\"rgba-quadrants-v1\"}",
+                             frames, state.width, state.height);
+                    winehua_smoke_write_result(&smoke, "RUNNING", "present", "fixed-frame", metrics);
+                    fixed_frame_announced = TRUE;
+                }
+                Sleep(16);
+                continue;
+            }
         }
 
         {
@@ -770,12 +830,43 @@ int main(int argc, char **argv)
                         state.producer_fps, state.width, state.height, frames);
             last_fps = now;
             last_report_frames = frames;
+            if (smoke.automation)
+            {
+                snprintf(metrics, sizeof(metrics),
+                         "{\"frames\":%u,\"producerFps\":%.3f,\"displayFps\":%.3f,"
+                         "\"cpuReadBytes\":-1,\"cpuUploadBytes\":-1,\"gpuCopyCount\":-1,"
+                         "\"queueSubmitCount\":-1,\"acquireWaitUs\":-1,\"renderWaitUs\":-1,"
+                         "\"presentWaitUs\":-1,\"frameLatency\":-1,\"p50FrameMs\":-1,"
+                         "\"p95FrameMs\":-1,\"p99FrameMs\":-1,\"swapchainRecreateCount\":0,"
+                         "\"surfaceQueueBacklog\":-1,\"fallbackDetected\":false}",
+                         frames, state.producer_fps, state.has_display_fps ? state.display_fps : -1.0);
+                winehua_smoke_write_result(&smoke, "RUNNING", "present", "heartbeat", metrics);
+            }
         }
 
         Sleep(1);
     }
 
     fprintf(stderr, "winehua_graphics_smoke: finished after %u frames\n", frames);
+    snprintf(metrics, sizeof(metrics),
+             "{\"frames\":%u,\"producerFps\":%.3f,\"displayFps\":%.3f,"
+             "\"width\":%d,\"height\":%d,\"cpuReadBytes\":-1,\"cpuUploadBytes\":-1,"
+             "\"gpuCopyCount\":-1,\"queueSubmitCount\":-1,\"acquireWaitUs\":-1,"
+             "\"renderWaitUs\":-1,\"presentWaitUs\":-1,\"frameLatency\":-1,"
+             "\"p50FrameMs\":-1,\"p95FrameMs\":-1,\"p99FrameMs\":-1,"
+             "\"swapchainRecreateCount\":0,\"surfaceQueueBacklog\":-1,"
+             "\"fallbackDetected\":false,\"fixedFrame\":\"rgba-quadrants-v1\"}",
+             frames, state.producer_fps, state.has_display_fps ? state.display_fps : -1.0,
+             state.width, state.height);
+    {
+        BOOL displayed = !smoke.automation || !state.display_fps_file || state.has_display_fps;
+        BOOL passed = frames && displayed;
+        winehua_smoke_write_result(&smoke, passed ? "PASS" : "FAIL", "present",
+                                   !frames ? "no frames rendered" :
+                                   displayed ? "OpenGL rendering completed" :
+                                               "no compositor display sequence observed",
+                                   metrics);
+    }
     shutdown_opengl(&state);
     if (state.hwnd) DestroyWindow(state.hwnd);
     return 0;

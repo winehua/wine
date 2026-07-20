@@ -1,0 +1,7 @@
+MODULE    = winehua_vulkan_smoke.exe
+IMPORTS   = vulkan-1 user32
+
+EXTRADLLFLAGS = -mconsole
+
+SOURCES = \
+	main.c

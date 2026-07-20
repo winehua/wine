@@ -1,0 +1,7 @@
+MODULE    = winehua_d3d11_smoke.exe
+IMPORTS   = d3d11 dxgi d3dcompiler user32 gdi32
+
+EXTRADLLFLAGS = -mconsole
+
+SOURCES = \
+	main.c
