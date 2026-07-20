@@ -2528,6 +2528,9 @@ int main(int argc, char **argv)
 {
     struct smoke_state state;
     UINT frame_target;
+    BOOL long_run;
+    ULONGLONG long_deadline_ms = 0;
+    ULONGLONG next_heartbeat_ms = 0;
     memset(&state, 0, sizeof(state));
     state.started_ms = winehua_smoke_timestamp_ms();
     state.present_result = E_FAIL;
@@ -2544,8 +2547,15 @@ int main(int argc, char **argv)
         release_state(&state);
         return 1;
     }
+    long_run = state.smoke.automation && state.smoke.seconds >= 60;
     frame_target = state.smoke.seconds ? state.smoke.seconds * 30 : 30;
-    while (state.frame_count < frame_target)
+    if (long_run)
+    {
+        long_deadline_ms = GetTickCount64() + (ULONGLONG)state.smoke.seconds * 1000;
+        next_heartbeat_ms = GetTickCount64() + 5000;
+    }
+    while (long_run ? GetTickCount64() < long_deadline_ms
+                    : state.frame_count < frame_target)
     {
         if (!draw_frame(&state))
         {
@@ -2561,7 +2571,12 @@ int main(int argc, char **argv)
              * snapshot_display.  The result JSON remains authoritative; this
              * bounded hold only makes the visual gate deterministic. */
             Sleep(state.smoke.automation ? 6000 : 2000);
-            if (state.smoke.automation) break;
+            if (state.smoke.automation && !long_run) break;
+        }
+        if (long_run && GetTickCount64() >= next_heartbeat_ms)
+        {
+            write_state(&state, "RUNNING", "dxvk", "long-running");
+            next_heartbeat_ms = GetTickCount64() + 5000;
         }
     }
     poll_stencil_query(&state, 2000);
@@ -2578,7 +2593,9 @@ int main(int argc, char **argv)
         release_state(&state);
         return 1;
     }
-    write_state(&state, "PASS", "dxvk", "DXVK Legacy D3D11 fixed-frame check passed");
+    write_state(&state, "PASS", "dxvk", long_run
+                ? "DXVK Legacy D3D11 long-run check passed"
+                : "DXVK Legacy D3D11 fixed-frame check passed");
     release_state(&state);
     return 0;
 }
