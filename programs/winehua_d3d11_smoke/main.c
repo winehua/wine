@@ -37,7 +37,7 @@ struct cube_constants
 #define WINEHUA_RGBA_MARKER 0xdeadbeefu
 #define WINEHUA_TEXTURE3D_SIZE 4
 #define WINEHUA_TEXTURE3D_TEXELS (WINEHUA_TEXTURE3D_SIZE * WINEHUA_TEXTURE3D_SIZE * WINEHUA_TEXTURE3D_SIZE)
-#define WINEHUA_BC_MATRIX_FORMATS 6
+#define WINEHUA_BC_MATRIX_FORMATS 8
 #define WINEHUA_HEAVEN_CUBE_FORMATS 5
 #define WINEHUA_D24_ARRAY_LAYERS 6
 #define WINEHUA_D24_CUBE_ARRAY_LAYERS 12
@@ -359,6 +359,7 @@ static void write_state(struct smoke_state *state, const char *status,
     char heaven_d24s8_cube_values[128];
     char heaven_d24s8_cube_array_values[256];
     char heaven_d24s8_linear_border_values[96];
+    char bc_matrix_values[256];
     const char *version = winehua_smoke_env("WINEHUA_DXVK_VERSION", "unknown");
     BOOL dxvk_loaded;
 
@@ -416,6 +417,9 @@ static void write_state(struct smoke_state *state, const char *status,
                      sizeof(heaven_d24s8_linear_border_values),
                      state->heaven_d24s8_linear_border_values,
                      WINEHUA_D24_BORDER_CASES);
+    format_hex_array(bc_matrix_values, sizeof(bc_matrix_values),
+                     (const UINT *)state->bc_matrix_values,
+                     WINEHUA_BC_MATRIX_FORMATS * 2);
     snprintf(metrics, sizeof(metrics),
              "{\"d3dBackend\":\"dxvk_legacy\",\"dxvkVersion\":\"%s\","
              "\"d3d11Module\":\"%s\",\"dxgiModule\":\"%s\","
@@ -434,7 +438,7 @@ static void write_state(struct smoke_state *state, const char *status,
             "\"shaderModel\":\"5.0\",\"shaderModel5\":%s,"
             "\"drawIndexedInstanced\":%s,\"instanceCount\":2,"
             "\"offscreenRenderTarget\":%s,\"bcSamplingSubmitted\":%s,\"bcSamplingFunctional\":%s,"
-            "\"bcFormatMipMatrix\":%s,"
+            "\"bcFormatMipMatrix\":%s,\"bcFormatMatrixValues\":[%s],"
             "\"msaa4xSupported\":%s,\"msaaResolveFunctional\":%s,"
             "\"computeShaderDispatch\":%s,\"computeUavSubmitted\":%s,\"computeUavFunctional\":%s,"
             "\"computeSampledImageFunctional\":%s,"
@@ -525,6 +529,7 @@ static void write_state(struct smoke_state *state, const char *status,
             state->bc_sampling_submitted ? "true" : "false",
             state->bc_sampling_functional ? "true" : "false",
             state->bc_matrix_functional ? "true" : "false",
+            bc_matrix_values,
             state->msaa4x_supported ? "true" : "false",
             state->msaa_resolve_functional ? "true" : "false",
             state->compute_dispatch_ready ? "true" : "false",
@@ -836,6 +841,20 @@ static BOOL create_bc_matrix_resources(struct smoke_state *state)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
+    static const unsigned char bc4_snorm_neg[8] = {
+        0x81, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    static const unsigned char bc4_snorm_zero[8] = {
+        0x00, 0x7f, 0x49, 0x92, 0x24, 0x49, 0x92, 0x24
+    };
+    static const unsigned char bc5_snorm_neg[16] = {
+        0x81, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x81, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    static const unsigned char bc5_snorm_zero_pos[16] = {
+        0x00, 0x7f, 0x49, 0x92, 0x24, 0x49, 0x92, 0x24,
+        0x7f, 0x00, 0x49, 0x92, 0x24, 0x49, 0x92, 0x24
+    };
     static const struct
     {
         DXGI_FORMAT format;
@@ -849,6 +868,8 @@ static BOOL create_bc_matrix_resources(struct smoke_state *state)
         {DXGI_FORMAT_BC3_UNORM_SRGB, bc3_red,    bc3_green,16},
         {DXGI_FORMAT_BC4_UNORM,      bc4_red,    bc4_half_red, 8},
         {DXGI_FORMAT_BC5_UNORM,      bc5_yellow, bc5_green,16},
+        {DXGI_FORMAT_BC4_SNORM,      bc4_snorm_neg, bc4_snorm_zero, 8},
+        {DXGI_FORMAT_BC5_SNORM,      bc5_snorm_neg, bc5_snorm_zero_pos,16},
     };
     D3D11_SAMPLER_DESC sampler_desc = {0};
     UINT i;
@@ -1844,14 +1865,17 @@ static BOOL run_bc_matrix_probes(struct smoke_state *state)
     static const char *names[WINEHUA_BC_MATRIX_FORMATS] = {
         "BC1_UNORM", "BC1_SRGB", "BC3_UNORM",
         "BC3_SRGB", "BC4_UNORM", "BC5_UNORM",
+        "BC4_SNORM", "BC5_SNORM",
     };
     static const UINT mip0_expected[WINEHUA_BC_MATRIX_FORMATS] = {
         0xff0000ffu, 0xff0000ffu, 0xff0000ffu,
         0xff0000ffu, 0xff0000ffu, 0xff00ffffu,
+        0xff000000u, 0xff000000u,
     };
     static const UINT mip1_expected[WINEHUA_BC_MATRIX_FORMATS] = {
         0xff00ff00u, 0xffff0000u, 0xffff0000u,
         0xff00ff00u, 0xff000080u, 0xff00ff00u,
+        0xff0000ffu, 0xff0000ffu,
     };
     char label[64];
     BOOL pass = TRUE;
