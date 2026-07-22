@@ -35,6 +35,14 @@ struct cube_constants
 #define WINEHUA_FEATURE_PROBE_SIZE 64
 #define WINEHUA_RGBA_EXPECTED 0xff332211u
 #define WINEHUA_RGBA_MARKER 0xdeadbeefu
+#define WINEHUA_TEXTURE3D_SIZE 4
+#define WINEHUA_TEXTURE3D_TEXELS (WINEHUA_TEXTURE3D_SIZE * WINEHUA_TEXTURE3D_SIZE * WINEHUA_TEXTURE3D_SIZE)
+#define WINEHUA_BC_MATRIX_FORMATS 6
+#define WINEHUA_HEAVEN_CUBE_FORMATS 5
+#define WINEHUA_D24_ARRAY_LAYERS 6
+#define WINEHUA_D24_CUBE_ARRAY_LAYERS 12
+#define WINEHUA_D24_BORDER_CASES 4
+#define WINEHUA_D24_EXTENDED_CASES 7
 
 struct smoke_state
 {
@@ -61,18 +69,27 @@ struct smoke_state
     ID3D11PixelShader *rgba_sample_pixel_shader;
     ID3D11PixelShader *rgba_load_pixel_shader;
     ID3D11PixelShader *descriptor_identity_pixel_shader;
+    ID3D11PixelShader *sampler_pair_pixel_shader;
     ID3D11PixelShader *subresource_pixel_shader;
     ID3D11PixelShader *stencil_overlay_pixel_shader;
     ID3D11ComputeShader *compute_shader;
     ID3D11ComputeShader *rgba_sample_compute_shader;
     ID3D11ComputeShader *rgba_load_compute_shader;
+    ID3D11ComputeShader *texture3d_pingpong_compute_shader;
+    ID3D11ComputeShader *texture3d_oob_compute_shader;
+    ID3D11ComputeShader *texture3d_border_compute_shader;
     ID3D11Texture2D *bc_texture;
     ID3D11ShaderResourceView *bc_srv;
     ID3D11SamplerState *bc_sampler;
+    ID3D11Texture2D *bc_matrix_textures[WINEHUA_BC_MATRIX_FORMATS];
+    ID3D11ShaderResourceView *bc_matrix_srvs[WINEHUA_BC_MATRIX_FORMATS];
+    ID3D11SamplerState *bc_mip_sampler;
     ID3D11Texture2D *pattern_texture;
     ID3D11Texture2D *pattern_staging;
     ID3D11ShaderResourceView *pattern_srv;
     ID3D11SamplerState *linear_sampler;
+    ID3D11SamplerState *border_point_sampler;
+    ID3D11SamplerState *border_linear_sampler;
     ID3D11Texture2D *rgba_texture;
     ID3D11ShaderResourceView *rgba_srv;
     ID3D11Texture2D *rgba_updated_texture;
@@ -90,6 +107,12 @@ struct smoke_state
     ID3D11ShaderResourceView *compute_srv;
     ID3D11UnorderedAccessView *compute_uav;
     ID3D11Texture2D *compute_staging;
+    ID3D11Texture3D *texture3d[2];
+    ID3D11ShaderResourceView *texture3d_srvs[2];
+    ID3D11UnorderedAccessView *texture3d_uavs[2];
+    ID3D11Texture3D *texture3d_staging;
+    ID3D11Texture3D *texture3d_border;
+    ID3D11ShaderResourceView *texture3d_border_srv;
     ID3D11Texture2D *subresource_texture;
     ID3D11ShaderResourceView *subresource_srv;
     ID3D11BlendState *blend_state;
@@ -116,12 +139,22 @@ struct smoke_state
     BOOL offscreen_render_ready;
     BOOL bc_sampling_submitted;
     BOOL bc_sampling_functional;
+    BOOL bc_matrix_functional;
     BOOL msaa4x_supported;
     BOOL msaa_resolve_functional;
     BOOL compute_dispatch_ready;
     BOOL compute_uav_submitted;
     BOOL compute_uav_functional;
     BOOL compute_sampled_functional;
+    BOOL texture3d_created;
+    BOOL texture3d_upload_functional;
+    BOOL texture3d_single_dispatch_functional;
+    BOOL texture3d_uav_to_srv_functional;
+    BOOL texture3d_pingpong_functional;
+    BOOL texture3d_oob_load_functional;
+    BOOL texture3d_oob_index_functional;
+    BOOL texture3d_border_point_functional;
+    BOOL texture3d_border_linear_functional;
     BOOL texture_sampling_functional;
     BOOL rgba_load_ps_functional;
     BOOL rgba_load_cs_functional;
@@ -138,11 +171,28 @@ struct smoke_state
     BOOL descriptor_rebind_functional;
     BOOL descriptor_unbound_functional;
     BOOL descriptor_lifetime_functional;
+    BOOL sampler_pair_functional;
     BOOL subresource_array_functional;
     BOOL subresource_mip_functional;
     BOOL subresource_explicit_lod_functional;
     BOOL subresource_barrier_functional;
     BOOL subresource_functional;
+    BOOL heaven_cube_cases[WINEHUA_HEAVEN_CUBE_FORMATS];
+    BOOL heaven_cube_functional;
+    BOOL heaven_texture3d_r8_functional;
+    BOOL heaven_texture3d_rg8_functional;
+    BOOL heaven_comparison_sampler_functional;
+    BOOL heaven_depth_comparison_sampler_functional;
+    BOOL heaven_d24s8_depth_comparison_sampler_functional;
+    BOOL heaven_d24s8_array_functional;
+    BOOL heaven_d24s8_array_views_functional;
+    BOOL heaven_d24s8_cube_as_array_functional;
+    BOOL heaven_d24s8_cube_sample_functional;
+    BOOL heaven_d24s8_cube_functional;
+    BOOL heaven_d24s8_cube_array_functional;
+    BOOL heaven_d24s8_linear_border_functional;
+    BOOL heaven_d24s8_extended_functional;
+    BOOL heaven_resource_functional;
     BOOL stencil_functional;
     BOOL stencil_pixel_functional;
     BOOL stencil_query_pending;
@@ -161,12 +211,38 @@ struct smoke_state
     UINT rgba_updated_load_cs_value;
     UINT rgba_updated_point_ps_value;
     UINT rgba_updated_point_cs_value;
+    UINT bc_matrix_values[WINEHUA_BC_MATRIX_FORMATS][2];
     UINT descriptor_identity_values[4];
     UINT descriptor_rebind_values[4];
     UINT descriptor_unbound_values[4];
     UINT descriptor_lifetime_values[4];
+    UINT sampler_pair_values[4];
     UINT subresource_initial_values[4];
     UINT subresource_updated_values[4];
+    UINT heaven_cube_mismatches[WINEHUA_HEAVEN_CUBE_FORMATS];
+    UINT heaven_texture3d_r8_values[4];
+    UINT heaven_texture3d_rg8_values[4];
+    UINT heaven_comparison_sampler_values[4];
+    UINT heaven_depth_comparison_sampler_values[4];
+    UINT heaven_d24s8_depth_comparison_sampler_values[4];
+    UINT heaven_d24s8_array_values[WINEHUA_D24_ARRAY_LAYERS];
+    UINT heaven_d24s8_array_view_values[WINEHUA_D24_ARRAY_LAYERS];
+    UINT heaven_d24s8_cube_as_array_values[WINEHUA_D24_ARRAY_LAYERS];
+    UINT heaven_d24s8_cube_sample_values[WINEHUA_D24_ARRAY_LAYERS];
+    UINT heaven_d24s8_cube_values[WINEHUA_D24_ARRAY_LAYERS];
+    UINT heaven_d24s8_cube_array_values[WINEHUA_D24_CUBE_ARRAY_LAYERS];
+    UINT heaven_d24s8_linear_border_values[WINEHUA_D24_BORDER_CASES];
+    UINT heaven_d24s8_extended_mismatches[WINEHUA_D24_EXTENDED_CASES];
+    UINT texture3d_upload_mismatches;
+    UINT texture3d_single_mismatches;
+    UINT texture3d_pingpong_mismatches;
+    UINT texture3d_oob_load_mismatches;
+    UINT texture3d_oob_index_mismatches;
+    UINT texture3d_border_point_mismatches;
+    UINT texture3d_border_linear_mismatches;
+    UINT texture3d_oob_values[16];
+    UINT texture3d_border_point_values[12];
+    UINT texture3d_border_linear_values[12];
     UINT64 stencil_samples;
     HRESULT present_result;
     D3D_FEATURE_LEVEL feature_level;
@@ -232,6 +308,27 @@ static BOOL module_is_managed_dxvk(const char *path)
     return strstr(normalized_path, normalized_root) != NULL;
 }
 
+static void format_hex_array(char *output, size_t output_size,
+                             const UINT *values, UINT count)
+{
+    size_t written = 0;
+    UINT i;
+
+    if (!output_size) return;
+    output[0] = 0;
+    for (i = 0; i < count && written + 1 < output_size; ++i)
+    {
+        int result = snprintf(output + written, output_size - written,
+                              "%s\"0x%08x\"", i ? "," : "", values[i]);
+        if (result < 0 || (size_t)result >= output_size - written)
+        {
+            output[output_size - 1] = 0;
+            return;
+        }
+        written += (size_t)result;
+    }
+}
+
 static BOOL dxvk_modules_loaded(struct smoke_state *state)
 {
     module_path("d3d11.dll", state->d3d11_module, sizeof(state->d3d11_module));
@@ -246,13 +343,79 @@ static void write_state(struct smoke_state *state, const char *status,
                         const char *stage, const char *message)
 {
     char d3d11_module[MAX_PATH], dxgi_module[MAX_PATH];
-    char metrics[8192];
+    char metrics[24576];
+    char texture3d_oob_values[256];
+    char texture3d_border_point_values[192];
+    char texture3d_border_linear_values[192];
+    char heaven_texture3d_r8_values[96];
+    char heaven_texture3d_rg8_values[96];
+    char heaven_comparison_sampler_values[96];
+    char heaven_depth_comparison_sampler_values[96];
+    char heaven_d24s8_depth_comparison_sampler_values[96];
+    char heaven_d24s8_array_values[128];
+    char heaven_d24s8_array_view_values[128];
+    char heaven_d24s8_cube_as_array_values[128];
+    char heaven_d24s8_cube_sample_values[128];
+    char heaven_d24s8_cube_values[128];
+    char heaven_d24s8_cube_array_values[256];
+    char heaven_d24s8_linear_border_values[96];
     const char *version = winehua_smoke_env("WINEHUA_DXVK_VERSION", "unknown");
     BOOL dxvk_loaded;
 
     dxvk_loaded = dxvk_modules_loaded(state);
     safe_json_text(d3d11_module, sizeof(d3d11_module), state->d3d11_module);
     safe_json_text(dxgi_module, sizeof(dxgi_module), state->dxgi_module);
+    format_hex_array(texture3d_oob_values, sizeof(texture3d_oob_values),
+                     state->texture3d_oob_values, 16);
+    format_hex_array(texture3d_border_point_values,
+                     sizeof(texture3d_border_point_values),
+                     state->texture3d_border_point_values, 12);
+    format_hex_array(texture3d_border_linear_values,
+                     sizeof(texture3d_border_linear_values),
+                     state->texture3d_border_linear_values, 12);
+    format_hex_array(heaven_texture3d_r8_values,
+                     sizeof(heaven_texture3d_r8_values),
+                     state->heaven_texture3d_r8_values, 4);
+    format_hex_array(heaven_texture3d_rg8_values,
+                     sizeof(heaven_texture3d_rg8_values),
+                     state->heaven_texture3d_rg8_values, 4);
+    format_hex_array(heaven_comparison_sampler_values,
+                     sizeof(heaven_comparison_sampler_values),
+                     state->heaven_comparison_sampler_values, 4);
+    format_hex_array(heaven_depth_comparison_sampler_values,
+                     sizeof(heaven_depth_comparison_sampler_values),
+                     state->heaven_depth_comparison_sampler_values, 4);
+    format_hex_array(heaven_d24s8_depth_comparison_sampler_values,
+                     sizeof(heaven_d24s8_depth_comparison_sampler_values),
+                     state->heaven_d24s8_depth_comparison_sampler_values, 4);
+    format_hex_array(heaven_d24s8_array_values,
+                     sizeof(heaven_d24s8_array_values),
+                     state->heaven_d24s8_array_values,
+                     WINEHUA_D24_ARRAY_LAYERS);
+    format_hex_array(heaven_d24s8_array_view_values,
+                     sizeof(heaven_d24s8_array_view_values),
+                     state->heaven_d24s8_array_view_values,
+                     WINEHUA_D24_ARRAY_LAYERS);
+    format_hex_array(heaven_d24s8_cube_as_array_values,
+                     sizeof(heaven_d24s8_cube_as_array_values),
+                     state->heaven_d24s8_cube_as_array_values,
+                     WINEHUA_D24_ARRAY_LAYERS);
+    format_hex_array(heaven_d24s8_cube_sample_values,
+                     sizeof(heaven_d24s8_cube_sample_values),
+                     state->heaven_d24s8_cube_sample_values,
+                     WINEHUA_D24_ARRAY_LAYERS);
+    format_hex_array(heaven_d24s8_cube_values,
+                     sizeof(heaven_d24s8_cube_values),
+                     state->heaven_d24s8_cube_values,
+                     WINEHUA_D24_ARRAY_LAYERS);
+    format_hex_array(heaven_d24s8_cube_array_values,
+                     sizeof(heaven_d24s8_cube_array_values),
+                     state->heaven_d24s8_cube_array_values,
+                     WINEHUA_D24_CUBE_ARRAY_LAYERS);
+    format_hex_array(heaven_d24s8_linear_border_values,
+                     sizeof(heaven_d24s8_linear_border_values),
+                     state->heaven_d24s8_linear_border_values,
+                     WINEHUA_D24_BORDER_CASES);
     snprintf(metrics, sizeof(metrics),
              "{\"d3dBackend\":\"dxvk_legacy\",\"dxvkVersion\":\"%s\","
              "\"d3d11Module\":\"%s\",\"dxgiModule\":\"%s\","
@@ -271,6 +434,7 @@ static void write_state(struct smoke_state *state, const char *status,
             "\"shaderModel\":\"5.0\",\"shaderModel5\":%s,"
             "\"drawIndexedInstanced\":%s,\"instanceCount\":2,"
             "\"offscreenRenderTarget\":%s,\"bcSamplingSubmitted\":%s,\"bcSamplingFunctional\":%s,"
+            "\"bcFormatMipMatrix\":%s,"
             "\"msaa4xSupported\":%s,\"msaaResolveFunctional\":%s,"
             "\"computeShaderDispatch\":%s,\"computeUavSubmitted\":%s,\"computeUavFunctional\":%s,"
             "\"computeSampledImageFunctional\":%s,"
@@ -298,10 +462,45 @@ static void write_state(struct smoke_state *state, const char *status,
             "\"rebind\":{\"values\":[\"0x%08x\",\"0x%08x\",\"0x%08x\",\"0x%08x\"],\"pass\":%s},"
             "\"unbound\":{\"values\":[\"0x%08x\",\"0x%08x\",\"0x%08x\",\"0x%08x\"],\"pass\":%s},"
              "\"lifetime\":{\"values\":[\"0x%08x\",\"0x%08x\",\"0x%08x\",\"0x%08x\"],\"pass\":%s}},"
+             "\"samplerPairMatrix\":{\"shader\":\"t0-t3_shared_s0\","
+             "\"values\":[\"0x%08x\",\"0x%08x\",\"0x%08x\",\"0x%08x\"],\"pass\":%s},"
              "\"subresourceMatrix\":{\"initialValues\":[\"0x%08x\",\"0x%08x\",\"0x%08x\",\"0x%08x\"],"
              "\"updatedValues\":[\"0x%08x\",\"0x%08x\",\"0x%08x\",\"0x%08x\"],"
              "\"arrayLayers\":%s,\"mipLevels\":%s,\"explicitLod\":%s,"
              "\"barrierUpdate\":%s,\"pass\":%s},"
+             "\"texture3dMatrix\":{\"format\":\"R32G32B32A32_FLOAT\","
+             "\"created\":%s,\"upload\":%s,\"singleDispatch\":%s,"
+             "\"uavToSrvBarrier\":%s,\"pingPong\":%s,"
+             "\"uploadMismatches\":%u,\"singleMismatches\":%u,"
+             "\"pingPongMismatches\":%u,"
+             "\"oobLoad\":%s,\"oobIndex\":%s,"
+             "\"borderPoint\":%s,\"borderLinear\":%s,"
+             "\"boundaryMismatches\":[%u,%u,%u,%u],"
+             "\"oobValues\":[%s],\"borderPointValues\":[%s],"
+             "\"borderLinearValues\":[%s]},"
+             "\"heavenResourceMatrix\":{"
+             "\"cube\":{\"rgba8\":%s,\"rgba8Srgb\":%s,"
+             "\"rgba16Float\":%s,\"bc1\":%s,\"bc1Srgb\":%s,"
+             "\"mismatches\":[%u,%u,%u,%u,%u],\"pass\":%s},"
+             "\"texture3d\":{"
+             "\"r8\":{\"values\":[%s],\"pass\":%s},"
+             "\"rg8\":{\"values\":[%s],\"pass\":%s}},"
+             "\"comparisonSampler\":{\"values\":[%s],\"pass\":%s},"
+             "\"depthComparisonSampler\":{\"values\":[%s],\"pass\":%s},"
+             "\"d24s8DepthComparisonSampler\":{\"values\":[%s],\"pass\":%s},"
+             "\"d24s8ExtendedMatrix\":{"
+             "\"resourceFormat\":\"R24G8_TYPELESS\","
+             "\"dsvFormat\":\"D24_UNORM_S8_UINT\","
+             "\"srvFormat\":\"R24_UNORM_X8_TYPELESS\","
+             "\"array\":{\"values\":[%s],\"mismatches\":%u,\"pass\":%s},"
+             "\"arrayViews\":{\"values\":[%s],\"mismatches\":%u,\"pass\":%s},"
+             "\"cubeAsArray\":{\"values\":[%s],\"mismatches\":%u,\"pass\":%s},"
+             "\"cubeSample\":{\"values\":[%s],\"mismatches\":%u,\"pass\":%s},"
+             "\"cube\":{\"values\":[%s],\"mismatches\":%u,\"pass\":%s},"
+             "\"cubeArray\":{\"values\":[%s],\"mismatches\":%u,\"pass\":%s},"
+             "\"linearBorder\":{\"values\":[%s],\"mismatches\":%u,\"pass\":%s},"
+             "\"pass\":%s},"
+             "\"pass\":%s},"
              "\"decodedFormat\":\"R8G8B8A8_UNORM\",\"decodedBytes\":256,"
              "\"cpuDecodeUs\":0,\"durationMs\":%llu}",
              version, d3d11_module, dxgi_module,
@@ -325,6 +524,7 @@ static void write_state(struct smoke_state *state, const char *status,
             state->offscreen_render_ready ? "true" : "false",
             state->bc_sampling_submitted ? "true" : "false",
             state->bc_sampling_functional ? "true" : "false",
+            state->bc_matrix_functional ? "true" : "false",
             state->msaa4x_supported ? "true" : "false",
             state->msaa_resolve_functional ? "true" : "false",
             state->compute_dispatch_ready ? "true" : "false",
@@ -384,6 +584,11 @@ static void write_state(struct smoke_state *state, const char *status,
              state->descriptor_lifetime_values[2],
              state->descriptor_lifetime_values[3],
              state->descriptor_lifetime_functional ? "true" : "false",
+             state->sampler_pair_values[0],
+             state->sampler_pair_values[1],
+             state->sampler_pair_values[2],
+             state->sampler_pair_values[3],
+             state->sampler_pair_functional ? "true" : "false",
              state->subresource_initial_values[0],
              state->subresource_initial_values[1],
              state->subresource_initial_values[2],
@@ -397,6 +602,69 @@ static void write_state(struct smoke_state *state, const char *status,
              state->subresource_explicit_lod_functional ? "true" : "false",
              state->subresource_barrier_functional ? "true" : "false",
              state->subresource_functional ? "true" : "false",
+             state->texture3d_created ? "true" : "false",
+             state->texture3d_upload_functional ? "true" : "false",
+             state->texture3d_single_dispatch_functional ? "true" : "false",
+             state->texture3d_uav_to_srv_functional ? "true" : "false",
+             state->texture3d_pingpong_functional ? "true" : "false",
+             state->texture3d_upload_mismatches,
+             state->texture3d_single_mismatches,
+             state->texture3d_pingpong_mismatches,
+             state->texture3d_oob_load_functional ? "true" : "false",
+             state->texture3d_oob_index_functional ? "true" : "false",
+             state->texture3d_border_point_functional ? "true" : "false",
+             state->texture3d_border_linear_functional ? "true" : "false",
+             state->texture3d_oob_load_mismatches,
+             state->texture3d_oob_index_mismatches,
+             state->texture3d_border_point_mismatches,
+             state->texture3d_border_linear_mismatches,
+             texture3d_oob_values,
+             texture3d_border_point_values,
+             texture3d_border_linear_values,
+             state->heaven_cube_cases[0] ? "true" : "false",
+             state->heaven_cube_cases[1] ? "true" : "false",
+             state->heaven_cube_cases[2] ? "true" : "false",
+             state->heaven_cube_cases[3] ? "true" : "false",
+             state->heaven_cube_cases[4] ? "true" : "false",
+             state->heaven_cube_mismatches[0],
+             state->heaven_cube_mismatches[1],
+             state->heaven_cube_mismatches[2],
+             state->heaven_cube_mismatches[3],
+             state->heaven_cube_mismatches[4],
+             state->heaven_cube_functional ? "true" : "false",
+             heaven_texture3d_r8_values,
+             state->heaven_texture3d_r8_functional ? "true" : "false",
+             heaven_texture3d_rg8_values,
+             state->heaven_texture3d_rg8_functional ? "true" : "false",
+             heaven_comparison_sampler_values,
+             state->heaven_comparison_sampler_functional ? "true" : "false",
+             heaven_depth_comparison_sampler_values,
+             state->heaven_depth_comparison_sampler_functional ? "true" : "false",
+             heaven_d24s8_depth_comparison_sampler_values,
+             state->heaven_d24s8_depth_comparison_sampler_functional ? "true" : "false",
+             heaven_d24s8_array_values,
+             state->heaven_d24s8_extended_mismatches[0],
+             state->heaven_d24s8_array_functional ? "true" : "false",
+             heaven_d24s8_array_view_values,
+             state->heaven_d24s8_extended_mismatches[1],
+             state->heaven_d24s8_array_views_functional ? "true" : "false",
+             heaven_d24s8_cube_as_array_values,
+             state->heaven_d24s8_extended_mismatches[2],
+             state->heaven_d24s8_cube_as_array_functional ? "true" : "false",
+             heaven_d24s8_cube_sample_values,
+             state->heaven_d24s8_extended_mismatches[3],
+             state->heaven_d24s8_cube_sample_functional ? "true" : "false",
+             heaven_d24s8_cube_values,
+             state->heaven_d24s8_extended_mismatches[4],
+             state->heaven_d24s8_cube_functional ? "true" : "false",
+             heaven_d24s8_cube_array_values,
+             state->heaven_d24s8_extended_mismatches[5],
+             state->heaven_d24s8_cube_array_functional ? "true" : "false",
+             heaven_d24s8_linear_border_values,
+             state->heaven_d24s8_extended_mismatches[6],
+             state->heaven_d24s8_linear_border_functional ? "true" : "false",
+             state->heaven_d24s8_extended_functional ? "true" : "false",
+             state->heaven_resource_functional ? "true" : "false",
              winehua_smoke_timestamp_ms() - state->started_ms);
     winehua_smoke_write_result(&state->smoke, status, stage, message, metrics);
 }
@@ -433,6 +701,29 @@ static BOOL compile_shader(const char *source, const char *entry, const char *ta
     }
     if (errors) ID3D10Blob_Release(errors);
     return TRUE;
+}
+
+static ID3D11PixelShader *create_probe_pixel_shader(
+    struct smoke_state *state, const char *source, const char *name)
+{
+    ID3DBlob *blob = NULL;
+    ID3D11PixelShader *shader = NULL;
+    HRESULT result;
+
+    if (!compile_shader(source, "main", "ps_5_0", &blob))
+        return NULL;
+    result = ID3D11Device_CreatePixelShader(
+        state->device, ID3D10Blob_GetBufferPointer(blob),
+        ID3D10Blob_GetBufferSize(blob), NULL, &shader);
+    ID3D10Blob_Release(blob);
+    if (FAILED(result))
+    {
+        fprintf(stderr,
+                "winehua_d3d11_smoke: Heaven %s pixel shader failed=0x%08lx\n",
+                name, (unsigned long)result);
+        return NULL;
+    }
+    return shader;
 }
 
 static BOOL create_bc_texture(struct smoke_state *state)
@@ -505,6 +796,126 @@ static BOOL create_bc_texture(struct smoke_state *state)
     }
 
     state->bc_texture_ready = TRUE;
+    return TRUE;
+}
+
+static BOOL create_bc_matrix_resources(struct smoke_state *state)
+{
+    static const unsigned char bc1_red[8] = {
+        0x00, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    static const unsigned char bc1_green[8] = {
+        0xe0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    static const unsigned char bc1_blue[8] = {
+        0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    static const unsigned char bc3_red[16] = {
+        0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    static const unsigned char bc3_green[16] = {
+        0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xe0, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    static const unsigned char bc3_blue[16] = {
+        0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    static const unsigned char bc4_red[8] = {
+        0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    static const unsigned char bc4_half_red[8] = {
+        0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    static const unsigned char bc5_yellow[16] = {
+        0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    static const unsigned char bc5_green[16] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    static const struct
+    {
+        DXGI_FORMAT format;
+        const unsigned char *mip0;
+        const unsigned char *mip1;
+        UINT block_size;
+    } cases[WINEHUA_BC_MATRIX_FORMATS] = {
+        {DXGI_FORMAT_BC1_UNORM,      bc1_red,    bc1_green, 8},
+        {DXGI_FORMAT_BC1_UNORM_SRGB, bc1_red,    bc1_blue,  8},
+        {DXGI_FORMAT_BC3_UNORM,      bc3_red,    bc3_blue, 16},
+        {DXGI_FORMAT_BC3_UNORM_SRGB, bc3_red,    bc3_green,16},
+        {DXGI_FORMAT_BC4_UNORM,      bc4_red,    bc4_half_red, 8},
+        {DXGI_FORMAT_BC5_UNORM,      bc5_yellow, bc5_green,16},
+    };
+    D3D11_SAMPLER_DESC sampler_desc = {0};
+    UINT i;
+    HRESULT result = S_OK;
+
+    for (i = 0; i < WINEHUA_BC_MATRIX_FORMATS; ++i)
+    {
+        D3D11_TEXTURE2D_DESC desc = {0};
+        D3D11_SUBRESOURCE_DATA data[2] = {{0}};
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+
+        desc.Width = 4;
+        desc.Height = 4;
+        desc.MipLevels = 2;
+        desc.ArraySize = 1;
+        desc.Format = cases[i].format;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_IMMUTABLE;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        data[0].pSysMem = cases[i].mip0;
+        data[0].SysMemPitch = cases[i].block_size;
+        data[0].SysMemSlicePitch = cases[i].block_size;
+        data[1].pSysMem = cases[i].mip1;
+        data[1].SysMemPitch = cases[i].block_size;
+        data[1].SysMemSlicePitch = cases[i].block_size;
+
+        result = ID3D11Device_CreateTexture2D(
+            state->device, &desc, data, &state->bc_matrix_textures[i]);
+        if (FAILED(result))
+        {
+            fprintf(stderr,
+                    "winehua_d3d11_smoke: BC matrix texture %u format=%u failed=0x%08lx\n",
+                    i, (unsigned int)cases[i].format, (unsigned long)result);
+            break;
+        }
+
+        srv_desc.Format = cases[i].format;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MostDetailedMip = 0;
+        srv_desc.Texture2D.MipLevels = 2;
+        result = ID3D11Device_CreateShaderResourceView(
+            state->device, (ID3D11Resource *)state->bc_matrix_textures[i],
+            &srv_desc, &state->bc_matrix_srvs[i]);
+        if (FAILED(result))
+        {
+            fprintf(stderr,
+                    "winehua_d3d11_smoke: BC matrix SRV %u format=%u failed=0x%08lx\n",
+                    i, (unsigned int)cases[i].format, (unsigned long)result);
+            break;
+        }
+    }
+
+    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sampler_desc.MinLOD = 1.0f;
+    sampler_desc.MaxLOD = 1.0f;
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreateSamplerState(
+            state->device, &sampler_desc, &state->bc_mip_sampler);
+    if (FAILED(result))
+    {
+        state->present_result = result;
+        return FALSE;
+    }
     return TRUE;
 }
 
@@ -770,6 +1181,20 @@ static BOOL create_feature_shaders(struct smoke_state *state)
         "if (slot == 1) return tex1.Load(int3(0, 0, 0));"
         "if (slot == 2) return tex2.Load(int3(0, 0, 0));"
         "return tex3.Load(int3(0, 0, 0)); }";
+    const char *sampler_pair_source =
+        "Texture2D tex0 : register(t0);"
+        "Texture2D tex1 : register(t1);"
+        "Texture2D tex2 : register(t2);"
+        "Texture2D tex3 : register(t3);"
+        "SamplerState sharedSampler : register(s0);"
+        "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "float4 main(PSIn input) : SV_Target {"
+        "int x = input.pos.x >= 32.0; int y = input.pos.y >= 32.0;"
+        "int slot = x + (y << 1); float2 uv = float2(0.5, 0.5);"
+        "if (slot == 0) return tex0.SampleLevel(sharedSampler, uv, 0.0);"
+        "if (slot == 1) return tex1.SampleLevel(sharedSampler, uv, 0.0);"
+        "if (slot == 2) return tex2.SampleLevel(sharedSampler, uv, 0.0);"
+        "return tex3.SampleLevel(sharedSampler, uv, 0.0); }";
     const char *subresource_source =
         "Texture2DArray inputTexture : register(t0);"
         "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
@@ -813,11 +1238,62 @@ static BOOL create_feature_shaders(struct smoke_state *state)
         "else { uint checker = ((id.x / 8) + (id.y / 8)) & 1;"
         "outputTexture[id.xy] = checker ? float4(1.0, 0.10, 0.80, 1.0)"
         ": float4(0.0, 0.80, 1.0, 1.0); } }";
+    const char *texture3d_pingpong_source =
+        "Texture3D<float4> inputTexture : register(t0);"
+        "SamplerState inputSampler : register(s0);"
+        "RWTexture3D<float4> outputTexture : register(u0);"
+        "[numthreads(2, 2, 2)]"
+        "void main(uint3 id : SV_DispatchThreadID) {"
+        "float3 uv = (float3(id) + 0.5) / float3(4.0, 4.0, 4.0);"
+        "outputTexture[id] = inputTexture.SampleLevel(inputSampler, uv, 0.0)"
+        "+ float4(1.0, 2.0, 4.0, 8.0); }";
+    const char *texture3d_oob_source =
+        "Texture3D<float4> inputTexture : register(t0);"
+        "RWTexture2D<float4> outputTexture : register(u0);"
+        "[numthreads(16, 1, 1)]"
+        "void main(uint3 id : SV_DispatchThreadID) {"
+        "uint c = id.x & 7; int3 p = int3(0, 0, 0);"
+        "if (c == 0) p = int3(-1, 0, 0);"
+        "if (c == 1) p = int3(4, 0, 0);"
+        "if (c == 2) p = int3(0, -1, 0);"
+        "if (c == 3) p = int3(0, 4, 0);"
+        "if (c == 4) p = int3(0, 0, -1);"
+        "if (c == 5) p = int3(0, 0, 4);"
+        "if (c == 6) p = int3(-1, -1, -1);"
+        "if (c == 7) p = int3(4, 4, 4);"
+        "float4 value = id.x < 8 ? inputTexture.Load(int4(p, 0))"
+        " : inputTexture[(uint3)p];"
+        "outputTexture[uint2(id.x, 0)] = value;"
+        "if (id.x == 0) outputTexture[uint2(0, 1)] = float4(0, 1, 1, 1); }";
+    const char *texture3d_border_source =
+        "Texture3D<float4> inputTexture : register(t0);"
+        "SamplerState inputSampler : register(s0);"
+        "RWTexture2D<float4> outputTexture : register(u0);"
+        "[numthreads(12, 1, 1)]"
+        "void main(uint3 id : SV_DispatchThreadID) {"
+        "float3 p = float3(0.5, 0.5, 0.5);"
+        "if (id.x == 0) p = float3(-0.25, 0.5, 0.5);"
+        "if (id.x == 1) p = float3(1.25, 0.5, 0.5);"
+        "if (id.x == 2) p = float3(0.5, -0.25, 0.5);"
+        "if (id.x == 3) p = float3(0.5, 1.25, 0.5);"
+        "if (id.x == 4) p = float3(0.5, 0.5, -0.25);"
+        "if (id.x == 5) p = float3(0.5, 0.5, 1.25);"
+        "if (id.x == 7) p = float3(0.0, 0.0, 0.0);"
+        "if (id.x == 8) p = float3(0.0, 0.5, 0.5);"
+        "if (id.x == 9) p = float3(1.0, 0.5, 0.5);"
+        "if (id.x == 10) p = float3(0.0, 0.0, 0.5);"
+        "if (id.x == 11) p = float3(1.0, 1.0, 0.5);"
+        "outputTexture[uint2(id.x, 0)] ="
+        " inputTexture.SampleLevel(inputSampler, p, 0.0);"
+        "if (id.x == 0) outputTexture[uint2(0, 1)] = float4(1, 0, 1, 1); }";
     ID3DBlob *fullscreen_blob = NULL, *probe_blob = NULL;
     ID3DBlob *overlay_blob = NULL, *compute_blob = NULL;
     ID3DBlob *rgba_sample_blob = NULL, *rgba_load_blob = NULL;
-    ID3DBlob *descriptor_identity_blob = NULL, *subresource_blob = NULL;
+    ID3DBlob *descriptor_identity_blob = NULL, *sampler_pair_blob = NULL;
+    ID3DBlob *subresource_blob = NULL;
     ID3DBlob *rgba_sample_compute_blob = NULL, *rgba_load_compute_blob = NULL;
+    ID3DBlob *texture3d_pingpong_blob = NULL;
+    ID3DBlob *texture3d_oob_blob = NULL, *texture3d_border_blob = NULL;
     HRESULT result = E_FAIL;
 
     if (!compile_shader(fullscreen_source, "main", "vs_5_0", &fullscreen_blob) ||
@@ -825,11 +1301,18 @@ static BOOL create_feature_shaders(struct smoke_state *state)
         !compile_shader(rgba_sample_source, "main", "ps_5_0", &rgba_sample_blob) ||
         !compile_shader(rgba_load_source, "main", "ps_5_0", &rgba_load_blob) ||
         !compile_shader(descriptor_identity_source, "main", "ps_5_0", &descriptor_identity_blob) ||
+        !compile_shader(sampler_pair_source, "main", "ps_5_0", &sampler_pair_blob) ||
         !compile_shader(subresource_source, "main", "ps_5_0", &subresource_blob) ||
         !compile_shader(stencil_overlay_source, "main", "ps_5_0", &overlay_blob) ||
         !compile_shader(compute_source, "main", "cs_5_0", &compute_blob) ||
         !compile_shader(rgba_sample_compute_source, "main", "cs_5_0", &rgba_sample_compute_blob) ||
-        !compile_shader(rgba_load_compute_source, "main", "cs_5_0", &rgba_load_compute_blob))
+        !compile_shader(rgba_load_compute_source, "main", "cs_5_0", &rgba_load_compute_blob) ||
+        !compile_shader(texture3d_pingpong_source, "main", "cs_5_0",
+                        &texture3d_pingpong_blob) ||
+        !compile_shader(texture3d_oob_source, "main", "cs_5_0",
+                        &texture3d_oob_blob) ||
+        !compile_shader(texture3d_border_source, "main", "cs_5_0",
+                        &texture3d_border_blob))
         goto done;
 
     result = ID3D11Device_CreateVertexShader(
@@ -851,6 +1334,11 @@ static BOOL create_feature_shaders(struct smoke_state *state)
             state->device, ID3D10Blob_GetBufferPointer(descriptor_identity_blob),
             ID3D10Blob_GetBufferSize(descriptor_identity_blob), NULL,
             &state->descriptor_identity_pixel_shader);
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreatePixelShader(
+            state->device, ID3D10Blob_GetBufferPointer(sampler_pair_blob),
+            ID3D10Blob_GetBufferSize(sampler_pair_blob), NULL,
+            &state->sampler_pair_pixel_shader);
     if (SUCCEEDED(result))
         result = ID3D11Device_CreatePixelShader(
             state->device, ID3D10Blob_GetBufferPointer(subresource_blob),
@@ -881,6 +1369,21 @@ static BOOL create_feature_shaders(struct smoke_state *state)
             state->device, ID3D10Blob_GetBufferPointer(rgba_load_compute_blob),
             ID3D10Blob_GetBufferSize(rgba_load_compute_blob), NULL,
             &state->rgba_load_compute_shader);
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreateComputeShader(
+            state->device, ID3D10Blob_GetBufferPointer(texture3d_pingpong_blob),
+            ID3D10Blob_GetBufferSize(texture3d_pingpong_blob), NULL,
+            &state->texture3d_pingpong_compute_shader);
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreateComputeShader(
+            state->device, ID3D10Blob_GetBufferPointer(texture3d_oob_blob),
+            ID3D10Blob_GetBufferSize(texture3d_oob_blob), NULL,
+            &state->texture3d_oob_compute_shader);
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreateComputeShader(
+            state->device, ID3D10Blob_GetBufferPointer(texture3d_border_blob),
+            ID3D10Blob_GetBufferSize(texture3d_border_blob), NULL,
+            &state->texture3d_border_compute_shader);
 
 done:
     if (fullscreen_blob) ID3D10Blob_Release(fullscreen_blob);
@@ -890,15 +1393,31 @@ done:
     if (rgba_sample_blob) ID3D10Blob_Release(rgba_sample_blob);
     if (rgba_load_blob) ID3D10Blob_Release(rgba_load_blob);
     if (descriptor_identity_blob) ID3D10Blob_Release(descriptor_identity_blob);
+    if (sampler_pair_blob) ID3D10Blob_Release(sampler_pair_blob);
     if (subresource_blob) ID3D10Blob_Release(subresource_blob);
     if (rgba_sample_compute_blob) ID3D10Blob_Release(rgba_sample_compute_blob);
     if (rgba_load_compute_blob) ID3D10Blob_Release(rgba_load_compute_blob);
+    if (texture3d_pingpong_blob) ID3D10Blob_Release(texture3d_pingpong_blob);
+    if (texture3d_oob_blob) ID3D10Blob_Release(texture3d_oob_blob);
+    if (texture3d_border_blob) ID3D10Blob_Release(texture3d_border_blob);
     if (FAILED(result))
     {
         state->present_result = result;
         return FALSE;
     }
     return TRUE;
+}
+
+static void fill_texture3d_initial(float values[WINEHUA_TEXTURE3D_TEXELS][4])
+{
+    UINT i;
+    for (i = 0; i < WINEHUA_TEXTURE3D_TEXELS; ++i)
+    {
+        values[i][0] = (float)i;
+        values[i][1] = (float)(i + 64);
+        values[i][2] = (float)(i + 128);
+        values[i][3] = (float)(i + 192);
+    }
 }
 
 static BOOL create_feature_resources(struct smoke_state *state)
@@ -1050,6 +1569,106 @@ static BOOL create_feature_resources(struct smoke_state *state)
         result = ID3D11Device_CreateTexture2D(state->device, &desc, NULL,
                                                &state->compute_staging);
 
+    if (SUCCEEDED(result))
+    {
+        D3D11_TEXTURE3D_DESC texture_desc = {0};
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {0};
+        D3D11_SAMPLER_DESC sampler_desc = {0};
+        D3D11_SUBRESOURCE_DATA initial_data = {0};
+        D3D11_SUBRESOURCE_DATA border_data = {0};
+        float initial_values[WINEHUA_TEXTURE3D_TEXELS][4];
+        float border_values[WINEHUA_TEXTURE3D_TEXELS][4];
+        UINT i;
+
+        fill_texture3d_initial(initial_values);
+        for (i = 0; i < WINEHUA_TEXTURE3D_TEXELS; ++i)
+            border_values[i][0] = border_values[i][1] =
+            border_values[i][2] = border_values[i][3] = 0.25f;
+        texture_desc.Width = WINEHUA_TEXTURE3D_SIZE;
+        texture_desc.Height = WINEHUA_TEXTURE3D_SIZE;
+        texture_desc.Depth = WINEHUA_TEXTURE3D_SIZE;
+        texture_desc.MipLevels = 1;
+        texture_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        texture_desc.Usage = D3D11_USAGE_DEFAULT;
+        texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE |
+                                 D3D11_BIND_UNORDERED_ACCESS;
+        initial_data.pSysMem = initial_values;
+        initial_data.SysMemPitch = WINEHUA_TEXTURE3D_SIZE * 4 * sizeof(float);
+        initial_data.SysMemSlicePitch = WINEHUA_TEXTURE3D_SIZE *
+                                        initial_data.SysMemPitch;
+
+        result = ID3D11Device_CreateTexture3D(
+            state->device, &texture_desc, &initial_data, &state->texture3d[0]);
+        if (SUCCEEDED(result))
+            result = ID3D11Device_CreateTexture3D(
+                state->device, &texture_desc, NULL, &state->texture3d[1]);
+
+        srv_desc.Format = texture_desc.Format;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
+        srv_desc.Texture3D.MostDetailedMip = 0;
+        srv_desc.Texture3D.MipLevels = 1;
+        uav_desc.Format = texture_desc.Format;
+        uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE3D;
+        uav_desc.Texture3D.FirstWSlice = 0;
+        uav_desc.Texture3D.WSize = WINEHUA_TEXTURE3D_SIZE;
+        for (i = 0; SUCCEEDED(result) && i < 2; ++i)
+        {
+            result = ID3D11Device_CreateShaderResourceView(
+                state->device, (ID3D11Resource *)state->texture3d[i],
+                &srv_desc, &state->texture3d_srvs[i]);
+            if (SUCCEEDED(result))
+                result = ID3D11Device_CreateUnorderedAccessView(
+                    state->device, (ID3D11Resource *)state->texture3d[i],
+                    &uav_desc, &state->texture3d_uavs[i]);
+        }
+
+        texture_desc.Usage = D3D11_USAGE_STAGING;
+        texture_desc.BindFlags = 0;
+        texture_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (SUCCEEDED(result))
+            result = ID3D11Device_CreateTexture3D(
+                state->device, &texture_desc, NULL, &state->texture3d_staging);
+
+        texture_desc.Usage = D3D11_USAGE_IMMUTABLE;
+        texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        texture_desc.CPUAccessFlags = 0;
+        border_data.pSysMem = border_values;
+        border_data.SysMemPitch = WINEHUA_TEXTURE3D_SIZE * 4 * sizeof(float);
+        border_data.SysMemSlicePitch = WINEHUA_TEXTURE3D_SIZE *
+                                       border_data.SysMemPitch;
+        if (SUCCEEDED(result))
+            result = ID3D11Device_CreateTexture3D(
+                state->device, &texture_desc, &border_data,
+                &state->texture3d_border);
+        if (SUCCEEDED(result))
+            result = ID3D11Device_CreateShaderResourceView(
+                state->device, (ID3D11Resource *)state->texture3d_border,
+                &srv_desc, &state->texture3d_border_srv);
+
+        sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
+        sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
+        sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+        sampler_desc.MipLODBias = 0.0f;
+        sampler_desc.MaxAnisotropy = 1;
+        sampler_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sampler_desc.BorderColor[0] = 0.5f;
+        sampler_desc.BorderColor[1] = 0.5f;
+        sampler_desc.BorderColor[2] = 0.5f;
+        sampler_desc.BorderColor[3] = 0.5f;
+        sampler_desc.MinLOD = 0.0f;
+        sampler_desc.MaxLOD = 0.0f;
+        if (SUCCEEDED(result))
+            result = ID3D11Device_CreateSamplerState(
+                state->device, &sampler_desc, &state->border_point_sampler);
+        sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        if (SUCCEEDED(result))
+            result = ID3D11Device_CreateSamplerState(
+                state->device, &sampler_desc, &state->border_linear_sampler);
+        if (SUCCEEDED(result)) state->texture3d_created = TRUE;
+    }
+
     if (state->query_enabled)
     {
         query_desc.Query = D3D11_QUERY_OCCLUSION;
@@ -1158,11 +1777,12 @@ static UINT rgba8_value(const D3D11_MAPPED_SUBRESOURCE *mapped, UINT x, UINT y)
            ((UINT)pixel[2] << 16) | ((UINT)pixel[3] << 24);
 }
 
-static BOOL run_rgba_ps_probe(struct smoke_state *state,
-                              ID3D11ShaderResourceView *resource,
-                              ID3D11PixelShader *shader,
-                              ID3D11SamplerState *sampler,
-                              const char *name, UINT *sampled_value)
+static BOOL run_texture_ps_probe(struct smoke_state *state,
+                                 ID3D11ShaderResourceView *resource,
+                                 ID3D11PixelShader *shader,
+                                 ID3D11SamplerState *sampler,
+                                 const char *name, UINT expected,
+                                 UINT *sampled_value)
 {
     static const float marker[4] = {
         239.0f / 255.0f, 190.0f / 255.0f,
@@ -1205,7 +1825,7 @@ static BOOL run_rgba_ps_probe(struct smoke_state *state,
         state->context, (ID3D11Resource *)state->probe_staging, 0,
         D3D11_MAP_READ, 0, &mapped);
     if (FAILED(result)) {
-        fprintf(stderr, "winehua_d3d11_smoke: RGBA %s PS map failed=0x%08lx\\n",
+        fprintf(stderr, "winehua_d3d11_smoke: texture %s PS map failed=0x%08lx\\n",
                 name, (unsigned long)result);
         return FALSE;
     }
@@ -1214,9 +1834,48 @@ static BOOL run_rgba_ps_probe(struct smoke_state *state,
         state->context, (ID3D11Resource *)state->probe_staging, 0);
     state->feature_probe_read_bytes += WINEHUA_FEATURE_PROBE_SIZE *
                                        WINEHUA_FEATURE_PROBE_SIZE * 4;
-    fprintf(stderr, "winehua_d3d11_smoke: RGBA %s PS value=0x%08x expected=0x%08x\\n",
-            name, *sampled_value, WINEHUA_RGBA_EXPECTED);
-    return *sampled_value == WINEHUA_RGBA_EXPECTED;
+    fprintf(stderr, "winehua_d3d11_smoke: texture %s PS value=0x%08x expected=0x%08x\\n",
+            name, *sampled_value, expected);
+    return *sampled_value == expected;
+}
+
+static BOOL run_bc_matrix_probes(struct smoke_state *state)
+{
+    static const char *names[WINEHUA_BC_MATRIX_FORMATS] = {
+        "BC1_UNORM", "BC1_SRGB", "BC3_UNORM",
+        "BC3_SRGB", "BC4_UNORM", "BC5_UNORM",
+    };
+    static const UINT mip0_expected[WINEHUA_BC_MATRIX_FORMATS] = {
+        0xff0000ffu, 0xff0000ffu, 0xff0000ffu,
+        0xff0000ffu, 0xff0000ffu, 0xff00ffffu,
+    };
+    static const UINT mip1_expected[WINEHUA_BC_MATRIX_FORMATS] = {
+        0xff00ff00u, 0xffff0000u, 0xffff0000u,
+        0xff00ff00u, 0xff000080u, 0xff00ff00u,
+    };
+    char label[64];
+    BOOL pass = TRUE;
+    UINT i;
+
+    for (i = 0; i < WINEHUA_BC_MATRIX_FORMATS; ++i)
+    {
+        snprintf(label, sizeof(label), "%s mip0", names[i]);
+        if (!run_texture_ps_probe(
+                state, state->bc_matrix_srvs[i],
+                state->rgba_sample_pixel_shader, state->bc_sampler,
+                label, mip0_expected[i], &state->bc_matrix_values[i][0]))
+            pass = FALSE;
+
+        snprintf(label, sizeof(label), "%s mip1", names[i]);
+        if (!run_texture_ps_probe(
+                state, state->bc_matrix_srvs[i],
+                state->rgba_sample_pixel_shader, state->bc_mip_sampler,
+                label, mip1_expected[i], &state->bc_matrix_values[i][1]))
+            pass = FALSE;
+    }
+
+    state->bc_matrix_functional = pass;
+    return pass;
 }
 
 static BOOL run_rgba_cs_probe(struct smoke_state *state,
@@ -1288,7 +1947,9 @@ static BOOL run_descriptor_identity_pass(
     UINT *values,
     const char *name,
     ID3D11Texture2D *release_texture,
-    ID3D11ShaderResourceView *release_srv)
+    ID3D11ShaderResourceView *release_srv,
+    ID3D11PixelShader *pixel_shader,
+    ID3D11SamplerState *sampler)
 {
     static const float marker[4] = {
         239.0f / 255.0f, 190.0f / 255.0f,
@@ -1298,6 +1959,8 @@ static BOOL run_descriptor_identity_pass(
                                WINEHUA_FEATURE_PROBE_SIZE, 0.0f, 1.0f};
     ID3D11RenderTargetView *targets[] = {state->probe_rtv};
     ID3D11ShaderResourceView *null_resources[] = {NULL, NULL, NULL, NULL};
+    ID3D11SamplerState *samplers[] = {sampler};
+    ID3D11SamplerState *null_samplers[] = {NULL};
     D3D11_MAPPED_SUBRESOURCE mapped;
     HRESULT result;
     UINT x[4] = {16, 48, 16, 48};
@@ -1314,8 +1977,12 @@ static BOOL run_descriptor_identity_pass(
     ID3D11DeviceContext_VSSetShader(
         state->context, state->fullscreen_vertex_shader, NULL, 0);
     ID3D11DeviceContext_PSSetShader(
-        state->context, state->descriptor_identity_pixel_shader, NULL, 0);
+        state->context, pixel_shader ? pixel_shader
+                                     : state->descriptor_identity_pixel_shader,
+        NULL, 0);
     ID3D11DeviceContext_PSSetShaderResources(state->context, 0, 4, resources);
+    if (sampler)
+        ID3D11DeviceContext_PSSetSamplers(state->context, 0, 1, samplers);
 
     /* Drop the application's final references after binding.  The immediate
      * context must retain the SRV/resource through the draw and descriptor
@@ -1326,6 +1993,9 @@ static BOOL run_descriptor_identity_pass(
     ID3D11DeviceContext_Draw(state->context, 3, 0);
     ID3D11DeviceContext_PSSetShaderResources(
         state->context, 0, 4, null_resources);
+    if (sampler)
+        ID3D11DeviceContext_PSSetSamplers(
+            state->context, 0, 1, null_samplers);
     ID3D11DeviceContext_PSSetShader(state->context, NULL, NULL, 0);
     ID3D11DeviceContext_OMSetRenderTargets(state->context, 0, NULL, NULL);
     ID3D11DeviceContext_CopyResource(
@@ -1388,14 +2058,14 @@ static BOOL run_descriptor_identity_probes(struct smoke_state *state)
 
     state->descriptor_identity_functional = run_descriptor_identity_pass(
         state, initial, colors, state->descriptor_identity_values,
-        "initial", NULL, NULL);
+        "initial", NULL, NULL, NULL, NULL);
     state->descriptor_rebind_functional = run_descriptor_identity_pass(
         state, rebind, rebind[0] == state->descriptor_srvs[3] ?
         (const UINT[]){0xff00ffffu, 0xffff0000u, 0xff00ff00u, 0xff0000ffu} : colors,
-        state->descriptor_rebind_values, "rebind", NULL, NULL);
+        state->descriptor_rebind_values, "rebind", NULL, NULL, NULL, NULL);
     state->descriptor_unbound_functional = run_descriptor_identity_pass(
         state, unbound, unbound_expected, state->descriptor_unbound_values,
-        "unbound", NULL, NULL);
+        "unbound", NULL, NULL, NULL, NULL);
 
     if (!create_solid_rgba_texture(state, 0xffff00ffu,
                                    &lifetime_texture, &lifetime_srv))
@@ -1406,11 +2076,24 @@ static BOOL run_descriptor_identity_probes(struct smoke_state *state)
     lifetime[3] = state->descriptor_srvs[3];
     state->descriptor_lifetime_functional = run_descriptor_identity_pass(
         state, lifetime, lifetime_expected, state->descriptor_lifetime_values,
-        "lifetime", lifetime_texture, lifetime_srv);
+        "lifetime", lifetime_texture, lifetime_srv, NULL, NULL);
     return state->descriptor_identity_functional &&
            state->descriptor_rebind_functional &&
            state->descriptor_unbound_functional &&
            state->descriptor_lifetime_functional;
+}
+
+static BOOL run_sampler_pair_probe(struct smoke_state *state)
+{
+    static const UINT expected[4] = {
+        0xff0000ffu, 0xff00ff00u, 0xffff0000u, 0xff00ffffu,
+    };
+
+    state->sampler_pair_functional = run_descriptor_identity_pass(
+        state, state->descriptor_srvs, expected, state->sampler_pair_values,
+        "shared-s0", NULL, NULL, state->sampler_pair_pixel_shader,
+        state->point_sampler);
+    return state->sampler_pair_functional;
 }
 
 static BOOL run_subresource_pass(struct smoke_state *state,
@@ -1542,6 +2225,1329 @@ static BOOL run_subresource_probes(struct smoke_state *state)
     return state->subresource_functional;
 }
 
+static BOOL validate_texture3d(struct smoke_state *state,
+                               ID3D11Texture3D *texture,
+                               UINT dispatch_count, UINT *mismatch_count,
+                               const char *name)
+{
+    static const float delta[4] = {1.0f, 2.0f, 4.0f, 8.0f};
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT result;
+    UINT x, y, z, component, mismatches = 0;
+    float first_actual[4] = {0}, first_expected[4] = {0};
+
+    ID3D11DeviceContext_CopyResource(
+        state->context, (ID3D11Resource *)state->texture3d_staging,
+        (ID3D11Resource *)texture);
+    state->feature_probe_gpu_copies++;
+    ID3D11DeviceContext_Flush(state->context);
+    result = ID3D11DeviceContext_Map(
+        state->context, (ID3D11Resource *)state->texture3d_staging, 0,
+        D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(result))
+    {
+        *mismatch_count = ~0u;
+        fprintf(stderr,
+                "winehua_d3d11_smoke: Texture3D %s map failed=0x%08lx\n",
+                name, (unsigned long)result);
+        return FALSE;
+    }
+
+    for (z = 0; z < WINEHUA_TEXTURE3D_SIZE; ++z)
+    {
+        for (y = 0; y < WINEHUA_TEXTURE3D_SIZE; ++y)
+        {
+            for (x = 0; x < WINEHUA_TEXTURE3D_SIZE; ++x)
+            {
+                UINT index = (z * WINEHUA_TEXTURE3D_SIZE + y) *
+                             WINEHUA_TEXTURE3D_SIZE + x;
+                const float *actual = (const float *)((const BYTE *)mapped.pData +
+                    z * mapped.DepthPitch + y * mapped.RowPitch +
+                    x * 4 * sizeof(float));
+                const float initial[4] = {
+                    (float)index, (float)(index + 64),
+                    (float)(index + 128), (float)(index + 192)
+                };
+                for (component = 0; component < 4; ++component)
+                {
+                    float expected = initial[component] +
+                                     dispatch_count * delta[component];
+                    float difference = actual[component] - expected;
+                    if (index == 0)
+                    {
+                        first_actual[component] = actual[component];
+                        first_expected[component] = expected;
+                    }
+                    if (difference < -0.001f || difference > 0.001f)
+                        ++mismatches;
+                }
+            }
+        }
+    }
+    ID3D11DeviceContext_Unmap(
+        state->context, (ID3D11Resource *)state->texture3d_staging, 0);
+    state->feature_probe_read_bytes += WINEHUA_TEXTURE3D_TEXELS *
+                                       4 * sizeof(float);
+    *mismatch_count = mismatches;
+    fprintf(stderr,
+            "winehua_d3d11_smoke: Texture3D %s first="
+            "%.1f,%.1f,%.1f,%.1f expected=%.1f,%.1f,%.1f,%.1f mismatches=%u\n",
+            name, first_actual[0], first_actual[1], first_actual[2],
+            first_actual[3], first_expected[0], first_expected[1],
+            first_expected[2], first_expected[3], mismatches);
+    return mismatches == 0;
+}
+
+static void dispatch_texture3d(struct smoke_state *state,
+                               ID3D11ShaderResourceView *source,
+                               ID3D11UnorderedAccessView *target)
+{
+    ID3D11ShaderResourceView *resources[] = {source};
+    ID3D11ShaderResourceView *null_resources[] = {NULL};
+    ID3D11UnorderedAccessView *uavs[] = {target};
+    ID3D11UnorderedAccessView *null_uavs[] = {NULL};
+    ID3D11SamplerState *samplers[] = {state->linear_sampler};
+    ID3D11SamplerState *null_samplers[] = {NULL};
+
+    ID3D11DeviceContext_CSSetShader(
+        state->context, state->texture3d_pingpong_compute_shader, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(state->context, 0, 1, resources);
+    ID3D11DeviceContext_CSSetSamplers(state->context, 0, 1, samplers);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        state->context, 0, 1, uavs, NULL);
+    ID3D11DeviceContext_Dispatch(state->context, 2, 2, 2);
+    ID3D11DeviceContext_CSSetShaderResources(
+        state->context, 0, 1, null_resources);
+    ID3D11DeviceContext_CSSetSamplers(
+        state->context, 0, 1, null_samplers);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        state->context, 0, 1, null_uavs, NULL);
+}
+
+static BOOL run_texture3d_probes(struct smoke_state *state)
+{
+    float initial_values[WINEHUA_TEXTURE3D_TEXELS][4];
+    const UINT row_pitch = WINEHUA_TEXTURE3D_SIZE * 4 * sizeof(float);
+    const UINT slice_pitch = WINEHUA_TEXTURE3D_SIZE * row_pitch;
+
+    if (!state->texture3d_created) return FALSE;
+    fill_texture3d_initial(initial_values);
+    state->texture3d_upload_functional = validate_texture3d(
+        state, state->texture3d[0], 0, &state->texture3d_upload_mismatches,
+        "upload");
+
+    dispatch_texture3d(
+        state, state->texture3d_srvs[0], state->texture3d_uavs[1]);
+    state->texture3d_single_dispatch_functional = validate_texture3d(
+        state, state->texture3d[1], 1,
+        &state->texture3d_single_mismatches, "single-dispatch");
+
+    /* Reset the source, then issue the two passes without Flush/Map or a CPU
+     * wait in between. This matches ComputeMark's Texture3D/RWTexture3D
+     * ping-pong contract and makes the UAV-write -> SRV-read dependency the
+     * only new ordering requirement in the second dispatch. */
+    ID3D11DeviceContext_UpdateSubresource(
+        state->context, (ID3D11Resource *)state->texture3d[0], 0, NULL,
+        initial_values, row_pitch, slice_pitch);
+    state->feature_probe_gpu_copies++;
+    dispatch_texture3d(
+        state, state->texture3d_srvs[0], state->texture3d_uavs[1]);
+    dispatch_texture3d(
+        state, state->texture3d_srvs[1], state->texture3d_uavs[0]);
+    ID3D11DeviceContext_CSSetShader(state->context, NULL, NULL, 0);
+
+    state->texture3d_pingpong_functional = validate_texture3d(
+        state, state->texture3d[0], 2,
+        &state->texture3d_pingpong_mismatches, "ping-pong");
+    state->texture3d_uav_to_srv_functional =
+        state->texture3d_single_dispatch_functional &&
+        state->texture3d_pingpong_functional;
+    return state->texture3d_upload_functional &&
+           state->texture3d_single_dispatch_functional &&
+           state->texture3d_uav_to_srv_functional &&
+           state->texture3d_pingpong_functional;
+}
+
+static BOOL gray_value_matches(UINT value, BYTE expected, BYTE tolerance)
+{
+    UINT component;
+    for (component = 0; component < 4; ++component)
+    {
+        BYTE actual = (BYTE)(value >> (component * 8));
+        int difference = (int)actual - (int)expected;
+        if (difference < -(int)tolerance || difference > (int)tolerance)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL packed_value_matches(UINT value, UINT expected, BYTE tolerance)
+{
+    UINT component;
+    for (component = 0; component < 4; ++component)
+    {
+        BYTE actual_component = (BYTE)(value >> (component * 8));
+        BYTE expected_component = (BYTE)(expected >> (component * 8));
+        int difference = (int)actual_component - (int)expected_component;
+        if (difference < -(int)tolerance || difference > (int)tolerance)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL run_texture3d_output_probe(
+    struct smoke_state *state,
+    ID3D11ComputeShader *shader,
+    ID3D11ShaderResourceView *resource,
+    ID3D11SamplerState *sampler,
+    UINT output_count,
+    UINT marker_expected,
+    UINT *values,
+    const char *name)
+{
+    static const float clear_value[4] = {
+        239.0f / 255.0f, 190.0f / 255.0f,
+        173.0f / 255.0f, 222.0f / 255.0f,
+    };
+    ID3D11ShaderResourceView *resources[] = {resource};
+    ID3D11ShaderResourceView *null_resources[] = {NULL};
+    ID3D11SamplerState *samplers[] = {sampler};
+    ID3D11SamplerState *null_samplers[] = {NULL};
+    ID3D11UnorderedAccessView *uavs[] = {state->compute_uav};
+    ID3D11UnorderedAccessView *null_uavs[] = {NULL};
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT result;
+    UINT marker, i;
+
+    ID3D11DeviceContext_ClearUnorderedAccessViewFloat(
+        state->context, state->compute_uav, clear_value);
+    ID3D11DeviceContext_CSSetShader(state->context, shader, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(state->context, 0, 1, resources);
+    ID3D11DeviceContext_CSSetSamplers(state->context, 0, 1, samplers);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        state->context, 0, 1, uavs, NULL);
+    ID3D11DeviceContext_Dispatch(state->context, 1, 1, 1);
+    ID3D11DeviceContext_CSSetShaderResources(
+        state->context, 0, 1, null_resources);
+    ID3D11DeviceContext_CSSetSamplers(
+        state->context, 0, 1, null_samplers);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(
+        state->context, 0, 1, null_uavs, NULL);
+    ID3D11DeviceContext_CSSetShader(state->context, NULL, NULL, 0);
+
+    ID3D11DeviceContext_CopyResource(
+        state->context, (ID3D11Resource *)state->compute_staging,
+        (ID3D11Resource *)state->compute_texture);
+    state->feature_probe_gpu_copies++;
+    ID3D11DeviceContext_Flush(state->context);
+    result = ID3D11DeviceContext_Map(
+        state->context, (ID3D11Resource *)state->compute_staging, 0,
+        D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(result))
+    {
+        fprintf(stderr,
+                "winehua_d3d11_smoke: Texture3D %s map failed=0x%08lx\n",
+                name, (unsigned long)result);
+        return FALSE;
+    }
+    for (i = 0; i < output_count; ++i)
+        values[i] = rgba8_value(&mapped, i, 0);
+    marker = rgba8_value(&mapped, 0, 1);
+    ID3D11DeviceContext_Unmap(
+        state->context, (ID3D11Resource *)state->compute_staging, 0);
+    state->feature_probe_read_bytes += 16 * 16 * 4;
+
+    fprintf(stderr, "winehua_d3d11_smoke: Texture3D %s values=", name);
+    for (i = 0; i < output_count; ++i)
+        fprintf(stderr, "%s0x%08x", i ? "," : "", values[i]);
+    fprintf(stderr, " marker=0x%08x expected=0x%08x\n",
+            marker, marker_expected);
+    return marker == marker_expected;
+}
+
+static BOOL run_texture3d_boundary_probes(struct smoke_state *state)
+{
+    static const BYTE linear_expected[12] = {
+        128, 128, 128, 128, 128, 128,
+        64, 120, 96, 96, 112, 112,
+    };
+    UINT i;
+    BOOL marker_ok;
+
+    marker_ok = run_texture3d_output_probe(
+        state, state->texture3d_oob_compute_shader,
+        state->texture3d_srvs[0], NULL, 16, 0xffffff00u,
+        state->texture3d_oob_values, "OOB Load/index");
+    for (i = 0; i < 8; ++i)
+        if (state->texture3d_oob_values[i] != 0)
+            ++state->texture3d_oob_load_mismatches;
+    for (i = 8; i < 16; ++i)
+        if (state->texture3d_oob_values[i] != 0)
+            ++state->texture3d_oob_index_mismatches;
+    state->texture3d_oob_load_functional = marker_ok &&
+        state->texture3d_oob_load_mismatches == 0;
+    state->texture3d_oob_index_functional = marker_ok &&
+        state->texture3d_oob_index_mismatches == 0;
+
+    marker_ok = run_texture3d_output_probe(
+        state, state->texture3d_border_compute_shader,
+        state->texture3d_border_srv, state->border_point_sampler,
+        12, 0xffff00ffu, state->texture3d_border_point_values,
+        "BorderColor point");
+    for (i = 0; i < 6; ++i)
+        if (!gray_value_matches(state->texture3d_border_point_values[i], 128, 2))
+            ++state->texture3d_border_point_mismatches;
+    if (!gray_value_matches(state->texture3d_border_point_values[6], 64, 2))
+        ++state->texture3d_border_point_mismatches;
+    state->texture3d_border_point_functional = marker_ok &&
+        state->texture3d_border_point_mismatches == 0;
+
+    marker_ok = run_texture3d_output_probe(
+        state, state->texture3d_border_compute_shader,
+        state->texture3d_border_srv, state->border_linear_sampler,
+        12, 0xffff00ffu, state->texture3d_border_linear_values,
+        "BorderColor linear");
+    for (i = 0; i < 12; ++i)
+        if (!gray_value_matches(state->texture3d_border_linear_values[i],
+                                linear_expected[i], 2))
+            ++state->texture3d_border_linear_mismatches;
+    state->texture3d_border_linear_functional = marker_ok &&
+        state->texture3d_border_linear_mismatches == 0;
+
+    fprintf(stderr,
+            "winehua_d3d11_smoke: Texture3D boundary result "
+            "load=%u index=%u pointBorder=%u linearBorder=%u "
+            "mismatches=%u,%u,%u,%u\n",
+            state->texture3d_oob_load_functional,
+            state->texture3d_oob_index_functional,
+            state->texture3d_border_point_functional,
+            state->texture3d_border_linear_functional,
+            state->texture3d_oob_load_mismatches,
+            state->texture3d_oob_index_mismatches,
+            state->texture3d_border_point_mismatches,
+            state->texture3d_border_linear_mismatches);
+    return state->texture3d_oob_load_functional &&
+           state->texture3d_oob_index_functional &&
+           state->texture3d_border_point_functional &&
+           state->texture3d_border_linear_functional;
+}
+
+static BOOL run_heaven_fullscreen_probe_tolerance(
+    struct smoke_state *state,
+    ID3D11PixelShader *shader,
+    ID3D11ShaderResourceView *resource,
+    ID3D11SamplerState *sampler,
+    const UINT *x, const UINT *y, const UINT *expected, UINT count,
+    UINT *values, UINT *mismatch_count, BYTE tolerance, const char *name)
+{
+    static const float marker[4] = {
+        239.0f / 255.0f, 190.0f / 255.0f,
+        173.0f / 255.0f, 222.0f / 255.0f,
+    };
+    D3D11_VIEWPORT viewport = {0, 0, WINEHUA_FEATURE_PROBE_SIZE,
+                               WINEHUA_FEATURE_PROBE_SIZE, 0.0f, 1.0f};
+    ID3D11RenderTargetView *targets[] = {state->probe_rtv};
+    ID3D11ShaderResourceView *resources[] = {resource};
+    ID3D11ShaderResourceView *null_resources[] = {NULL};
+    ID3D11SamplerState *samplers[] = {sampler};
+    ID3D11SamplerState *null_samplers[] = {NULL};
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT result;
+    UINT i, mismatches = 0;
+
+    ID3D11DeviceContext_OMSetRenderTargets(state->context, 1, targets, NULL);
+    ID3D11DeviceContext_ClearRenderTargetView(
+        state->context, state->probe_rtv, marker);
+    ID3D11DeviceContext_RSSetViewports(state->context, 1, &viewport);
+    ID3D11DeviceContext_IASetInputLayout(state->context, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(
+        state->context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(
+        state->context, state->fullscreen_vertex_shader, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(state->context, shader, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(
+        state->context, 0, 1, resources);
+    if (sampler)
+        ID3D11DeviceContext_PSSetSamplers(
+            state->context, 0, 1, samplers);
+    ID3D11DeviceContext_Draw(state->context, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(
+        state->context, 0, 1, null_resources);
+    if (sampler)
+        ID3D11DeviceContext_PSSetSamplers(
+            state->context, 0, 1, null_samplers);
+    ID3D11DeviceContext_PSSetShader(state->context, NULL, NULL, 0);
+    ID3D11DeviceContext_OMSetRenderTargets(state->context, 0, NULL, NULL);
+    ID3D11DeviceContext_CopyResource(
+        state->context, (ID3D11Resource *)state->probe_staging,
+        (ID3D11Resource *)state->probe_texture);
+    state->feature_probe_gpu_copies++;
+    ID3D11DeviceContext_Flush(state->context);
+
+    result = ID3D11DeviceContext_Map(
+        state->context, (ID3D11Resource *)state->probe_staging, 0,
+        D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(result))
+    {
+        *mismatch_count = ~0u;
+        fprintf(stderr,
+                "winehua_d3d11_smoke: Heaven %s map failed=0x%08lx\n",
+                name, (unsigned long)result);
+        return FALSE;
+    }
+    for (i = 0; i < count; ++i)
+    {
+        values[i] = rgba8_value(&mapped, x[i], y[i]);
+        if (!packed_value_matches(values[i], expected[i], tolerance))
+            ++mismatches;
+    }
+    ID3D11DeviceContext_Unmap(
+        state->context, (ID3D11Resource *)state->probe_staging, 0);
+    state->feature_probe_read_bytes += WINEHUA_FEATURE_PROBE_SIZE *
+                                       WINEHUA_FEATURE_PROBE_SIZE * 4;
+    *mismatch_count = mismatches;
+    fprintf(stderr, "winehua_d3d11_smoke: Heaven %s values=", name);
+    for (i = 0; i < count; ++i)
+        fprintf(stderr, "%s0x%08x", i ? "," : "", values[i]);
+    fprintf(stderr, " mismatches=%u\n", mismatches);
+    return mismatches == 0;
+}
+
+static BOOL run_heaven_fullscreen_probe(
+    struct smoke_state *state,
+    ID3D11PixelShader *shader,
+    ID3D11ShaderResourceView *resource,
+    ID3D11SamplerState *sampler,
+    const UINT *x, const UINT *y, const UINT *expected, UINT count,
+    UINT *values, UINT *mismatch_count, const char *name)
+{
+    return run_heaven_fullscreen_probe_tolerance(
+        state, shader, resource, sampler, x, y, expected, count,
+        values, mismatch_count, 0, name);
+}
+
+static void fill_heaven_cube_subresource(
+    BYTE *data, DXGI_FORMAT format, UINT color, UINT texel_count)
+{
+    const BYTE red = (BYTE)color;
+    const BYTE green = (BYTE)(color >> 8);
+    const BYTE blue = (BYTE)(color >> 16);
+    const BYTE alpha = (BYTE)(color >> 24);
+    UINT i;
+
+    memset(data, 0, 128);
+    if (format == DXGI_FORMAT_BC1_UNORM ||
+        format == DXGI_FORMAT_BC1_UNORM_SRGB)
+    {
+        const WORD rgb565 = (WORD)(((red * 31 / 255) << 11) |
+                                   ((green * 63 / 255) << 5) |
+                                   (blue * 31 / 255));
+        data[0] = (BYTE)rgb565;
+        data[1] = (BYTE)(rgb565 >> 8);
+        return;
+    }
+
+    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+    {
+        WORD *half = (WORD *)data;
+        for (i = 0; i < texel_count; ++i)
+        {
+            half[i * 4 + 0] = red ? 0x3c00 : 0;
+            half[i * 4 + 1] = green ? 0x3c00 : 0;
+            half[i * 4 + 2] = blue ? 0x3c00 : 0;
+            half[i * 4 + 3] = alpha ? 0x3c00 : 0;
+        }
+        return;
+    }
+
+    for (i = 0; i < texel_count; ++i)
+        ((UINT *)data)[i] = color;
+}
+
+static BOOL create_heaven_cube_texture(
+    struct smoke_state *state, DXGI_FORMAT format,
+    ID3D11Texture2D **texture, ID3D11ShaderResourceView **srv)
+{
+    static const UINT colors[2][6] = {
+        {0xff0000ffu, 0xff00ff00u, 0xffff0000u,
+         0xff00ffffu, 0xffff00ffu, 0xffffff00u},
+        {0xffffffffu, 0xff0000ffu, 0xff00ff00u,
+         0xffff0000u, 0xff00ffffu, 0xffff00ffu},
+    };
+    BYTE storage[12][128];
+    D3D11_SUBRESOURCE_DATA initial[12];
+    D3D11_TEXTURE2D_DESC desc = {0};
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+    UINT face, mip;
+    HRESULT result;
+
+    memset(initial, 0, sizeof(initial));
+    for (face = 0; face < 6; ++face)
+    {
+        for (mip = 0; mip < 2; ++mip)
+        {
+            const UINT subresource = mip + face * 2;
+            const UINT width = 4 >> mip;
+            const BOOL bc = format == DXGI_FORMAT_BC1_UNORM ||
+                            format == DXGI_FORMAT_BC1_UNORM_SRGB;
+            const UINT bytes_per_pixel =
+                format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
+            fill_heaven_cube_subresource(
+                storage[subresource], format, colors[mip][face], width * width);
+            initial[subresource].pSysMem = storage[subresource];
+            initial[subresource].SysMemPitch = bc ? 8 : width * bytes_per_pixel;
+            initial[subresource].SysMemSlicePitch = bc ? 8 :
+                width * width * bytes_per_pixel;
+        }
+    }
+
+    desc.Width = 4;
+    desc.Height = 4;
+    desc.MipLevels = 2;
+    desc.ArraySize = 6;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+    result = ID3D11Device_CreateTexture2D(
+        state->device, &desc, initial, texture);
+    if (FAILED(result))
+    {
+        state->present_result = result;
+        return FALSE;
+    }
+
+    srv_desc.Format = format;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+    srv_desc.TextureCube.MostDetailedMip = 0;
+    srv_desc.TextureCube.MipLevels = 2;
+    result = ID3D11Device_CreateShaderResourceView(
+        state->device, (ID3D11Resource *)*texture, &srv_desc, srv);
+    if (FAILED(result))
+    {
+        state->present_result = result;
+        ID3D11Texture2D_Release(*texture);
+        *texture = NULL;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL run_heaven_cube_probes(struct smoke_state *state)
+{
+    static const char *shader_source =
+        "TextureCube inputCube : register(t0);"
+        "SamplerState inputSampler : register(s0);"
+        "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "float4 main(PSIn input) : SV_Target {"
+        "int face = min((int)(input.pos.x * 6.0 / 64.0), 5);"
+        "float3 direction = float3(1.0, 0.0, 0.0);"
+        "if (face == 1) direction = float3(-1.0, 0.0, 0.0);"
+        "else if (face == 2) direction = float3(0.0, 1.0, 0.0);"
+        "else if (face == 3) direction = float3(0.0, -1.0, 0.0);"
+        "else if (face == 4) direction = float3(0.0, 0.0, 1.0);"
+        "else if (face == 5) direction = float3(0.0, 0.0, -1.0);"
+        "float lod = input.pos.y >= 32.0 ? 1.0 : 0.0;"
+        "return inputCube.SampleLevel(inputSampler, direction, lod); }";
+    static const DXGI_FORMAT formats[WINEHUA_HEAVEN_CUBE_FORMATS] = {
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_BC1_UNORM,
+        DXGI_FORMAT_BC1_UNORM_SRGB,
+    };
+    static const char *names[WINEHUA_HEAVEN_CUBE_FORMATS] = {
+        "cube RGBA8", "cube RGBA8 sRGB", "cube RGBA16F",
+        "cube BC1", "cube BC1 sRGB",
+    };
+    static const UINT x[12] = {5, 16, 26, 37, 48, 58,
+                               5, 16, 26, 37, 48, 58};
+    static const UINT y[12] = {16, 16, 16, 16, 16, 16,
+                               48, 48, 48, 48, 48, 48};
+    static const UINT expected[12] = {
+        0xff0000ffu, 0xff00ff00u, 0xffff0000u,
+        0xff00ffffu, 0xffff00ffu, 0xffffff00u,
+        0xffffffffu, 0xff0000ffu, 0xff00ff00u,
+        0xffff0000u, 0xff00ffffu, 0xffff00ffu,
+    };
+    ID3DBlob *blob = NULL;
+    ID3D11PixelShader *shader = NULL;
+    HRESULT result;
+    BOOL pass = TRUE;
+    UINT i;
+
+    if (!compile_shader(shader_source, "main", "ps_5_0", &blob)) return FALSE;
+    result = ID3D11Device_CreatePixelShader(
+        state->device, ID3D10Blob_GetBufferPointer(blob),
+        ID3D10Blob_GetBufferSize(blob), NULL, &shader);
+    ID3D10Blob_Release(blob);
+    if (FAILED(result)) return FALSE;
+
+    for (i = 0; i < WINEHUA_HEAVEN_CUBE_FORMATS; ++i)
+    {
+        ID3D11Texture2D *texture = NULL;
+        ID3D11ShaderResourceView *srv = NULL;
+        UINT values[12] = {0};
+
+        if (create_heaven_cube_texture(
+                state, formats[i], &texture, &srv))
+            state->heaven_cube_cases[i] = run_heaven_fullscreen_probe(
+                state, shader, srv, state->bc_sampler,
+                x, y, expected, 12, values,
+                &state->heaven_cube_mismatches[i], names[i]);
+        else
+            state->heaven_cube_mismatches[i] = ~0u;
+
+        if (!state->heaven_cube_cases[i]) pass = FALSE;
+        if (srv) ID3D11ShaderResourceView_Release(srv);
+        if (texture) ID3D11Texture2D_Release(texture);
+    }
+    ID3D11PixelShader_Release(shader);
+    state->heaven_cube_functional = pass;
+    return pass;
+}
+
+static BOOL run_heaven_texture3d_case(
+    struct smoke_state *state, ID3D11PixelShader *shader,
+    DXGI_FORMAT format, const BYTE values[4][2], UINT *actual,
+    const UINT *expected, const char *name)
+{
+    static const UINT x[4] = {16, 48, 16, 48};
+    static const UINT y[4] = {16, 16, 48, 48};
+    static const UINT coords[4][3] = {
+        {0, 0, 0}, {31, 0, 0}, {0, 31, 31}, {31, 31, 31},
+    };
+    const UINT size = 32;
+    const UINT bytes_per_pixel = format == DXGI_FORMAT_R8G8_UNORM ? 2 : 1;
+    const SIZE_T data_size = size * size * size * bytes_per_pixel;
+    BYTE *data = calloc(1, data_size);
+    D3D11_TEXTURE3D_DESC desc = {0};
+    D3D11_SUBRESOURCE_DATA initial = {0};
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+    ID3D11Texture3D *texture = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    UINT mismatch_count = 0;
+    BOOL pass = FALSE;
+    HRESULT result;
+    UINT i;
+
+    if (!data) return FALSE;
+    for (i = 0; i < 4; ++i)
+    {
+        const SIZE_T offset = ((coords[i][2] * size + coords[i][1]) * size +
+                               coords[i][0]) * bytes_per_pixel;
+        data[offset] = values[i][0];
+        if (bytes_per_pixel == 2) data[offset + 1] = values[i][1];
+    }
+
+    desc.Width = size;
+    desc.Height = size;
+    desc.Depth = size;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    initial.pSysMem = data;
+    initial.SysMemPitch = size * bytes_per_pixel;
+    initial.SysMemSlicePitch = size * size * bytes_per_pixel;
+    result = ID3D11Device_CreateTexture3D(
+        state->device, &desc, &initial, &texture);
+    free(data);
+    if (FAILED(result)) return FALSE;
+
+    srv_desc.Format = format;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
+    srv_desc.Texture3D.MostDetailedMip = 0;
+    srv_desc.Texture3D.MipLevels = 1;
+    result = ID3D11Device_CreateShaderResourceView(
+        state->device, (ID3D11Resource *)texture, &srv_desc, &srv);
+    if (SUCCEEDED(result))
+        pass = run_heaven_fullscreen_probe(
+            state, shader, srv, NULL, x, y, expected, 4, actual,
+            &mismatch_count, name);
+    if (srv) ID3D11ShaderResourceView_Release(srv);
+    ID3D11Texture3D_Release(texture);
+    return pass;
+}
+
+static BOOL run_heaven_texture3d_probes(struct smoke_state *state)
+{
+    static const char *shader_source =
+        "Texture3D<float4> inputVolume : register(t0);"
+        "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "float4 main(PSIn input) : SV_Target {"
+        "int slot = (input.pos.x >= 32.0) + ((input.pos.y >= 32.0) << 1);"
+        "int3 coord = int3(0, 0, 0);"
+        "if (slot == 1) coord = int3(31, 0, 0);"
+        "else if (slot == 2) coord = int3(0, 31, 31);"
+        "else if (slot == 3) coord = int3(31, 31, 31);"
+        "float4 value = inputVolume.Load(int4(coord, 0));"
+        "return float4(value.r, value.g, 0.0, 1.0); }";
+    static const BYTE r8_values[4][2] = {
+        {0x20, 0}, {0x60, 0}, {0xa0, 0}, {0xe0, 0},
+    };
+    static const BYTE rg8_values[4][2] = {
+        {0x10, 0x20}, {0x40, 0x60},
+        {0x80, 0xa0}, {0xc0, 0xe0},
+    };
+    static const UINT r8_expected[4] = {
+        0xff000020u, 0xff000060u, 0xff0000a0u, 0xff0000e0u,
+    };
+    static const UINT rg8_expected[4] = {
+        0xff002010u, 0xff006040u, 0xff00a080u, 0xff00e0c0u,
+    };
+    ID3DBlob *blob = NULL;
+    ID3D11PixelShader *shader = NULL;
+    HRESULT result;
+
+    if (!compile_shader(shader_source, "main", "ps_5_0", &blob)) return FALSE;
+    result = ID3D11Device_CreatePixelShader(
+        state->device, ID3D10Blob_GetBufferPointer(blob),
+        ID3D10Blob_GetBufferSize(blob), NULL, &shader);
+    ID3D10Blob_Release(blob);
+    if (FAILED(result)) return FALSE;
+
+    state->heaven_texture3d_r8_functional = run_heaven_texture3d_case(
+        state, shader, DXGI_FORMAT_R8_UNORM, r8_values,
+        state->heaven_texture3d_r8_values, r8_expected, "Texture3D R8");
+    state->heaven_texture3d_rg8_functional = run_heaven_texture3d_case(
+        state, shader, DXGI_FORMAT_R8G8_UNORM, rg8_values,
+        state->heaven_texture3d_rg8_values, rg8_expected, "Texture3D RG8");
+    ID3D11PixelShader_Release(shader);
+    return state->heaven_texture3d_r8_functional &&
+           state->heaven_texture3d_rg8_functional;
+}
+
+static BOOL run_heaven_comparison_sampler_probe(struct smoke_state *state)
+{
+    static const char *shader_source =
+        "Texture2D<float> inputDepth : register(t0);"
+        "SamplerComparisonState comparisonSampler : register(s0);"
+        "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "float4 main(PSIn input) : SV_Target {"
+        "float2 uv = float2(input.pos.x >= 32.0 ? 0.75 : 0.25,"
+        "                   input.pos.y >= 32.0 ? 0.75 : 0.25);"
+        "float result = inputDepth.SampleCmpLevelZero("
+        "    comparisonSampler, uv, 0.5);"
+        "return float4(result, result, result, 1.0); }";
+    static const float depth_values[4] = {0.2f, 0.4f, 0.6f, 0.8f};
+    static const UINT x[4] = {16, 48, 16, 48};
+    static const UINT y[4] = {16, 16, 48, 48};
+    static const UINT expected[4] = {
+        0xff000000u, 0xff000000u, 0xffffffffu, 0xffffffffu,
+    };
+    D3D11_TEXTURE2D_DESC desc = {0};
+    D3D11_SUBRESOURCE_DATA initial = {depth_values, sizeof(float) * 2, 0};
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+    D3D11_SAMPLER_DESC sampler_desc = {0};
+    ID3D11Texture2D *texture = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    ID3D11SamplerState *sampler = NULL;
+    ID3DBlob *blob = NULL;
+    ID3D11PixelShader *shader = NULL;
+    UINT mismatch_count = 0;
+    HRESULT result;
+
+    if (!compile_shader(shader_source, "main", "ps_5_0", &blob)) return FALSE;
+    result = ID3D11Device_CreatePixelShader(
+        state->device, ID3D10Blob_GetBufferPointer(blob),
+        ID3D10Blob_GetBufferSize(blob), NULL, &shader);
+    ID3D10Blob_Release(blob);
+    if (FAILED(result)) return FALSE;
+
+    desc.Width = 2;
+    desc.Height = 2;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R32_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    result = ID3D11Device_CreateTexture2D(
+        state->device, &desc, &initial, &texture);
+    if (SUCCEEDED(result))
+    {
+        srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MipLevels = 1;
+        result = ID3D11Device_CreateShaderResourceView(
+            state->device, (ID3D11Resource *)texture, &srv_desc, &srv);
+    }
+    if (SUCCEEDED(result))
+    {
+        sampler_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+        sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+        sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+        result = ID3D11Device_CreateSamplerState(
+            state->device, &sampler_desc, &sampler);
+    }
+    if (SUCCEEDED(result))
+        state->heaven_comparison_sampler_functional =
+            run_heaven_fullscreen_probe(
+                state, shader, srv, sampler, x, y, expected, 4,
+                state->heaven_comparison_sampler_values,
+                &mismatch_count, "comparison sampler");
+
+    if (sampler) ID3D11SamplerState_Release(sampler);
+    if (srv) ID3D11ShaderResourceView_Release(srv);
+    if (texture) ID3D11Texture2D_Release(texture);
+    ID3D11PixelShader_Release(shader);
+    return state->heaven_comparison_sampler_functional;
+}
+
+static BOOL run_heaven_depth_comparison_sampler_case(
+    struct smoke_state *state, DXGI_FORMAT resource_format,
+    DXGI_FORMAT dsv_format, DXGI_FORMAT srv_format,
+    UINT *values, const char *name)
+{
+    static const char *shader_source =
+        "Texture2D<float> inputDepth : register(t0);"
+        "SamplerComparisonState comparisonSampler : register(s0);"
+        "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "float4 main(PSIn input) : SV_Target {"
+        "float reference = input.pos.x >= 32.0 ? 0.75 : 0.25;"
+        "float result = inputDepth.SampleCmpLevelZero("
+        "    comparisonSampler, float2(0.5, 0.5), reference);"
+        "return float4(result, result, result, 1.0); }";
+    static const UINT x[4] = {16, 48, 16, 48};
+    static const UINT y[4] = {16, 16, 48, 48};
+    static const UINT expected[4] = {
+        0xffffffffu, 0xff000000u, 0xffffffffu, 0xff000000u,
+    };
+    D3D11_TEXTURE2D_DESC desc = {0};
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {0};
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+    D3D11_SAMPLER_DESC sampler_desc = {0};
+    ID3D11Texture2D *texture = NULL;
+    ID3D11DepthStencilView *dsv = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    ID3D11SamplerState *sampler = NULL;
+    ID3DBlob *blob = NULL;
+    ID3D11PixelShader *shader = NULL;
+    UINT mismatch_count = 0;
+    BOOL functional = FALSE;
+    HRESULT result;
+
+    if (!compile_shader(shader_source, "main", "ps_5_0", &blob)) return FALSE;
+    result = ID3D11Device_CreatePixelShader(
+        state->device, ID3D10Blob_GetBufferPointer(blob),
+        ID3D10Blob_GetBufferSize(blob), NULL, &shader);
+    ID3D10Blob_Release(blob);
+    if (FAILED(result)) return FALSE;
+
+    desc.Width = 2;
+    desc.Height = 2;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = resource_format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    result = ID3D11Device_CreateTexture2D(
+        state->device, &desc, NULL, &texture);
+    if (SUCCEEDED(result))
+    {
+        dsv_desc.Format = dsv_format;
+        dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        result = ID3D11Device_CreateDepthStencilView(
+            state->device, (ID3D11Resource *)texture, &dsv_desc, &dsv);
+    }
+    if (SUCCEEDED(result))
+    {
+        ID3D11DeviceContext_ClearDepthStencilView(
+            state->context, dsv, D3D11_CLEAR_DEPTH, 0.5f, 0);
+        srv_desc.Format = srv_format;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MipLevels = 1;
+        result = ID3D11Device_CreateShaderResourceView(
+            state->device, (ID3D11Resource *)texture, &srv_desc, &srv);
+    }
+    if (SUCCEEDED(result))
+    {
+        sampler_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+        sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+        sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+        result = ID3D11Device_CreateSamplerState(
+            state->device, &sampler_desc, &sampler);
+    }
+    if (SUCCEEDED(result))
+        functional = run_heaven_fullscreen_probe(
+            state, shader, srv, sampler, x, y, expected, 4,
+            values, &mismatch_count, name);
+
+    if (sampler) ID3D11SamplerState_Release(sampler);
+    if (srv) ID3D11ShaderResourceView_Release(srv);
+    if (dsv) ID3D11DepthStencilView_Release(dsv);
+    if (texture) ID3D11Texture2D_Release(texture);
+    ID3D11PixelShader_Release(shader);
+    return functional;
+}
+
+static BOOL create_d24s8_depth_texture(
+    struct smoke_state *state, UINT array_size, UINT misc_flags,
+    const float *depth_values, ID3D11Texture2D **texture, const char *name)
+{
+    D3D11_TEXTURE2D_DESC desc = {0};
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {0};
+    ID3D11DepthStencilView *dsv = NULL;
+    HRESULT result;
+    UINT layer;
+
+    desc.Width = 4;
+    desc.Height = 4;
+    desc.MipLevels = 1;
+    desc.ArraySize = array_size;
+    desc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    desc.MiscFlags = misc_flags;
+    result = ID3D11Device_CreateTexture2D(
+        state->device, &desc, NULL, texture);
+    if (FAILED(result))
+    {
+        fprintf(stderr,
+                "winehua_d3d11_smoke: Heaven %s texture failed=0x%08lx\n",
+                name, (unsigned long)result);
+        return FALSE;
+    }
+
+    dsv_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+    dsv_desc.Texture2DArray.MipSlice = 0;
+    dsv_desc.Texture2DArray.ArraySize = 1;
+    for (layer = 0; layer < array_size; ++layer)
+    {
+        dsv_desc.Texture2DArray.FirstArraySlice = layer;
+        result = ID3D11Device_CreateDepthStencilView(
+            state->device, (ID3D11Resource *)*texture, &dsv_desc, &dsv);
+        if (FAILED(result))
+        {
+            fprintf(stderr,
+                    "winehua_d3d11_smoke: Heaven %s DSV layer=%u failed=0x%08lx\n",
+                    name, layer, (unsigned long)result);
+            ID3D11Texture2D_Release(*texture);
+            *texture = NULL;
+            return FALSE;
+        }
+        ID3D11DeviceContext_ClearDepthStencilView(
+            state->context, dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
+            depth_values[layer], (UINT8)(0x40 + layer));
+        ID3D11DepthStencilView_Release(dsv);
+        dsv = NULL;
+    }
+    return TRUE;
+}
+
+static BOOL run_heaven_d24s8_extended_matrix(struct smoke_state *state)
+{
+    static const char *array_shader_source =
+        "Texture2DArray<float> inputDepth : register(t0);"
+        "SamplerComparisonState comparisonSampler : register(s0);"
+        "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "float4 main(PSIn input) : SV_Target {"
+        "uint layer = min((uint)(input.pos.x * (6.0 / 64.0)), 5u);"
+        "float value = inputDepth.SampleCmpLevelZero("
+        " comparisonSampler, float3(0.5, 0.5, (float)layer), 0.5);"
+        "return float4(value, value, value, 1.0); }";
+    static const char *array_view_shader_source =
+        "Texture2DArray<float> inputDepth : register(t0);"
+        "SamplerComparisonState comparisonSampler : register(s0);"
+        "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "float4 main(PSIn input) : SV_Target {"
+        "float value = inputDepth.SampleCmpLevelZero("
+        " comparisonSampler, float3(0.5, 0.5, 0.0), 0.5);"
+        "return float4(value, value, value, 1.0); }";
+    static const char *cube_shader_source =
+        "TextureCube<float> inputDepth : register(t0);"
+        "SamplerComparisonState comparisonSampler : register(s0);"
+        "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "float3 cubeDirection(uint face) {"
+        " if (face == 0) return float3(1,0,0);"
+        " if (face == 1) return float3(-1,0,0);"
+        " if (face == 2) return float3(0,1,0);"
+        " if (face == 3) return float3(0,-1,0);"
+        " if (face == 4) return float3(0,0,1);"
+        " return float3(0,0,-1); }"
+        "float4 main(PSIn input) : SV_Target {"
+        "uint face = min((uint)(input.pos.x * (6.0 / 64.0)), 5u);"
+        "float value = inputDepth.SampleCmpLevelZero("
+        " comparisonSampler, cubeDirection(face), 0.5);"
+        "return float4(value, value, value, 1.0); }";
+    static const char *cube_sample_shader_source =
+        "TextureCube<float> inputDepth : register(t0);"
+        "SamplerState regularSampler : register(s0);"
+        "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "float3 cubeDirection(uint face) {"
+        " if (face == 0) return float3(1,0,0);"
+        " if (face == 1) return float3(-1,0,0);"
+        " if (face == 2) return float3(0,1,0);"
+        " if (face == 3) return float3(0,-1,0);"
+        " if (face == 4) return float3(0,0,1);"
+        " return float3(0,0,-1); }"
+        "float4 main(PSIn input) : SV_Target {"
+        "uint face = min((uint)(input.pos.x * (6.0 / 64.0)), 5u);"
+        "float value = inputDepth.SampleLevel("
+        " regularSampler, cubeDirection(face), 0.0);"
+        "return float4(value, value, value, 1.0); }";
+    static const char *cube_array_shader_source =
+        "TextureCubeArray<float> inputDepth : register(t0);"
+        "SamplerComparisonState comparisonSampler : register(s0);"
+        "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "float3 cubeDirection(uint face) {"
+        " if (face == 0) return float3(1,0,0);"
+        " if (face == 1) return float3(-1,0,0);"
+        " if (face == 2) return float3(0,1,0);"
+        " if (face == 3) return float3(0,-1,0);"
+        " if (face == 4) return float3(0,0,1);"
+        " return float3(0,0,-1); }"
+        "float4 main(PSIn input) : SV_Target {"
+        "uint face = min((uint)(input.pos.x * (6.0 / 64.0)), 5u);"
+        "float cube = input.pos.y >= 32.0 ? 1.0 : 0.0;"
+        "float value = inputDepth.SampleCmpLevelZero("
+        " comparisonSampler, float4(cubeDirection(face), cube), 0.5);"
+        "return float4(value, value, value, 1.0); }";
+    static const char *linear_border_shader_source =
+        "Texture2DArray<float> inputDepth : register(t0);"
+        "SamplerComparisonState comparisonSampler : register(s0);"
+        "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "float4 main(PSIn input) : SV_Target {"
+        "float2 coord = float2(0.5, 0.5);"
+        "if (input.pos.x >= 16.0 && input.pos.x < 32.0) coord = float2(-1.0, 0.5);"
+        "else if (input.pos.x >= 32.0 && input.pos.x < 48.0) coord = float2(0.0, 0.5);"
+        "else if (input.pos.x >= 48.0) coord = float2(1.0, 0.5);"
+        "float value = inputDepth.SampleCmpLevelZero("
+        " comparisonSampler, float3(coord, 0.0), 0.5);"
+        "return float4(value, value, value, 1.0); }";
+    static const float array_depths[WINEHUA_D24_ARRAY_LAYERS] = {
+        0.125f, 0.25f, 0.375f, 0.625f, 0.75f, 0.875f,
+    };
+    static const float cube_array_depths[WINEHUA_D24_CUBE_ARRAY_LAYERS] = {
+        0.125f, 0.25f, 0.375f, 0.625f, 0.75f, 0.875f,
+        0.875f, 0.75f, 0.625f, 0.375f, 0.25f, 0.125f,
+    };
+    static const UINT stripe_x[WINEHUA_D24_ARRAY_LAYERS] = {
+        5, 16, 27, 37, 48, 58,
+    };
+    static const UINT stripe_y[WINEHUA_D24_ARRAY_LAYERS] = {
+        16, 16, 16, 16, 16, 16,
+    };
+    static const UINT cube_array_x[WINEHUA_D24_CUBE_ARRAY_LAYERS] = {
+        5, 16, 27, 37, 48, 58, 5, 16, 27, 37, 48, 58,
+    };
+    static const UINT cube_array_y[WINEHUA_D24_CUBE_ARRAY_LAYERS] = {
+        16, 16, 16, 16, 16, 16, 48, 48, 48, 48, 48, 48,
+    };
+    static const UINT array_expected[WINEHUA_D24_ARRAY_LAYERS] = {
+        0xff000000u, 0xff000000u, 0xff000000u,
+        0xffffffffu, 0xffffffffu, 0xffffffffu,
+    };
+    static const UINT cube_sample_expected[WINEHUA_D24_ARRAY_LAYERS] = {
+        0xff202020u, 0xff404040u, 0xff606060u,
+        0xff9f9f9fu, 0xffbfbfbfu, 0xffdfdfdfu,
+    };
+    static const UINT cube_array_expected[WINEHUA_D24_CUBE_ARRAY_LAYERS] = {
+        0xff000000u, 0xff000000u, 0xff000000u,
+        0xffffffffu, 0xffffffffu, 0xffffffffu,
+        0xffffffffu, 0xffffffffu, 0xffffffffu,
+        0xff000000u, 0xff000000u, 0xff000000u,
+    };
+    static const UINT border_x[WINEHUA_D24_BORDER_CASES] = {8, 24, 40, 56};
+    static const UINT border_y[WINEHUA_D24_BORDER_CASES] = {32, 32, 32, 32};
+    static const UINT border_expected[WINEHUA_D24_BORDER_CASES] = {
+        0xffffffffu, 0xff000000u, 0xff808080u, 0xff808080u,
+    };
+    static const UINT single_x = 32;
+    static const UINT single_y = 32;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+    D3D11_SAMPLER_DESC sampler_desc = {0};
+    ID3D11Texture2D *array_texture = NULL;
+    ID3D11Texture2D *cube_texture = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    ID3D11SamplerState *linear_clamp_sampler = NULL;
+    ID3D11SamplerState *linear_border_sampler = NULL;
+    ID3D11SamplerState *regular_linear_sampler = NULL;
+    ID3D11PixelShader *array_shader = NULL;
+    ID3D11PixelShader *array_view_shader = NULL;
+    ID3D11PixelShader *cube_shader = NULL;
+    ID3D11PixelShader *cube_sample_shader = NULL;
+    ID3D11PixelShader *cube_array_shader = NULL;
+    ID3D11PixelShader *linear_border_shader = NULL;
+    HRESULT result = E_FAIL;
+    UINT layer;
+    UINT mismatches;
+
+    array_shader = create_probe_pixel_shader(
+        state, array_shader_source, "D24S8 array");
+    array_view_shader = create_probe_pixel_shader(
+        state, array_view_shader_source, "D24S8 array view");
+    cube_shader = create_probe_pixel_shader(
+        state, cube_shader_source, "D24S8 cube");
+    cube_sample_shader = create_probe_pixel_shader(
+        state, cube_sample_shader_source, "D24S8 cube regular sample");
+    cube_array_shader = create_probe_pixel_shader(
+        state, cube_array_shader_source, "D24S8 cube array");
+    linear_border_shader = create_probe_pixel_shader(
+        state, linear_border_shader_source, "D24S8 linear border");
+    if (!array_shader || !array_view_shader || !cube_shader ||
+        !cube_sample_shader ||
+        !cube_array_shader || !linear_border_shader)
+        goto done;
+
+    if (!create_d24s8_depth_texture(
+            state, WINEHUA_D24_ARRAY_LAYERS, 0, array_depths,
+            &array_texture, "D24S8 array") ||
+        !create_d24s8_depth_texture(
+            state, WINEHUA_D24_CUBE_ARRAY_LAYERS,
+            D3D11_RESOURCE_MISC_TEXTURECUBE, cube_array_depths,
+            &cube_texture, "D24S8 cube array"))
+        goto done;
+
+    sampler_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
+    sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    result = ID3D11Device_CreateSamplerState(
+        state->device, &sampler_desc, &linear_clamp_sampler);
+    if (FAILED(result)) goto done;
+    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    result = ID3D11Device_CreateSamplerState(
+        state->device, &sampler_desc, &regular_linear_sampler);
+    if (FAILED(result)) goto done;
+    sampler_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
+    sampler_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+    sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
+    sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
+    sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+    result = ID3D11Device_CreateSamplerState(
+        state->device, &sampler_desc, &linear_border_sampler);
+    if (FAILED(result)) goto done;
+
+    srv_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    srv_desc.Texture2DArray.MostDetailedMip = 0;
+    srv_desc.Texture2DArray.MipLevels = 1;
+    srv_desc.Texture2DArray.FirstArraySlice = 0;
+    srv_desc.Texture2DArray.ArraySize = WINEHUA_D24_ARRAY_LAYERS;
+    result = ID3D11Device_CreateShaderResourceView(
+        state->device, (ID3D11Resource *)array_texture, &srv_desc, &srv);
+    if (SUCCEEDED(result))
+        state->heaven_d24s8_array_functional =
+            run_heaven_fullscreen_probe(
+                state, array_shader, srv, linear_clamp_sampler,
+                stripe_x, stripe_y, array_expected,
+                WINEHUA_D24_ARRAY_LAYERS,
+                state->heaven_d24s8_array_values,
+                &state->heaven_d24s8_extended_mismatches[0],
+                "D24S8 Texture2DArray linear comparison");
+    if (srv) ID3D11ShaderResourceView_Release(srv);
+    srv = NULL;
+
+    state->heaven_d24s8_array_views_functional = TRUE;
+    for (layer = 0; layer < WINEHUA_D24_ARRAY_LAYERS; ++layer)
+    {
+        srv_desc.Texture2DArray.FirstArraySlice = layer;
+        srv_desc.Texture2DArray.ArraySize = 1;
+        result = ID3D11Device_CreateShaderResourceView(
+            state->device, (ID3D11Resource *)array_texture, &srv_desc, &srv);
+        mismatches = 0;
+        if (FAILED(result) ||
+            !run_heaven_fullscreen_probe(
+                state, array_view_shader, srv, linear_clamp_sampler,
+                &single_x, &single_y, &array_expected[layer], 1,
+                &state->heaven_d24s8_array_view_values[layer],
+                &mismatches, "D24S8 single-layer view"))
+            state->heaven_d24s8_array_views_functional = FALSE;
+        state->heaven_d24s8_extended_mismatches[1] += mismatches;
+        if (srv) ID3D11ShaderResourceView_Release(srv);
+        srv = NULL;
+    }
+
+    memset(&srv_desc, 0, sizeof(srv_desc));
+    srv_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    srv_desc.Texture2DArray.MostDetailedMip = 0;
+    srv_desc.Texture2DArray.MipLevels = 1;
+    srv_desc.Texture2DArray.FirstArraySlice = 0;
+    srv_desc.Texture2DArray.ArraySize = WINEHUA_D24_ARRAY_LAYERS;
+    result = ID3D11Device_CreateShaderResourceView(
+        state->device, (ID3D11Resource *)cube_texture, &srv_desc, &srv);
+    if (SUCCEEDED(result))
+        state->heaven_d24s8_cube_as_array_functional =
+            run_heaven_fullscreen_probe(
+                state, array_shader, srv, linear_clamp_sampler,
+                stripe_x, stripe_y, array_expected,
+                WINEHUA_D24_ARRAY_LAYERS,
+                state->heaven_d24s8_cube_as_array_values,
+                &state->heaven_d24s8_extended_mismatches[2],
+                "D24S8 cube-compatible image as Texture2DArray");
+    if (srv) ID3D11ShaderResourceView_Release(srv);
+    srv = NULL;
+
+    memset(&srv_desc, 0, sizeof(srv_desc));
+    srv_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+    srv_desc.TextureCube.MostDetailedMip = 0;
+    srv_desc.TextureCube.MipLevels = 1;
+    result = ID3D11Device_CreateShaderResourceView(
+        state->device, (ID3D11Resource *)cube_texture, &srv_desc, &srv);
+    if (SUCCEEDED(result))
+    {
+        state->heaven_d24s8_cube_sample_functional =
+            run_heaven_fullscreen_probe_tolerance(
+                state, cube_sample_shader, srv, regular_linear_sampler,
+                stripe_x, stripe_y, cube_sample_expected,
+                WINEHUA_D24_ARRAY_LAYERS,
+                state->heaven_d24s8_cube_sample_values,
+                &state->heaven_d24s8_extended_mismatches[3], 2,
+                "D24S8 TextureCube regular linear sample");
+        state->heaven_d24s8_cube_functional =
+            run_heaven_fullscreen_probe(
+                state, cube_shader, srv, linear_clamp_sampler,
+                stripe_x, stripe_y, array_expected,
+                WINEHUA_D24_ARRAY_LAYERS,
+                state->heaven_d24s8_cube_values,
+                &state->heaven_d24s8_extended_mismatches[4],
+                "D24S8 TextureCube linear comparison");
+    }
+    if (srv) ID3D11ShaderResourceView_Release(srv);
+    srv = NULL;
+
+    memset(&srv_desc, 0, sizeof(srv_desc));
+    srv_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    srv_desc.Texture2DArray.MostDetailedMip = 0;
+    srv_desc.Texture2DArray.MipLevels = 1;
+    srv_desc.Texture2DArray.FirstArraySlice = 4;
+    srv_desc.Texture2DArray.ArraySize = 1;
+    result = ID3D11Device_CreateShaderResourceView(
+        state->device, (ID3D11Resource *)array_texture, &srv_desc, &srv);
+    if (SUCCEEDED(result))
+        state->heaven_d24s8_linear_border_functional =
+            run_heaven_fullscreen_probe_tolerance(
+                state, linear_border_shader, srv, linear_border_sampler,
+                border_x, border_y, border_expected,
+                WINEHUA_D24_BORDER_CASES,
+                state->heaven_d24s8_linear_border_values,
+                &state->heaven_d24s8_extended_mismatches[6], 2,
+                "D24S8 linear comparison border");
+    if (srv) ID3D11ShaderResourceView_Release(srv);
+    srv = NULL;
+
+    write_state(state, "RUNNING", "dxvk", "D24S8 cube-array pending");
+    memset(&srv_desc, 0, sizeof(srv_desc));
+    srv_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBEARRAY;
+    srv_desc.TextureCubeArray.MostDetailedMip = 0;
+    srv_desc.TextureCubeArray.MipLevels = 1;
+    srv_desc.TextureCubeArray.First2DArrayFace = 0;
+    srv_desc.TextureCubeArray.NumCubes = 2;
+    result = ID3D11Device_CreateShaderResourceView(
+        state->device, (ID3D11Resource *)cube_texture, &srv_desc, &srv);
+    if (SUCCEEDED(result))
+        state->heaven_d24s8_cube_array_functional =
+            run_heaven_fullscreen_probe(
+                state, cube_array_shader, srv, linear_clamp_sampler,
+                cube_array_x, cube_array_y, cube_array_expected,
+                WINEHUA_D24_CUBE_ARRAY_LAYERS,
+                state->heaven_d24s8_cube_array_values,
+                &state->heaven_d24s8_extended_mismatches[5],
+                "D24S8 TextureCubeArray linear comparison");
+
+done:
+    if (FAILED(result))
+        fprintf(stderr,
+                "winehua_d3d11_smoke: Heaven D24S8 extended resource creation failed=0x%08lx\n",
+                (unsigned long)result);
+    if (srv) ID3D11ShaderResourceView_Release(srv);
+    if (linear_border_sampler)
+        ID3D11SamplerState_Release(linear_border_sampler);
+    if (linear_clamp_sampler)
+        ID3D11SamplerState_Release(linear_clamp_sampler);
+    if (regular_linear_sampler)
+        ID3D11SamplerState_Release(regular_linear_sampler);
+    if (cube_texture) ID3D11Texture2D_Release(cube_texture);
+    if (array_texture) ID3D11Texture2D_Release(array_texture);
+    if (linear_border_shader)
+        ID3D11PixelShader_Release(linear_border_shader);
+    if (cube_array_shader) ID3D11PixelShader_Release(cube_array_shader);
+    if (cube_sample_shader) ID3D11PixelShader_Release(cube_sample_shader);
+    if (cube_shader) ID3D11PixelShader_Release(cube_shader);
+    if (array_view_shader) ID3D11PixelShader_Release(array_view_shader);
+    if (array_shader) ID3D11PixelShader_Release(array_shader);
+
+    state->heaven_d24s8_extended_functional =
+        state->heaven_d24s8_array_functional &&
+        state->heaven_d24s8_array_views_functional &&
+        state->heaven_d24s8_cube_as_array_functional &&
+        state->heaven_d24s8_cube_sample_functional &&
+        state->heaven_d24s8_cube_functional &&
+        state->heaven_d24s8_cube_array_functional &&
+        state->heaven_d24s8_linear_border_functional;
+    fprintf(stderr,
+            "winehua_d3d11_smoke: Heaven D24S8 extended result "
+            "array=%u views=%u cubeAsArray=%u cubeSample=%u "
+            "cubeCompare=%u cubeArray=%u linearBorder=%u\n",
+            state->heaven_d24s8_array_functional,
+            state->heaven_d24s8_array_views_functional,
+            state->heaven_d24s8_cube_as_array_functional,
+            state->heaven_d24s8_cube_sample_functional,
+            state->heaven_d24s8_cube_functional,
+            state->heaven_d24s8_cube_array_functional,
+            state->heaven_d24s8_linear_border_functional);
+    return state->heaven_d24s8_extended_functional;
+}
+
+static BOOL run_heaven_resource_probes(struct smoke_state *state)
+{
+    const BOOL cube = run_heaven_cube_probes(state);
+    const BOOL texture3d = run_heaven_texture3d_probes(state);
+    const BOOL comparison = run_heaven_comparison_sampler_probe(state);
+    BOOL depth_comparison;
+    BOOL d24s8_depth_comparison;
+    BOOL d24s8_extended;
+
+    depth_comparison = run_heaven_depth_comparison_sampler_case(
+        state, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_D32_FLOAT,
+        DXGI_FORMAT_R32_FLOAT,
+        state->heaven_depth_comparison_sampler_values,
+        "D32 depth comparison sampler");
+    state->heaven_depth_comparison_sampler_functional = depth_comparison;
+
+    d24s8_depth_comparison = run_heaven_depth_comparison_sampler_case(
+        state, DXGI_FORMAT_R24G8_TYPELESS,
+        DXGI_FORMAT_D24_UNORM_S8_UINT,
+        DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+        state->heaven_d24s8_depth_comparison_sampler_values,
+        "D24S8 depth comparison sampler");
+    state->heaven_d24s8_depth_comparison_sampler_functional =
+        d24s8_depth_comparison;
+
+    /* The extended matrix emits a RUNNING checkpoint before its CubeArray
+     * draw. Publish the completed 2D depth-comparison cases first so a crash
+     * in that later probe cannot leave already verified cases recorded as
+     * pending/false in the authoritative smoke JSON. */
+    d24s8_extended = run_heaven_d24s8_extended_matrix(state);
+    state->heaven_resource_functional =
+        cube && texture3d && depth_comparison && d24s8_depth_comparison &&
+        d24s8_extended;
+    if (!comparison)
+        fprintf(stderr,
+                "winehua_d3d11_smoke: ordinary R32_FLOAT comparison sampler "
+                "is diagnostic-only; Heaven depth comparison gates remain authoritative\n");
+    return state->heaven_resource_functional;
+}
+
 static BOOL run_feature_probes(struct smoke_state *state)
 {
     D3D11_VIEWPORT viewport = {0, 0, WINEHUA_FEATURE_PROBE_SIZE,
@@ -1590,23 +3596,23 @@ static BOOL run_feature_probes(struct smoke_state *state)
      * Vulkan probe, and LINEAR tests filtering without changing any other
      * image parameter. PS and CS results stay independent so a shader-stage
      * specific Maleoon/Venus/DXVK failure cannot be hidden. */
-    state->rgba_load_ps_functional = run_rgba_ps_probe(
+    state->rgba_load_ps_functional = run_texture_ps_probe(
         state, state->rgba_srv, state->rgba_load_pixel_shader, NULL, "Load",
-        &state->rgba_load_ps_value);
+        WINEHUA_RGBA_EXPECTED, &state->rgba_load_ps_value);
     state->rgba_load_cs_functional = run_rgba_cs_probe(
         state, state->rgba_srv, state->rgba_load_compute_shader, NULL, "Load",
         &state->rgba_load_cs_value);
-    state->rgba_point_ps_functional = run_rgba_ps_probe(
+    state->rgba_point_ps_functional = run_texture_ps_probe(
         state, state->rgba_srv, state->rgba_sample_pixel_shader,
-        state->point_sampler, "POINT",
+        state->point_sampler, "POINT", WINEHUA_RGBA_EXPECTED,
         &state->rgba_point_ps_value);
     state->rgba_point_cs_functional = run_rgba_cs_probe(
         state, state->rgba_srv, state->rgba_sample_compute_shader,
         state->point_sampler, "POINT",
         &state->rgba_point_cs_value);
-    state->rgba_linear_ps_functional = run_rgba_ps_probe(
+    state->rgba_linear_ps_functional = run_texture_ps_probe(
         state, state->rgba_srv, state->rgba_sample_pixel_shader,
-        state->linear_sampler, "LINEAR",
+        state->linear_sampler, "LINEAR", WINEHUA_RGBA_EXPECTED,
         &state->rgba_linear_ps_value);
     state->rgba_linear_cs_functional = run_rgba_cs_probe(
         state, state->rgba_srv, state->rgba_sample_compute_shader,
@@ -1640,15 +3646,17 @@ static BOOL run_feature_probes(struct smoke_state *state)
         fprintf(stderr, "winehua_d3d11_smoke: RGBA UPDATED upload value=0x%08x expected=0x%08x\\n",
                 state->rgba_updated_upload_value, WINEHUA_RGBA_EXPECTED);
     }
-    state->rgba_updated_load_ps_functional = run_rgba_ps_probe(
+    state->rgba_updated_load_ps_functional = run_texture_ps_probe(
         state, state->rgba_updated_srv, state->rgba_load_pixel_shader,
-        NULL, "UPDATED Load", &state->rgba_updated_load_ps_value);
+        NULL, "UPDATED Load", WINEHUA_RGBA_EXPECTED,
+        &state->rgba_updated_load_ps_value);
     state->rgba_updated_load_cs_functional = run_rgba_cs_probe(
         state, state->rgba_updated_srv, state->rgba_load_compute_shader,
         NULL, "UPDATED Load", &state->rgba_updated_load_cs_value);
-    state->rgba_updated_point_ps_functional = run_rgba_ps_probe(
+    state->rgba_updated_point_ps_functional = run_texture_ps_probe(
         state, state->rgba_updated_srv, state->rgba_sample_pixel_shader,
-        state->point_sampler, "UPDATED POINT", &state->rgba_updated_point_ps_value);
+        state->point_sampler, "UPDATED POINT", WINEHUA_RGBA_EXPECTED,
+        &state->rgba_updated_point_ps_value);
     state->rgba_updated_point_cs_functional = run_rgba_cs_probe(
         state, state->rgba_updated_srv, state->rgba_sample_compute_shader,
         state->point_sampler, "UPDATED POINT", &state->rgba_updated_point_cs_value);
@@ -1659,8 +3667,14 @@ static BOOL run_feature_probes(struct smoke_state *state)
      * the application's references immediately after binding. */
     if (!run_descriptor_identity_probes(state))
         fprintf(stderr, "winehua_d3d11_smoke: descriptor identity matrix failed\n");
+    if (!run_sampler_pair_probe(state))
+        fprintf(stderr, "winehua_d3d11_smoke: shared sampler-slot matrix failed\n");
     if (!run_subresource_probes(state))
         fprintf(stderr, "winehua_d3d11_smoke: subresource matrix failed\n");
+    if (!run_texture3d_probes(state))
+        fprintf(stderr, "winehua_d3d11_smoke: Texture3D ping-pong matrix failed\n");
+    if (!run_texture3d_boundary_probes(state))
+        fprintf(stderr, "winehua_d3d11_smoke: Texture3D boundary matrix failed\n");
 
     ID3D11DeviceContext_OMSetRenderTargets(state->context, 1, targets, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(
@@ -1724,6 +3738,8 @@ static BOOL run_feature_probes(struct smoke_state *state)
                 (unsigned long)result);
     state->offscreen_render_ready = TRUE;
     state->bc_sampling_functional = probe_readback_ok;
+    if (!run_bc_matrix_probes(state))
+        fprintf(stderr, "winehua_d3d11_smoke: BC format/mip matrix failed\n");
 
     /* Validate ordinary RGBA texture upload/update/sampling independently of
      * the BC emulation probe. This prevents a BC-only failure from being
@@ -1857,6 +3873,7 @@ static BOOL feature_checks_passed(const struct smoke_state *state)
            state->draw_indexed_instanced_ready &&
            state->offscreen_render_ready &&
            state->bc_sampling_functional &&
+           state->bc_matrix_functional &&
            state->msaa4x_supported &&
            state->msaa_resolve_functional &&
            state->compute_dispatch_ready &&
@@ -1879,7 +3896,18 @@ static BOOL feature_checks_passed(const struct smoke_state *state)
            state->descriptor_rebind_functional &&
            state->descriptor_unbound_functional &&
            state->descriptor_lifetime_functional &&
+           state->sampler_pair_functional &&
            state->subresource_functional &&
+           state->texture3d_created &&
+           state->texture3d_upload_functional &&
+           state->texture3d_single_dispatch_functional &&
+           state->texture3d_uav_to_srv_functional &&
+           state->texture3d_pingpong_functional &&
+           state->texture3d_oob_load_functional &&
+           state->texture3d_oob_index_functional &&
+           state->texture3d_border_point_functional &&
+           state->texture3d_border_linear_functional &&
+           state->heaven_resource_functional &&
            (!state->query_enabled ||
             (state->stencil_pixel_functional && state->stencil_functional));
 }
@@ -2100,6 +4128,7 @@ static BOOL create_device(struct smoke_state *state)
     state->shader_model_5_ready = TRUE;
 
     if (!create_bc_texture(state)) return FALSE;
+    if (!create_bc_matrix_resources(state)) return FALSE;
     if (!create_pattern_texture(state)) return FALSE;
     if (!create_rgba_sample_texture(state)) return FALSE;
     if (!create_descriptor_identity_resources(state)) return FALSE;
@@ -2107,7 +4136,8 @@ static BOOL create_device(struct smoke_state *state)
 
     if (!create_feature_shaders(state) ||
         !create_feature_resources(state) ||
-        !run_feature_probes(state))
+        !run_feature_probes(state) ||
+        !run_heaven_resource_probes(state))
         return FALSE;
 
     {
@@ -2450,6 +4480,20 @@ static void release_state(struct smoke_state *state)
     if (state->compute_uav) ID3D11UnorderedAccessView_Release(state->compute_uav);
     if (state->compute_srv) ID3D11ShaderResourceView_Release(state->compute_srv);
     if (state->compute_texture) ID3D11Texture2D_Release(state->compute_texture);
+    if (state->texture3d_staging)
+        ID3D11Texture3D_Release(state->texture3d_staging);
+    if (state->texture3d_border_srv)
+        ID3D11ShaderResourceView_Release(state->texture3d_border_srv);
+    if (state->texture3d_border)
+        ID3D11Texture3D_Release(state->texture3d_border);
+    for (i = 0; i < 2; ++i)
+    {
+        if (state->texture3d_uavs[i])
+            ID3D11UnorderedAccessView_Release(state->texture3d_uavs[i]);
+        if (state->texture3d_srvs[i])
+            ID3D11ShaderResourceView_Release(state->texture3d_srvs[i]);
+        if (state->texture3d[i]) ID3D11Texture3D_Release(state->texture3d[i]);
+    }
     if (state->subresource_srv)
         ID3D11ShaderResourceView_Release(state->subresource_srv);
     if (state->subresource_texture)
@@ -2467,6 +4511,8 @@ static void release_state(struct smoke_state *state)
         ID3D11PixelShader_Release(state->rgba_load_pixel_shader);
     if (state->descriptor_identity_pixel_shader)
         ID3D11PixelShader_Release(state->descriptor_identity_pixel_shader);
+    if (state->sampler_pair_pixel_shader)
+        ID3D11PixelShader_Release(state->sampler_pair_pixel_shader);
     if (state->subresource_pixel_shader)
         ID3D11PixelShader_Release(state->subresource_pixel_shader);
     if (state->rgba_sample_pixel_shader)
@@ -2481,6 +4527,12 @@ static void release_state(struct smoke_state *state)
         ID3D11ComputeShader_Release(state->rgba_load_compute_shader);
     if (state->rgba_sample_compute_shader)
         ID3D11ComputeShader_Release(state->rgba_sample_compute_shader);
+    if (state->texture3d_pingpong_compute_shader)
+        ID3D11ComputeShader_Release(state->texture3d_pingpong_compute_shader);
+    if (state->texture3d_oob_compute_shader)
+        ID3D11ComputeShader_Release(state->texture3d_oob_compute_shader);
+    if (state->texture3d_border_compute_shader)
+        ID3D11ComputeShader_Release(state->texture3d_border_compute_shader);
     if (state->constant_buffer) ID3D11Buffer_Release(state->constant_buffer);
     if (state->dynamic_constant_staging)
         ID3D11Buffer_Release(state->dynamic_constant_staging);
@@ -2490,8 +4542,14 @@ static void release_state(struct smoke_state *state)
     if (state->vertex_shader) ID3D11VertexShader_Release(state->vertex_shader);
     if (state->pixel_shader) ID3D11PixelShader_Release(state->pixel_shader);
     if (state->bc_sampler) ID3D11SamplerState_Release(state->bc_sampler);
+    if (state->bc_mip_sampler)
+        ID3D11SamplerState_Release(state->bc_mip_sampler);
     if (state->point_sampler) ID3D11SamplerState_Release(state->point_sampler);
     if (state->linear_sampler) ID3D11SamplerState_Release(state->linear_sampler);
+    if (state->border_point_sampler)
+        ID3D11SamplerState_Release(state->border_point_sampler);
+    if (state->border_linear_sampler)
+        ID3D11SamplerState_Release(state->border_linear_sampler);
     if (state->blend_state) ID3D11BlendState_Release(state->blend_state);
     if (state->depth_stencil_state)
         ID3D11DepthStencilState_Release(state->depth_stencil_state);
@@ -2516,6 +4574,13 @@ static void release_state(struct smoke_state *state)
     }
     if (state->bc_srv) ID3D11ShaderResourceView_Release(state->bc_srv);
     if (state->bc_texture) ID3D11Texture2D_Release(state->bc_texture);
+    for (i = 0; i < WINEHUA_BC_MATRIX_FORMATS; ++i)
+    {
+        if (state->bc_matrix_srvs[i])
+            ID3D11ShaderResourceView_Release(state->bc_matrix_srvs[i]);
+        if (state->bc_matrix_textures[i])
+            ID3D11Texture2D_Release(state->bc_matrix_textures[i]);
+    }
     if (state->dsv) ID3D11DepthStencilView_Release(state->dsv);
     if (state->rtv) ID3D11RenderTargetView_Release(state->rtv);
     if (state->context) ID3D11DeviceContext_Release(state->context);
@@ -2543,7 +4608,8 @@ int main(int argc, char **argv)
     write_state(&state, "STARTED", "startup", "DXVK Legacy D3D11 smoke starting");
     if (!create_device(&state))
     {
-        write_state(&state, "FAIL", "dxvk", "D3D11 device or shader creation failed");
+        write_state(&state, "FAIL", "dxvk",
+                    "D3D11 initialization or required feature contract failed");
         release_state(&state);
         return 1;
     }
