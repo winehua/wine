@@ -3146,6 +3146,81 @@ static BOOL create_d24s8_depth_texture(
     return TRUE;
 }
 
+static BOOL render_d24s8_cube_corner_pattern(
+    struct smoke_state *state, ID3D11Texture2D *texture)
+{
+    static const float corner_depths[WINEHUA_D24_CUBE_ARRAY_LAYERS] = {
+        0.875f, 0.875f, 0.875f, 0.125f, 0.125f, 0.125f,
+        0.125f, 0.125f, 0.125f, 0.875f, 0.875f, 0.875f,
+    };
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {0};
+    D3D11_DEPTH_STENCIL_DESC depth_desc = {0};
+    D3D11_VIEWPORT viewport = {3.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
+    ID3D11DepthStencilState *depth_state = NULL;
+    ID3D11DepthStencilView *dsv = NULL;
+    HRESULT result;
+    UINT layer;
+
+    depth_desc.DepthEnable = TRUE;
+    depth_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    depth_desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    result = ID3D11Device_CreateDepthStencilState(
+        state->device, &depth_desc, &depth_state);
+    if (FAILED(result))
+        return FALSE;
+
+    dsv_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+    dsv_desc.Texture2DArray.MipSlice = 0;
+    dsv_desc.Texture2DArray.ArraySize = 1;
+    ID3D11DeviceContext_IASetInputLayout(state->context, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(
+        state->context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(
+        state->context, state->fullscreen_vertex_shader, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(state->context, NULL, NULL, 0);
+    ID3D11DeviceContext_RSSetViewports(state->context, 1, &viewport);
+    ID3D11DeviceContext_OMSetDepthStencilState(
+        state->context, depth_state, 0);
+
+    for (layer = 0; layer < WINEHUA_D24_CUBE_ARRAY_LAYERS; ++layer)
+    {
+        dsv_desc.Texture2DArray.FirstArraySlice = layer;
+        result = ID3D11Device_CreateDepthStencilView(
+            state->device, (ID3D11Resource *)texture, &dsv_desc, &dsv);
+        if (FAILED(result))
+            break;
+        viewport.MinDepth = corner_depths[layer];
+        viewport.MaxDepth = corner_depths[layer];
+        ID3D11DeviceContext_RSSetViewports(
+            state->context, 1, &viewport);
+        ID3D11DeviceContext_OMSetRenderTargets(
+            state->context, 0, NULL, dsv);
+        ID3D11DeviceContext_Draw(state->context, 3, 0);
+        ID3D11DeviceContext_OMSetRenderTargets(
+            state->context, 0, NULL, NULL);
+        ID3D11DepthStencilView_Release(dsv);
+        dsv = NULL;
+    }
+
+    ID3D11DeviceContext_VSSetShader(state->context, NULL, NULL, 0);
+    ID3D11DeviceContext_OMSetDepthStencilState(
+        state->context, NULL, 0);
+    if (dsv)
+        ID3D11DepthStencilView_Release(dsv);
+    ID3D11DeviceContext_OMSetRenderTargets(
+        state->context, 0, NULL, NULL);
+    ID3D11DepthStencilState_Release(depth_state);
+    if (FAILED(result))
+    {
+        fprintf(stderr,
+                "winehua_d3d11_smoke: D24S8 CubeArray corner pattern failed=0x%08lx\n",
+                (unsigned long)result);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static BOOL run_heaven_d24s8_extended_matrix(struct smoke_state *state)
 {
     static const char *array_shader_source =
@@ -3200,20 +3275,25 @@ static BOOL run_heaven_d24s8_extended_matrix(struct smoke_state *state)
     static const char *cube_array_shader_source =
         "TextureCubeArray<float> inputDepth : register(t0);"
         "SamplerComparisonState comparisonSampler : register(s0);"
+        "SamplerState regularSampler : register(s1);"
         "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
         "float3 cubeDirection(uint face) {"
-        " if (face == 0) return float3(1,0,0);"
-        " if (face == 1) return float3(-1,0,0);"
-        " if (face == 2) return float3(0,1,0);"
-        " if (face == 3) return float3(0,-1,0);"
-        " if (face == 4) return float3(0,0,1);"
-        " return float3(0,0,-1); }"
+        " if (face == 0) return float3(1,0.75,-0.75);"
+        " if (face == 1) return float3(-1,0.75,0.75);"
+        " if (face == 2) return float3(0.75,1,-0.75);"
+        " if (face == 3) return float3(0.75,-1,0.75);"
+        " if (face == 4) return float3(0.75,0.75,1);"
+        " return float3(-0.75,0.75,-1); }"
         "float4 main(PSIn input) : SV_Target {"
         "uint face = min((uint)(input.pos.x * (6.0 / 64.0)), 5u);"
         "float cube = input.pos.y >= 32.0 ? 1.0 : 0.0;"
-        "float value = inputDepth.SampleCmpLevelZero("
-        " comparisonSampler, float4(cubeDirection(face), cube), 0.5);"
-        "return float4(value, value, value, 1.0); }";
+        "float4 coord = float4(cubeDirection(face), cube);"
+        "float sampled = inputDepth.SampleLevel(regularSampler, coord, 0.0);"
+        "float explicitCmp = inputDepth.SampleCmpLevelZero("
+        " comparisonSampler, coord, 0.5);"
+        "float implicitCmp = inputDepth.SampleCmp("
+        " comparisonSampler, coord, 0.5);"
+        "return float4(sampled, explicitCmp, implicitCmp, 1.0); }";
     static const char *linear_border_shader_source =
         "Texture2DArray<float> inputDepth : register(t0);"
         "SamplerComparisonState comparisonSampler : register(s0);"
@@ -3254,10 +3334,10 @@ static BOOL run_heaven_d24s8_extended_matrix(struct smoke_state *state)
         0xff9f9f9fu, 0xffbfbfbfu, 0xffdfdfdfu,
     };
     static const UINT cube_array_expected[WINEHUA_D24_CUBE_ARRAY_LAYERS] = {
-        0xff000000u, 0xff000000u, 0xff000000u,
-        0xffffffffu, 0xffffffffu, 0xffffffffu,
-        0xffffffffu, 0xffffffffu, 0xffffffffu,
-        0xff000000u, 0xff000000u, 0xff000000u,
+        0xffffffdfu, 0xffffffdfu, 0xffffffdfu,
+        0xff000020u, 0xff000020u, 0xff000020u,
+        0xff000020u, 0xff000020u, 0xff000020u,
+        0xffffffdfu, 0xffffffdfu, 0xffffffdfu,
     };
     static const UINT border_x[WINEHUA_D24_BORDER_CASES] = {8, 24, 40, 56};
     static const UINT border_y[WINEHUA_D24_BORDER_CASES] = {32, 32, 32, 32};
@@ -3308,6 +3388,12 @@ static BOOL run_heaven_d24s8_extended_matrix(struct smoke_state *state)
             state, WINEHUA_D24_CUBE_ARRAY_LAYERS,
             D3D11_RESOURCE_MISC_TEXTURECUBE, cube_array_depths,
             &cube_texture, "D24S8 cube array"))
+        goto done;
+
+    /* Replace the cleared CubeArray values at one off-axis texel. This
+     * distinguishes face/UV orientation from a test that samples only the
+     * cube center, while leaving the independent 2D-array texture intact. */
+    if (!render_d24s8_cube_corner_pattern(state, cube_texture))
         goto done;
 
     sampler_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
@@ -3455,14 +3541,22 @@ static BOOL run_heaven_d24s8_extended_matrix(struct smoke_state *state)
     result = ID3D11Device_CreateShaderResourceView(
         state->device, (ID3D11Resource *)cube_texture, &srv_desc, &srv);
     if (SUCCEEDED(result))
+    {
+        ID3D11SamplerState *regular_samplers[] = {regular_linear_sampler};
+        ID3D11SamplerState *null_samplers[] = {NULL};
+        ID3D11DeviceContext_PSSetSamplers(
+            state->context, 1, 1, regular_samplers);
         state->heaven_d24s8_cube_array_functional =
-            run_heaven_fullscreen_probe(
+            run_heaven_fullscreen_probe_tolerance(
                 state, cube_array_shader, srv, linear_clamp_sampler,
                 cube_array_x, cube_array_y, cube_array_expected,
                 WINEHUA_D24_CUBE_ARRAY_LAYERS,
                 state->heaven_d24s8_cube_array_values,
-                &state->heaven_d24s8_extended_mismatches[5],
-                "D24S8 TextureCubeArray linear comparison");
+                &state->heaven_d24s8_extended_mismatches[5], 2,
+                "D24S8 TextureCubeArray mixed sample and comparison");
+        ID3D11DeviceContext_PSSetSamplers(
+            state->context, 1, 1, null_samplers);
+    }
 
 done:
     if (FAILED(result))
