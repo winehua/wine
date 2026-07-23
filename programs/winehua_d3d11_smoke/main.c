@@ -47,6 +47,7 @@ struct cube_constants
 #define WINEHUA_D24_DEPTH_POINTS 3
 #define WINEHUA_D24_COMPARE_POINTS 9
 #define WINEHUA_RGBA16F_POINTS 6
+#define WINEHUA_HEAVEN_MINI_POINTS 4
 
 struct smoke_state
 {
@@ -200,6 +201,7 @@ struct smoke_state
     BOOL mrt_gbuffer_functional;
     BOOL d24_readonly_shadow_functional;
     BOOL rgba16f_rtv_srv_load_functional;
+    BOOL heaven_mini_pipeline_functional;
     BOOL heaven_pass_functional;
     BOOL stencil_functional;
     BOOL stencil_pixel_functional;
@@ -248,9 +250,11 @@ struct smoke_state
     UINT rgba16f_initial_values[WINEHUA_RGBA16F_POINTS];
     UINT rgba16f_added_values[WINEHUA_RGBA16F_POINTS];
     UINT rgba16f_tonemap_values[WINEHUA_RGBA16F_POINTS];
+    UINT heaven_mini_pipeline_values[WINEHUA_HEAVEN_MINI_POINTS];
     UINT mrt_gbuffer_mismatches;
     UINT d24_readonly_shadow_mismatches;
     UINT rgba16f_rtv_srv_load_mismatches;
+    UINT heaven_mini_pipeline_mismatches;
     UINT texture3d_upload_mismatches;
     UINT texture3d_single_mismatches;
     UINT texture3d_pingpong_mismatches;
@@ -384,6 +388,7 @@ static void write_state(struct smoke_state *state, const char *status,
     char rgba16f_initial_values[128];
     char rgba16f_added_values[128];
     char rgba16f_tonemap_values[128];
+    char heaven_mini_pipeline_values[96];
     char bc_matrix_values[256];
     const char *version = winehua_smoke_env("WINEHUA_DXVK_VERSION", "unknown");
     BOOL dxvk_loaded;
@@ -456,6 +461,10 @@ static void write_state(struct smoke_state *state, const char *status,
                      state->rgba16f_added_values, WINEHUA_RGBA16F_POINTS);
     format_hex_array(rgba16f_tonemap_values, sizeof(rgba16f_tonemap_values),
                      state->rgba16f_tonemap_values, WINEHUA_RGBA16F_POINTS);
+    format_hex_array(heaven_mini_pipeline_values,
+                     sizeof(heaven_mini_pipeline_values),
+                     state->heaven_mini_pipeline_values,
+                     WINEHUA_HEAVEN_MINI_POINTS);
     format_hex_array(bc_matrix_values, sizeof(bc_matrix_values),
                      (const UINT *)state->bc_matrix_values,
                      WINEHUA_BC_MATRIX_FORMATS * 2);
@@ -550,6 +559,8 @@ static void write_state(struct smoke_state *state, const char *status,
              "\"rewrite\":[%s],\"mismatches\":%u,\"pass\":%s},"
              "\"rgba16fRtvSrvLoad\":{\"initial\":[%s],\"added\":[%s],"
              "\"tonemap\":[%s],\"mismatches\":%u,\"pass\":%s},"
+             "\"miniPipeline\":{\"values\":[%s],\"mismatches\":%u,"
+             "\"pass\":%s},"
              "\"pass\":%s},"
              "\"decodedFormat\":\"R8G8B8A8_UNORM\",\"decodedBytes\":256,"
              "\"cpuDecodeUs\":0,\"durationMs\":%llu}",
@@ -726,6 +737,9 @@ static void write_state(struct smoke_state *state, const char *status,
              rgba16f_tonemap_values,
              state->rgba16f_rtv_srv_load_mismatches,
              state->rgba16f_rtv_srv_load_functional ? "true" : "false",
+             heaven_mini_pipeline_values,
+             state->heaven_mini_pipeline_mismatches,
+             state->heaven_mini_pipeline_functional ? "true" : "false",
              state->heaven_pass_functional ? "true" : "false",
              winehua_smoke_timestamp_ms() - state->started_ms);
     winehua_smoke_write_result(&state->smoke, status, stage, message, metrics);
@@ -4422,16 +4436,308 @@ done:
     return state->rgba16f_rtv_srv_load_functional;
 }
 
+static void run_heaven_target_pass(
+    struct smoke_state *state, ID3D11RenderTargetView *target,
+    UINT width, UINT height, ID3D11PixelShader *pixel_shader,
+    ID3D11ShaderResourceView *const *resources, UINT resource_count)
+{
+    D3D11_VIEWPORT viewport = {0, 0, width, height, 0.0f, 1.0f};
+    ID3D11ShaderResourceView *null_resources[8] = {0};
+    ID3D11RenderTargetView *targets[] = {target};
+
+    ID3D11DeviceContext_OMSetRenderTargets(state->context, 1, targets, NULL);
+    ID3D11DeviceContext_OMSetDepthStencilState(state->context, NULL, 0);
+    ID3D11DeviceContext_OMSetBlendState(
+        state->context, NULL, NULL, 0xffffffffu);
+    ID3D11DeviceContext_RSSetViewports(state->context, 1, &viewport);
+    ID3D11DeviceContext_IASetInputLayout(state->context, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(
+        state->context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(
+        state->context, state->fullscreen_vertex_shader, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(
+        state->context, pixel_shader, NULL, 0);
+    if (resource_count)
+        ID3D11DeviceContext_PSSetShaderResources(
+            state->context, 0, resource_count, resources);
+    ID3D11DeviceContext_Draw(state->context, 3, 0);
+    if (resource_count)
+        ID3D11DeviceContext_PSSetShaderResources(
+            state->context, 0, resource_count, null_resources);
+    ID3D11DeviceContext_PSSetShader(state->context, NULL, NULL, 0);
+    ID3D11DeviceContext_OMSetRenderTargets(state->context, 0, NULL, NULL);
+}
+
+static BOOL run_heaven_mini_pipeline_smoke(struct smoke_state *state)
+{
+    static const char *geometry_source =
+        "struct PSIn { float4 pos : SV_Position; float2 uv : TEXCOORD0; };"
+        "struct PSOut { float4 rt0 : SV_Target0; float4 rt1 : SV_Target1;"
+        " float4 rt2 : SV_Target2; float depth : SV_Depth; };"
+        "PSOut main(PSIn input) { PSOut output;"
+        " bool right = input.pos.x >= 32.0;"
+        " bool bottom = input.pos.y >= 32.0;"
+        " float3 albedo = !bottom ? (right ? float3(0,1,0) : float3(1,0,0))"
+        "                         : (right ? float3(1,1,1) : float3(0,0,1));"
+        " float material = !bottom ? (right ? 0.5 : 0.25)"
+        "                           : (right ? 1.0 : 0.75);"
+        " float depth = !bottom ? (right ? 0.4 : 0.2)"
+        "                        : (right ? 0.8 : 0.6);"
+        " output.rt0 = float4(albedo,1);"
+        " output.rt1 = float4(0.5,0.5,1,1);"
+        " output.rt2 = float4(material,0,0,1);"
+        " output.depth = depth; return output; }";
+    static const char *lighting_source =
+        "Texture2D<float4> gbuffer0 : register(t0);"
+        "Texture2D<float4> gbuffer1 : register(t1);"
+        "Texture2D<float4> gbuffer2 : register(t2);"
+        "Texture2D<float> depthTexture : register(t3);"
+        "float4 main(float4 pos : SV_Position) : SV_Target {"
+        " int3 p = int3(pos.xy,0);"
+        " float3 albedo = gbuffer0.Load(p).rgb;"
+        " float ndotl = saturate(gbuffer1.Load(p).z * 2.0 - 1.0);"
+        " float material = gbuffer2.Load(p).r;"
+        " float depth = depthTexture.Load(p);"
+        " float3 lit = albedo * (0.5 + material * 2.0) * ndotl"
+        "            + depth.xxx * 0.25;"
+        " return float4(lit,1); }";
+    static const char *bloom_source =
+        "Texture2D<float4> hdrTexture : register(t0);"
+        "float4 main(float4 pos : SV_Position) : SV_Target {"
+        " int2 p = int2(pos.xy) * 2;"
+        " float3 value = (hdrTexture.Load(int3(p,0)).rgb"
+        "              + hdrTexture.Load(int3(p + int2(1,0),0)).rgb"
+        "              + hdrTexture.Load(int3(p + int2(0,1),0)).rgb"
+        "              + hdrTexture.Load(int3(p + int2(1,1),0)).rgb) * 0.25;"
+        " return float4(max(value - 1.0, 0.0),1); }";
+    static const char *tonemap_source =
+        "Texture2D<float4> hdrTexture : register(t0);"
+        "Texture2D<float4> bloomTexture : register(t1);"
+        "float4 main(float4 pos : SV_Position) : SV_Target {"
+        " int2 p = int2(pos.xy);"
+        " float3 hdr = hdrTexture.Load(int3(p,0)).rgb;"
+        " float3 bloom = bloomTexture.Load(int3(p / 2,0)).rgb;"
+        " float3 combined = hdr + bloom * 0.5;"
+        " return float4(combined / (1.0 + combined),1); }";
+    static const UINT x[WINEHUA_HEAVEN_MINI_POINTS] = {16, 48, 16, 48};
+    static const UINT y[WINEHUA_HEAVEN_MINI_POINTS] = {16, 16, 48, 48};
+    static const UINT expected[WINEHUA_HEAVEN_MINI_POINTS][3] = {
+        {132, 12, 12}, {23, 167, 23}, {33, 33, 187}, {199, 199, 199},
+    };
+    D3D11_TEXTURE2D_DESC color_desc = {0};
+    D3D11_TEXTURE2D_DESC depth_desc = {0};
+    D3D11_TEXTURE2D_DESC fp16_desc = {0};
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {0};
+    D3D11_SHADER_RESOURCE_VIEW_DESC depth_srv_desc = {0};
+    D3D11_VIEWPORT viewport = {0, 0, WINEHUA_FEATURE_PROBE_SIZE,
+                               WINEHUA_FEATURE_PROBE_SIZE, 0.0f, 1.0f};
+    ID3D11Texture2D *gbuffer[3] = {0};
+    ID3D11RenderTargetView *gbuffer_rtvs[3] = {0};
+    ID3D11ShaderResourceView *gbuffer_srvs[4] = {0};
+    ID3D11ShaderResourceView *post_srvs[2] = {0};
+    ID3D11Texture2D *depth = NULL;
+    ID3D11DepthStencilView *depth_dsv = NULL;
+    ID3D11Texture2D *hdr = NULL;
+    ID3D11RenderTargetView *hdr_rtv = NULL;
+    ID3D11ShaderResourceView *hdr_srv = NULL;
+    ID3D11Texture2D *bloom = NULL;
+    ID3D11RenderTargetView *bloom_rtv = NULL;
+    ID3D11ShaderResourceView *bloom_srv = NULL;
+    ID3D11PixelShader *geometry_shader = NULL;
+    ID3D11PixelShader *lighting_shader = NULL;
+    ID3D11PixelShader *bloom_shader = NULL;
+    ID3D11PixelShader *tonemap_shader = NULL;
+    UINT i;
+    HRESULT result = E_FAIL;
+
+    state->heaven_mini_pipeline_mismatches = 0;
+    geometry_shader = create_probe_pixel_shader(
+        state, geometry_source, "mini pipeline geometry");
+    lighting_shader = create_probe_pixel_shader(
+        state, lighting_source, "mini pipeline lighting");
+    bloom_shader = create_probe_pixel_shader(
+        state, bloom_source, "mini pipeline bloom downsample");
+    tonemap_shader = create_probe_pixel_shader(
+        state, tonemap_source, "mini pipeline tone map");
+    if (!geometry_shader || !lighting_shader || !bloom_shader ||
+        !tonemap_shader)
+        goto done;
+
+    color_desc.Width = WINEHUA_FEATURE_PROBE_SIZE;
+    color_desc.Height = WINEHUA_FEATURE_PROBE_SIZE;
+    color_desc.MipLevels = 1;
+    color_desc.ArraySize = 1;
+    color_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    color_desc.SampleDesc.Count = 1;
+    color_desc.Usage = D3D11_USAGE_DEFAULT;
+    color_desc.BindFlags = D3D11_BIND_RENDER_TARGET |
+                           D3D11_BIND_SHADER_RESOURCE;
+    result = S_OK;
+    for (i = 0; i < 3 && SUCCEEDED(result); ++i)
+    {
+        result = ID3D11Device_CreateTexture2D(
+            state->device, &color_desc, NULL, &gbuffer[i]);
+        if (SUCCEEDED(result))
+            result = ID3D11Device_CreateRenderTargetView(
+                state->device, (ID3D11Resource *)gbuffer[i], NULL,
+                &gbuffer_rtvs[i]);
+        if (SUCCEEDED(result))
+            result = ID3D11Device_CreateShaderResourceView(
+                state->device, (ID3D11Resource *)gbuffer[i], NULL,
+                &gbuffer_srvs[i]);
+    }
+
+    depth_desc = color_desc;
+    depth_desc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+    depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL |
+                           D3D11_BIND_SHADER_RESOURCE;
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreateTexture2D(
+            state->device, &depth_desc, NULL, &depth);
+    dsv_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreateDepthStencilView(
+            state->device, (ID3D11Resource *)depth, &dsv_desc, &depth_dsv);
+    depth_srv_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    depth_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    depth_srv_desc.Texture2D.MipLevels = 1;
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreateShaderResourceView(
+            state->device, (ID3D11Resource *)depth, &depth_srv_desc,
+            &gbuffer_srvs[3]);
+
+    fp16_desc = color_desc;
+    fp16_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreateTexture2D(
+            state->device, &fp16_desc, NULL, &hdr);
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreateRenderTargetView(
+            state->device, (ID3D11Resource *)hdr, NULL, &hdr_rtv);
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreateShaderResourceView(
+            state->device, (ID3D11Resource *)hdr, NULL, &hdr_srv);
+    fp16_desc.Width /= 2;
+    fp16_desc.Height /= 2;
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreateTexture2D(
+            state->device, &fp16_desc, NULL, &bloom);
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreateRenderTargetView(
+            state->device, (ID3D11Resource *)bloom, NULL, &bloom_rtv);
+    if (SUCCEEDED(result))
+        result = ID3D11Device_CreateShaderResourceView(
+            state->device, (ID3D11Resource *)bloom, NULL, &bloom_srv);
+    if (FAILED(result)) goto done;
+
+    ID3D11DeviceContext_OMSetRenderTargets(
+        state->context, 3, gbuffer_rtvs, depth_dsv);
+    for (i = 0; i < 3; ++i)
+        ID3D11DeviceContext_ClearRenderTargetView(
+            state->context, gbuffer_rtvs[i], (const float[]){0, 0, 0, 1});
+    ID3D11DeviceContext_ClearDepthStencilView(
+        state->context, depth_dsv,
+        D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+    ID3D11DeviceContext_OMSetDepthStencilState(state->context, NULL, 0);
+    ID3D11DeviceContext_OMSetBlendState(
+        state->context, NULL, NULL, 0xffffffffu);
+    ID3D11DeviceContext_RSSetViewports(state->context, 1, &viewport);
+    ID3D11DeviceContext_IASetInputLayout(state->context, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(
+        state->context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(
+        state->context, state->fullscreen_vertex_shader, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(
+        state->context, geometry_shader, NULL, 0);
+    ID3D11DeviceContext_Draw(state->context, 3, 0);
+    ID3D11DeviceContext_PSSetShader(state->context, NULL, NULL, 0);
+    ID3D11DeviceContext_OMSetRenderTargets(state->context, 0, NULL, NULL);
+
+    ID3D11DeviceContext_ClearRenderTargetView(
+        state->context, hdr_rtv, (const float[]){0, 0, 0, 1});
+    run_heaven_target_pass(
+        state, hdr_rtv, WINEHUA_FEATURE_PROBE_SIZE,
+        WINEHUA_FEATURE_PROBE_SIZE, lighting_shader, gbuffer_srvs, 4);
+
+    post_srvs[0] = hdr_srv;
+    ID3D11DeviceContext_ClearRenderTargetView(
+        state->context, bloom_rtv, (const float[]){0, 0, 0, 1});
+    run_heaven_target_pass(
+        state, bloom_rtv, WINEHUA_FEATURE_PROBE_SIZE / 2,
+        WINEHUA_FEATURE_PROBE_SIZE / 2, bloom_shader, post_srvs, 1);
+
+    post_srvs[1] = bloom_srv;
+    run_heaven_target_pass(
+        state, state->probe_rtv, WINEHUA_FEATURE_PROBE_SIZE,
+        WINEHUA_FEATURE_PROBE_SIZE, tonemap_shader, post_srvs, 2);
+    if (!read_heaven_probe_points(
+            state, x, y, WINEHUA_HEAVEN_MINI_POINTS,
+            state->heaven_mini_pipeline_values, "Heaven mini pipeline"))
+        goto done;
+    for (i = 0; i < WINEHUA_HEAVEN_MINI_POINTS; ++i)
+    {
+        UINT value = state->heaven_mini_pipeline_values[i];
+        UINT red = value & 0xffu;
+        UINT green = (value >> 8) & 0xffu;
+        UINT blue = (value >> 16) & 0xffu;
+        if (red + 6 < expected[i][0] || red > expected[i][0] + 6 ||
+            green + 6 < expected[i][1] || green > expected[i][1] + 6 ||
+            blue + 6 < expected[i][2] || blue > expected[i][2] + 6 ||
+            (value >> 24) != 0xffu)
+            state->heaven_mini_pipeline_mismatches++;
+    }
+    state->heaven_mini_pipeline_functional =
+        state->heaven_mini_pipeline_mismatches == 0;
+
+done:
+    if (FAILED(result))
+    {
+        state->present_result = result;
+        fprintf(stderr,
+                "winehua_d3d11_smoke: Heaven mini pipeline resource failure=0x%08lx\n",
+                (unsigned long)result);
+    }
+    fprintf(stderr,
+            "winehua_d3d11_smoke: Heaven mini pipeline mismatches=%u pass=%u\n",
+            state->heaven_mini_pipeline_mismatches,
+            state->heaven_mini_pipeline_functional);
+    if (tonemap_shader) ID3D11PixelShader_Release(tonemap_shader);
+    if (bloom_shader) ID3D11PixelShader_Release(bloom_shader);
+    if (lighting_shader) ID3D11PixelShader_Release(lighting_shader);
+    if (geometry_shader) ID3D11PixelShader_Release(geometry_shader);
+    if (bloom_srv) ID3D11ShaderResourceView_Release(bloom_srv);
+    if (bloom_rtv) ID3D11RenderTargetView_Release(bloom_rtv);
+    if (bloom) ID3D11Texture2D_Release(bloom);
+    if (hdr_srv) ID3D11ShaderResourceView_Release(hdr_srv);
+    if (hdr_rtv) ID3D11RenderTargetView_Release(hdr_rtv);
+    if (hdr) ID3D11Texture2D_Release(hdr);
+    if (gbuffer_srvs[3])
+        ID3D11ShaderResourceView_Release(gbuffer_srvs[3]);
+    if (depth_dsv) ID3D11DepthStencilView_Release(depth_dsv);
+    if (depth) ID3D11Texture2D_Release(depth);
+    for (i = 0; i < 3; ++i)
+    {
+        if (gbuffer_srvs[i])
+            ID3D11ShaderResourceView_Release(gbuffer_srvs[i]);
+        if (gbuffer_rtvs[i])
+            ID3D11RenderTargetView_Release(gbuffer_rtvs[i]);
+        if (gbuffer[i]) ID3D11Texture2D_Release(gbuffer[i]);
+    }
+    return state->heaven_mini_pipeline_functional;
+}
+
 static BOOL run_heaven_pass_probes(struct smoke_state *state)
 {
     const BOOL mrt = run_mrt_gbuffer_smoke(state);
     const BOOL d24 = run_d24_readonly_shadow_smoke(state);
     const BOOL rgba16f = run_rgba16f_rtv_srv_load_smoke(state);
+    const BOOL mini = run_heaven_mini_pipeline_smoke(state);
 
-    state->heaven_pass_functional = mrt && d24 && rgba16f;
+    state->heaven_pass_functional = mrt && d24 && rgba16f && mini;
     fprintf(stderr,
-            "winehua_d3d11_smoke: Heaven pass matrix MRT=%u D24=%u RGBA16F=%u pass=%u\n",
-            mrt, d24, rgba16f, state->heaven_pass_functional);
+            "winehua_d3d11_smoke: Heaven pass matrix MRT=%u D24=%u RGBA16F=%u mini=%u pass=%u\n",
+            mrt, d24, rgba16f, mini, state->heaven_pass_functional);
     return state->heaven_pass_functional;
 }
 
