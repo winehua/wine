@@ -869,10 +869,14 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
     {
         if (builtin->unix_path && !builtin->unix_handle)
         {
+#ifdef __OHOS__
             /* OHOS: dlopen 不能用绝对路径, 只取文件名让系统 linker 搜索 libs/ */
             const char *name = strrchr( builtin->unix_path, '/' );
             name = name ? name + 1 : builtin->unix_path;
             builtin->unix_handle = dlopen( name, RTLD_NOW );
+#else
+            builtin->unix_handle = dlopen( builtin->unix_path, RTLD_NOW );
+#endif
             if (!builtin->unix_handle)
                 WARN_(module)( "failed to load %s: %s\n", debugstr_a(builtin->unix_path), dlerror() );
         }
@@ -4098,7 +4102,13 @@ TEB *virtual_alloc_first_teb(void)
     }
 
     NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, is_win64 ? limit_2g - 1 : 0, &total,
-                             MEM_RESERVE, PAGE_READWRITE );  /* OHOS: skip MEM_TOP_DOWN for Box64 */
+                             MEM_RESERVE
+#ifdef __OHOS__
+                             /* OHOS: Box64 doesn't support MEM_TOP_DOWN */
+#else
+                             | MEM_TOP_DOWN
+#endif
+                             , PAGE_READWRITE );
     teb_block_pos = 30;
     ptr = (char *)teb_block + 30 * block_size;
     data_size = 2 * block_size;

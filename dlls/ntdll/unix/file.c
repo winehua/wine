@@ -4345,19 +4345,25 @@ NTSTATUS unix_to_nt_file_name( const char *unix_name, WCHAR **nt, UINT dispositi
     if (!name) return STATUS_NO_MEMORY;
     status = find_drive_nt_root( name, len - 1, &buffer, disposition );
     free( name );
-    if (status && status != STATUS_NO_SUCH_FILE && status != STATUS_OBJECT_PATH_NOT_FOUND)
+    if (status && status != STATUS_NO_SUCH_FILE
+#ifdef __OHOS__
+        && status != STATUS_OBJECT_PATH_NOT_FOUND
+#endif
+        )
     {
         ERR( "unix_to_nt_file_name: find_drive_nt_root failed status=%08x for %s\n", status, unix_name );
         return status;
     }
 
-    if (!buffer)  /* dosdevices symlinks unavailable, fall back to \\?\unix path */
+    if (!buffer)  /* conversion failed, return \\?\unix path */
     {
         if (!(buffer = malloc( sizeof(unix_prefixW) + len * sizeof(WCHAR) ))) return STATUS_NO_MEMORY;
         memcpy( buffer, unix_prefixW, sizeof(unix_prefixW) );
         ntdll_umbstowcs( unix_name, len, buffer + ARRAY_SIZE(unix_prefixW), len );
         collapse_path( buffer );
-        status = STATUS_SUCCESS;  /* fallback succeeded, clear error */
+#ifdef __OHOS__
+        status = STATUS_SUCCESS;  /* OHOS: dosdevices symlinks unavailable, fallback succeeded */
+#endif
     }
 
     *nt = buffer;
