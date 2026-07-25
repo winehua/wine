@@ -39,6 +39,7 @@ SOURCES = \
 	menu.c \
 	message.c \
 	opengl.c \
+	opengl_diag.c \
 	opentype.c \
 	painting.c \
 	palette.c \
