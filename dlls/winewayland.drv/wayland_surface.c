@@ -271,7 +271,39 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface)
     xdg_toplevel_add_listener(surface->xdg_toplevel, &xdg_toplevel_listener, surface->hwnd);
 
     if (process_name)
-        xdg_toplevel_set_app_id(surface->xdg_toplevel, process_name);
+    {
+        /* Append window class suffix for known explorer window types,
+         * enabling the compositor to identify desktop root and taskbar
+         * without geometric heuristics.
+         *
+         * Class names as defined in programs/explorer/:
+         *   Shell_TrayWnd — systray.c:150 (taskbar)
+         *   #32769        — desktop.c:40  (DESKTOP_CLASS_ATOM, desktop shell) */
+        static const WCHAR taskbar_class[] = {'S','h','e','l','l','_','T','r','a','y','W','n','d', 0};
+        static const WCHAR desktop_atom[] = {'#','3','2','7','6','9', 0};
+        WCHAR class_buf[256];
+        UNICODE_STRING class_str = {.Buffer = class_buf, .MaximumLength = sizeof(class_buf)};
+        const char *suffix = NULL;
+
+        if (NtUserGetClassName(surface->hwnd, TRUE, &class_str))
+        {
+            if (!wcscmp(class_buf, taskbar_class))
+                suffix = "taskbar";
+            else if (!wcscmp(class_buf, desktop_atom))
+                suffix = "desktop-shell";
+        }
+
+        if (suffix)
+        {
+            char app_id[512];
+            snprintf(app_id, sizeof(app_id), "%s.%s", process_name, suffix);
+            xdg_toplevel_set_app_id(surface->xdg_toplevel, app_id);
+        }
+        else
+        {
+            xdg_toplevel_set_app_id(surface->xdg_toplevel, process_name);
+        }
+    }
 
     if (!NtUserInternalGetWindowText(surface->hwnd, text, ARRAY_SIZE(text)))
         text[0] = 0;
