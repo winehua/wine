@@ -432,82 +432,15 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
      * Broker 在主进程上下文（非 appspawn 子进程）调用 StartNativeChildProcess，
      * 并通过 SCM_RIGHTS 传递 wineserver socket fd 给子进程。 */
     {
-        const char *binDir = getenv("WINEBINDIR");
-        if (!binDir) binDir = "/data/storage/el2/base/files/wine/bin";
-        extern char **environ;
-        char *entryParams = NULL;
-        int i, j, len;
-        /* 要传给子进程的命名 fd —— 目前仅 wineserver 通信 socket。
-         * 未来的宿主 fd 桥(GPU/剪贴板等)在此 append 即可, 协议无需再改。 */
-        const char *fd_names[4];
-        int fds[4];
-        int n_send_fds = 0;
-
         argv = build_argv( &params->CommandLine, 0 );
-
-        /* 构建 entryParams: "binDir|arg0|arg1|..."
-         * ARM64 Box64 in-process 模式下不需要 "|wine" 前缀，因为 Box64
-         * 已将目标 ELF 路径设为 guest argv[0]。x86_64 Pad 仍需前缀。 */
-        len = strlen(binDir) + 1;
-        if (!getenv("USE_LIBBOX64"))
-            len += 5; /* + "|wine" */
-        for (i = 0; argv[i]; i++) len += strlen(argv[i]) + 1;
-
-        /* 预留环境变量空间: 每项 +7 为 "|__env=" 前缀。
-         * 过滤 per-process fd 变量: 子进程会从 fdList 拿到自己的值。 */
-        if (environ) {
-            for (j = 0; environ[j]; j++) {
-                if (strchr(environ[j], '|') || strchr(environ[j], '\n')) continue;
-                if (!strncmp(environ[j], "WINESERVERSOCKET=", 17) ||
-                    !strncmp(environ[j], "WINE_OHOS_AUDIO_ENABLE=", 23) ||
-                    !strncmp(environ[j], "WINE_OHOS_AUDIO_BOOTSTRAP_FD=", 29) ||
-                    !strncmp(environ[j], "WINE_OHOS_AUDIO_PROTOCOL_VERSION=", 33))
-                    continue;
-                len += strlen(environ[j]) + 7;
-            }
-        }
-
-        entryParams = malloc(len + 1);
-        if (entryParams)
-        {
-            char *p = entryParams;
-            if (getenv("USE_LIBBOX64"))
-                p += snprintf(p, len + 1, "%s", binDir);
-            else
-                p += snprintf(p, len + 1, "%s|wine", binDir);
-            for (i = 0; argv[i]; i++)
-                p += snprintf(p, len + 1 - (p - entryParams), "|%s", argv[i]);
-            /* 序列化父进程 environ 为 |__env=K=V| 段 (等价 fork+exec 继承) */
-            if (environ) {
-                for (j = 0; environ[j]; j++) {
-                    if (strchr(environ[j], '|') || strchr(environ[j], '\n')) continue;
-                    if (!strncmp(environ[j], "WINESERVERSOCKET=", 17) ||
-                        !strncmp(environ[j], "WINE_OHOS_AUDIO_ENABLE=", 23) ||
-                        !strncmp(environ[j], "WINE_OHOS_AUDIO_BOOTSTRAP_FD=", 29) ||
-                        !strncmp(environ[j], "WINE_OHOS_AUDIO_PROTOCOL_VERSION=", 33))
-                        continue;
-                    p += snprintf(p, len + 1 - (p - entryParams), "|__env=%s", environ[j]);
-                }
-            }
-        }
-
-        /* 收集要传给子进程的命名 fd (目前仅 wineserver 通信 socket) */
-        fd_names[n_send_fds] = "wineserver_sock";
-        fds[n_send_fds] = socketfd;
-        n_send_fds++;
-
-        /* 通过 Process Broker 创建子进程 */
         {
             int child_pid = -1;
-            if (ohos_broker_spawn(entryParams, fd_names, fds, n_send_fds, &child_pid) == 0)
+            if (ohos_broker_spawn_child( argv, socketfd, &child_pid ) == 0)
                 pid = child_pid;
             else
-                pid = -1;
-            if (pid <= 0) status = STATUS_UNSUCCESSFUL;
+                status = STATUS_UNSUCCESSFUL;
         }
-
         free(argv);
-        free(entryParams);
     }
 #else
     if (!(pid = fork()))  /* child */

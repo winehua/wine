@@ -41,6 +41,17 @@ int ohos_broker_spawn(const char *entry_params,
                       const char **fd_names, const int *fds, int n_fds,
                       int *child_pid);
 
+/* Convenience: spawn wineserver via broker.
+ * Resolves binDir from WINEBINDIR env, sends "binDir|wineserver|-f|-p".
+ * Returns 0 on success (sets *child_pid), -1 on failure. */
+int ohos_broker_spawn_wineserver( int *child_pid );
+
+/* Convenience: spawn a Wine child process via broker.
+ * Builds entryParams from argv + environ (blacklist-filtered),
+ * and passes socketfd as "wineserver_sock" via SCM_RIGHTS.
+ * Returns 0 on success (sets *child_pid), -1 on failure. */
+int ohos_broker_spawn_child( char **argv, int socketfd, int *child_pid );
+
 #endif /* __OHOS__ */
 
 #endif /* __WINE_OHOS_BROKER_H */

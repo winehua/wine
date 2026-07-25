@@ -597,17 +597,9 @@ void start_server( BOOL debug )
 
         if (!socket_alive)
         {
-            const char *binDir = getenv("WINEBINDIR");
-            if (!binDir) binDir = "/data/storage/el2/base/files/wine/bin";
-
-            {
-                char entryParams[1024];
-                snprintf(entryParams, sizeof(entryParams), "%s|wineserver|-f|-p", binDir);
-
-                int child_pid;
-                if (ohos_broker_spawn(entryParams, NULL, NULL, 0, &child_pid) == 0)
-                    started = TRUE;
-            }
+            int child_pid;
+            if (ohos_broker_spawn_wineserver(&child_pid) == 0)
+                started = TRUE;
 
             if (started)
             {

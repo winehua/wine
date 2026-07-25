@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -138,5 +139,103 @@ int ohos_broker_spawn(const char *entry_params,
         ret = broker_send_spawn(broker_fd, entry_params, fd_names, fds, n_fds, child_pid);
 
     close(broker_fd);
+    return ret;
+}
+
+
+/* Resolve binDir from WINEBINDIR env or fallback. */
+static const char *resolve_bindir(void)
+{
+    const char *dir = getenv("WINEBINDIR");
+    return dir ? dir : "/data/storage/el2/base/files/wine/bin";
+}
+
+
+/* Check if an env var should be forwarded to the child.
+ * Blacklist: per-process fd/handle vars that the child gets via fdList. */
+static int env_forwardable(const char *env)
+{
+    if (strchr(env, '|') || strchr(env, '\n')) return 0;
+    if (!strncmp(env, "WINESERVERSOCKET=", 17) ||
+        !strncmp(env, "WINE_OHOS_AUDIO_ENABLE=", 23) ||
+        !strncmp(env, "WINE_OHOS_AUDIO_BOOTSTRAP_FD=", 29) ||
+        !strncmp(env, "WINE_OHOS_AUDIO_PROTOCOL_VERSION=", 33))
+        return 0;
+    return 1;
+}
+
+
+/***********************************************************************
+ *           ohos_broker_spawn_wineserver
+ *
+ * Convenience wrapper to spawn wineserver via the Process Broker.
+ * Resolves binDir and sends entry_params "binDir|wineserver|-f|-p".
+ */
+int ohos_broker_spawn_wineserver( int *child_pid )
+{
+    const char *binDir = resolve_bindir();
+    char entryParams[1024];
+    snprintf(entryParams, sizeof(entryParams), "%s|wineserver|-f|-p", binDir);
+    return ohos_broker_spawn(entryParams, NULL, NULL, 0, child_pid);
+}
+
+
+/***********************************************************************
+ *           ohos_broker_spawn_child
+ *
+ * Spawn a Wine child process via the Process Broker.
+ * Builds entryParams from argv array + filtered environ, and passes
+ * socketfd as "wineserver_sock" via SCM_RIGHTS.
+ */
+int ohos_broker_spawn_child( char **argv, int socketfd, int *child_pid )
+{
+    const char *binDir = resolve_bindir();
+    extern char **environ;
+    char *entryParams = NULL;
+    const char *fd_names[4];
+    int fds[4];
+    int n_send_fds = 0;
+    int i, j, len;
+    int ret;
+
+    /* Compute entryParams buffer size */
+    len = strlen(binDir) + 1;
+    if (!getenv("USE_LIBBOX64"))
+        len += 5; /* + "|wine" */
+    for (i = 0; argv[i]; i++) len += strlen(argv[i]) + 1;
+    if (environ) {
+        for (j = 0; environ[j]; j++) {
+            if (!env_forwardable(environ[j])) continue;
+            len += strlen(environ[j]) + 7; /* "|__env=" prefix */
+        }
+    }
+
+    entryParams = malloc(len + 1);
+    if (!entryParams) return -1;
+
+    /* Build entryParams: "binDir[|wine]|arg0|arg1|...|__env=K=V|..." */
+    {
+        char *p = entryParams;
+        if (getenv("USE_LIBBOX64"))
+            p += snprintf(p, len + 1, "%s", binDir);
+        else
+            p += snprintf(p, len + 1, "%s|wine", binDir);
+        for (i = 0; argv[i]; i++)
+            p += snprintf(p, len + 1 - (p - entryParams), "|%s", argv[i]);
+        if (environ) {
+            for (j = 0; environ[j]; j++) {
+                if (!env_forwardable(environ[j])) continue;
+                p += snprintf(p, len + 1 - (p - entryParams), "|__env=%s", environ[j]);
+            }
+        }
+    }
+
+    /* Collect fds */
+    fd_names[n_send_fds] = "wineserver_sock";
+    fds[n_send_fds] = socketfd;
+    n_send_fds++;
+
+    ret = ohos_broker_spawn(entryParams, fd_names, fds, n_send_fds, child_pid);
+    free(entryParams);
     return ret;
 }
