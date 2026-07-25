@@ -1467,6 +1467,8 @@ BOOL WINAPI SetupCommitFileQueueW( HWND owner, HSPFILEQ handle, PSP_FILE_CALLBAC
                     op->src_path = NULL;
                 }
 
+                /* NOTE: This file is compiled as a PE target — __OHOS__
+                 * is NOT defined. Do NOT wrap OHOS code with #ifdef. */
                 {
                     int needmedia_retries = 0;
                     for (;;)

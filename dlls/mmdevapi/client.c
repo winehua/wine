@@ -374,6 +374,9 @@ HRESULT validate_fmt(const WAVEFORMATEXTENSIBLE *fmt, BOOL compatible)
     return ret;
 }
 
+/* NOTE: This file is compiled as a PE target (x86_64-windows / i386-windows).
+ * __OHOS__ is NOT defined here — do NOT wrap OHOS-specific code with
+ * #ifdef __OHOS__, or it will be silently dropped from the PE DLL. */
 static BOOL backend_allows_shared_mode_conversion(void)
 {
     static const WCHAR wineohos_driverW[] = L"wineohos.drv";
