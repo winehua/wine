@@ -124,6 +124,9 @@
 #include "wine/list.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#ifdef __OHOS__
+#include "ohos_file.h"
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(file);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
@@ -2351,25 +2354,11 @@ static unsigned int get_drives_info( struct file_identity info[MAX_DOS_DRIVES] )
                 else
                 {
 #ifdef __OHOS__
-                    /* OHOS: symlink not available, try hardcoded drive paths.
-                     * c:→$WINEPREFIX/drive_c, z:→/ */
+                    /* OHOS: symlink not available, try hardcoded drive paths. */
                     char alt_path[PATH_MAX];
-                    if (i == 'z' - 'a')
-                    {
-                        const char *home = getenv( "HOME" );
-                        if (!home) home = "/storage/Users/currentUser";
-                        snprintf( alt_path, sizeof(alt_path), "%s", home );
-                    }
-                    else if (i >= 'c' - 'a' && i <= 'y' - 'a')
-                    {
-                        snprintf( alt_path, sizeof(alt_path), "%s/drive_%c",
-                                  config_dir, 'a' + i );
-                    }
-                    else
-                    {
-                        alt_path[0] = 0;
-                    }
-                    if (alt_path[0] && !stat( alt_path, &st ))
+                    if (ohos_drive_unix_path( 'a' + i, config_dir,
+                                               alt_path, sizeof(alt_path) ) &&
+                        !stat( alt_path, &st ))
                     {
                         cache[i].dev = st.st_dev;
                         cache[i].ino = st.st_ino;
@@ -3388,14 +3377,10 @@ static NTSTATUS get_dos_device( char **unix_name, int start_pos )
         /* OHOS: symlink not available, fall back to default drive mapping */
         if (!new_name && dev[1] == ':')
         {
-            if (dev[0] == 'z')
-            {
-                const char *home = getenv( "HOME" );
-                if (!home) home = "/storage/Users/currentUser";
-                new_name = strdup( home );
-            }
-            else if (dev[0] >= 'c' && dev[0] <= 'y')
-                asprintf( &new_name, "%s/drive_%c", config_dir, dev[0] );
+            char path_buf[PATH_MAX];
+            int len = ohos_drive_unix_path( dev[0], config_dir,
+                                             path_buf, sizeof(path_buf) );
+            if (len) new_name = strdup( path_buf );
         }
 #endif
         free( *unix_name );
@@ -3833,26 +3818,15 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
     pos += ret;
 
 #ifdef __OHOS__
-    /* OHOS: symlink() not available in NAPI sandbox. For drive letter
-     * prefixes, fall back to hardcoded default directory paths.
-     * c: → $WINEPREFIX/drive_c, ..., z: → /storage/Users/currentUser */
+    /* OHOS: symlink not available, fall back to default drive mapping. */
     if (prefix_len == 2 && prefix[1] == ':')
     {
         unix_name[pos] = 0;  /* null-terminate the prefix for lstat */
         if (lstat( unix_name, &st ) == -1)
         {
-            if (prefix[0] == 'z')
-            {
-                const char *z_target = getenv( "HOME" );
-                if (!z_target) z_target = "/storage/Users/currentUser";
-                strcpy( unix_name, z_target );
-                pos = strlen( z_target );
-            }
-            else if (prefix[0] >= 'c' && prefix[0] <= 'y')
-            {
-                pos = snprintf( unix_name, unix_len, "%s/drive_%c",
-                                config_dir, prefix[0] );
-            }
+            int drv_len = ohos_drive_unix_path( prefix[0], config_dir,
+                                                 unix_name, unix_len );
+            if (drv_len) pos = drv_len;
         }
     }
 #endif
