@@ -57,7 +57,7 @@
 #endif
 #include <unistd.h>
 #ifdef __OHOS__
-#include <sys/un.h>
+#include "ohos_broker.h"
 #endif
 #ifdef HAVE_MACH_MACH_H
 # include <mach/mach.h>
@@ -400,76 +400,6 @@ static BOOL is_unix_console_handle( HANDLE handle )
 }
 
 
-#ifdef __OHOS__
-/***********************************************************************
- *           send_spawn_request  (OHOS broker+NCP)
- *
- * 通过 broker 的 Unix socket 发送一个 SPAWN 请求, 携带 entryParams、
- * N 个命名 fd (SCM_RIGHTS)。环境变量已序列化为 |__env=K=V| 段嵌入 entryParams。
- * 协议:
- *   "SPAWN\n{entryParams}\n[FDS:name0,name1,...]\n" + cmsg{fds}
- * 成功返回 0 并置 *child_pid; 失败返回 -1。
- */
-static int send_spawn_request( int broker_fd, const char *entryParams,
-                               const char **fd_names, const int *fds, int n_fds,
-                               int *child_pid )
-{
-    char req_hdr[] = "SPAWN\n";
-    size_t ep_len = entryParams ? strlen(entryParams) : 0;
-    char fds_line[512];
-    int fl_len, i;
-    struct iovec iov_parts[3];
-    struct msghdr msg;
-    union { char buf[CMSG_SPACE(sizeof(int) * 16)]; struct cmsghdr align; } ctrl;
-    ssize_t received;
-    int32_t response[2];
-
-    if (n_fds > 16) n_fds = 16;  /* ctrl 缓冲区上限, 对齐 broker 侧 */
-
-    /* 构造 "\nFDS:name0,name1,...\n" (无 fd 时仅 "\n") */
-    if (n_fds > 0)
-    {
-        fl_len = snprintf( fds_line, sizeof(fds_line), "\nFDS:" );
-        for (i = 0; i < n_fds; i++)
-            fl_len += snprintf( fds_line + fl_len, sizeof(fds_line) - fl_len,
-                                "%s%s", i ? "," : "", fd_names[i] );
-        fl_len += snprintf( fds_line + fl_len, sizeof(fds_line) - fl_len, "\n" );
-    }
-    else fl_len = snprintf( fds_line, sizeof(fds_line), "\n" );
-
-    iov_parts[0].iov_base = req_hdr;
-    iov_parts[0].iov_len  = sizeof(req_hdr) - 1;
-    iov_parts[1].iov_base = (void *)(entryParams ? entryParams : "");
-    iov_parts[1].iov_len  = ep_len;
-    iov_parts[2].iov_base = fds_line;
-    iov_parts[2].iov_len  = fl_len;
-
-    memset( &msg, 0, sizeof(msg) );
-    msg.msg_iov = iov_parts;
-    msg.msg_iovlen = 3;
-    if (n_fds > 0)
-    {
-        struct cmsghdr *cmsg;
-        msg.msg_control = ctrl.buf;
-        msg.msg_controllen = CMSG_SPACE(sizeof(int) * n_fds);
-        cmsg = CMSG_FIRSTHDR( &msg );
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type  = SCM_RIGHTS;
-        cmsg->cmsg_len   = CMSG_LEN(sizeof(int) * n_fds);
-        memcpy( CMSG_DATA(cmsg), fds, sizeof(int) * n_fds );
-        msg.msg_controllen = cmsg->cmsg_len;
-    }
-
-    if (sendmsg( broker_fd, &msg, MSG_NOSIGNAL ) < 0) return -1;
-
-    received = recv( broker_fd, response, sizeof(response), MSG_WAITALL );
-    if (received != sizeof(response)) return -1;
-    if (response[1] != 0 || response[0] <= 0) return -1;
-    *child_pid = response[0];
-    return 0;
-}
-#endif
-
 
 /***********************************************************************
  *           spawn_process
@@ -502,14 +432,10 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
      * Broker 在主进程上下文（非 appspawn 子进程）调用 StartNativeChildProcess，
      * 并通过 SCM_RIGHTS 传递 wineserver socket fd 给子进程。 */
     {
-        const char *broker_path = getenv("PROCESSBROKER");
-        if (!broker_path) broker_path = "/data/storage/el2/base/files/.wine_broker";
         const char *binDir = getenv("WINEBINDIR");
         if (!binDir) binDir = "/data/storage/el2/base/files/wine/bin";
         extern char **environ;
         char *entryParams = NULL;
-        int broker_fd;
-        struct sockaddr_un addr;
         int i, j, len;
         /* 要传给子进程的命名 fd —— 目前仅 wineserver 通信 socket。
          * 未来的宿主 fd 桥(GPU/剪贴板等)在此 append 即可, 协议无需再改。 */
@@ -570,27 +496,15 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
         fds[n_send_fds] = socketfd;
         n_send_fds++;
 
-        /* 连接 broker 并发送 SPAWN 请求 */
-        broker_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (broker_fd >= 0)
+        /* 通过 Process Broker 创建子进程 */
         {
-            memset(&addr, 0, sizeof(addr));
-            addr.sun_family = AF_UNIX;
-            strcpy(addr.sun_path, broker_path);
-
-            if (connect(broker_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0)
-            {
-                int child_pid = -1;
-                if (send_spawn_request(broker_fd, entryParams, fd_names, fds, n_send_fds, &child_pid) == 0)
-                    pid = child_pid;
-                else
-                    pid = -1;
-                if (pid <= 0) status = STATUS_UNSUCCESSFUL;
-            }
-            else status = STATUS_UNSUCCESSFUL;
-            close(broker_fd);
+            int child_pid = -1;
+            if (ohos_broker_spawn(entryParams, fd_names, fds, n_send_fds, &child_pid) == 0)
+                pid = child_pid;
+            else
+                pid = -1;
+            if (pid <= 0) status = STATUS_UNSUCCESSFUL;
         }
-        else status = STATUS_UNSUCCESSFUL;
 
         free(argv);
         free(entryParams);

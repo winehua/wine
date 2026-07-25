@@ -38,9 +38,8 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #ifdef __OHOS__
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <dirent.h>
+#include "ohos_broker.h"
 #endif
 #include <unistd.h>
 #include <dlfcn.h>
@@ -601,43 +600,13 @@ void start_server( BOOL debug )
             const char *binDir = getenv("WINEBINDIR");
             if (!binDir) binDir = "/data/storage/el2/base/files/wine/bin";
 
-            int broker_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-            if (broker_fd >= 0)
             {
-                struct sockaddr_un addr;
-                memset(&addr, 0, sizeof(addr));
-                addr.sun_family = AF_UNIX;
-                const char *broker_path = getenv("PROCESSBROKER");
-                strcpy(addr.sun_path, broker_path ? broker_path : "/data/storage/el2/base/files/.wine_broker");
+                char entryParams[1024];
+                snprintf(entryParams, sizeof(entryParams), "%s|wineserver|-f|-p", binDir);
 
-                if (connect(broker_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0)
-                {
-                    char entryParams[1024];
-                    snprintf(entryParams, sizeof(entryParams), "%s|wineserver|-f|-p", binDir);
-
-                    char req[2048];
-                    int reqlen = snprintf(req, sizeof(req), "SPAWN\n%s\n", entryParams);
-
-                    struct iovec iov;
-                    iov.iov_base = req;
-                    iov.iov_len = reqlen;
-
-                    struct msghdr msg = {};
-                    msg.msg_iov = &iov;
-                    msg.msg_iovlen = 1;
-
-                    if (sendmsg(broker_fd, &msg, MSG_NOSIGNAL) >= 0)
-                    {
-                        int32_t response[2];
-                        ssize_t n = recv(broker_fd, response, sizeof(response), MSG_WAITALL);
-                        if (n == sizeof(response))
-                        {
-                            if (response[1] == 0 && response[0] > 0)
-                                started = TRUE;
-                        }
-                    }
-                }
-                close(broker_fd);
+                int child_pid;
+                if (ohos_broker_spawn(entryParams, NULL, NULL, 0, &child_pid) == 0)
+                    started = TRUE;
             }
 
             if (started)
