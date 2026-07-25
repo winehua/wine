@@ -7,4 +7,5 @@ VER_OLESELFREGISTER     = 1
 
 SOURCES = \
 	mciavi_res.rc \
-	mciqtz.c
+	mciqtz.c \
+	mciqtz_waveout.c

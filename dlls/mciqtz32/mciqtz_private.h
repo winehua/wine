@@ -63,6 +63,7 @@ typedef struct {
     HANDLE         callback;
     HANDLE         thread;
     HANDLE         stop_event;
+    /* WaveOut backend fields (OHOS only) */
     WAVEFORMATEX   wave_format;
     BYTE          *wave_pcm;
     DWORD          wave_pcm_bytes;
