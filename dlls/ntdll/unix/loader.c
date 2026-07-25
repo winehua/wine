@@ -551,130 +551,42 @@ static int exec_wineserver( pid_t *pid, char **argv )
 void start_server( BOOL debug )
 {
     static BOOL started;  /* we only try once */
+    char *argv[3];
+    static char debug_flag[] = "-d";
 
     if (!started)
     {
 #ifdef __OHOS__
-        /* 问题起因: 标准 Linux 上 start_server() 通过 posix_spawn 启动 wineserver，
-         * wineserver 自动 daemonize（double-fork），中间进程退出后 waitpid 返回，
-         * 此时 wineserver socket 已就绪。但 OHOS 没有 execve，
-         * wineserver 是 libwineserver.so 库而非独立 ELF 可执行文件。
+        /* OHOS: wineserver 是 libwineserver.so, 无法通过 posix_spawn 启动。
+         * 通过 Process Broker 请求主进程调用 StartNativeChildProcess,
+         * 然后轮询 socket 直到就绪。
          *
-         * 解决办法: 通过 Process Broker 请求主进程调用 StartNativeChildProcess
-         * 来重启 wineserver。由于没有 daemonize + waitpid 同步点，
-         * 需要轮询 socket 直到就绪。
-         *
-         * 跨进程互斥: static BOOL started 只在单进程内有效，多进程可能同时
-         * 进入此路径。spawn 前扫描 .wineserver/<host>/socket 是否存在——
-         * 存在说明 wineserver 已在运行（可能是其他进程 spawn 的），不重复 spawn。*/
+         * 跨进程互斥: spawn 前扫描 .wineserver/<host>/socket — 已存在说明
+         * wineserver 在运行（可能由他进程 spawn），不重复 spawn。*/
         const char *prefix = getenv("WINEPREFIX");
         if (!prefix) prefix = "/data/storage/el2/base/files/.wine";
-        char sockdir_check[512];
-        snprintf(sockdir_check, sizeof(sockdir_check), "%s/.wineserver", prefix);
 
-        /* 扫描 .wineserver 下是否有活跃的 socket 文件 */
-        int socket_alive = 0;
-        {
-            struct stat st;
-            if (stat(sockdir_check, &st) == 0 && S_ISDIR(st.st_mode))
-            {
-                DIR *d = opendir(sockdir_check);
-                if (d)
-                {
-                    struct dirent *de;
-                    while ((de = readdir(d)))
-                    {
-                        if (de->d_name[0] == '.') continue;
-                        char sub[1024];
-                        snprintf(sub, sizeof(sub), "%s/%s/socket", sockdir_check, de->d_name);
-                        if (stat(sub, &st) == 0 && S_ISSOCK(st.st_mode))
-                            { socket_alive = 1; break; }
-                    }
-                    closedir(d);
-                }
-            }
-        }
-
-        if (!socket_alive)
+        if (!ohos_broker_scan_wineserver(prefix, 0, 0))
         {
             int child_pid;
             if (ohos_broker_spawn_wineserver(&child_pid) == 0)
-                started = TRUE;
-
-            if (started)
             {
+                started = TRUE;
                 /* poll socket 直到就绪（最多 5 秒） */
-                int found = 0;
-                for (int wait = 0; wait < 25; wait++)
-                {
-                    struct stat st;
-                    if (stat(sockdir_check, &st) == 0 && S_ISDIR(st.st_mode))
-                    {
-                        DIR *d = opendir(sockdir_check);
-                        if (d)
-                        {
-                            struct dirent *de;
-                            while ((de = readdir(d)))
-                            {
-                                if (de->d_name[0] == '.') continue;
-                                char sub[1024];
-                                snprintf(sub, sizeof(sub), "%s/%s/socket", sockdir_check, de->d_name);
-                                if (stat(sub, &st) == 0 && S_ISSOCK(st.st_mode))
-                                {
-                                    found = 1;
-                                    break;
-                                }
-                            }
-                            closedir(d);
-                        }
-                        if (found) break;
-                    }
-                    usleep(200000);
-                }
+                if (!ohos_broker_scan_wineserver(prefix, 5, 0))
+                    ; /* socket 未出现, 下次重试 */
             }
-            else
-                /* broker spawn failed, will retry next time */;
         }
         else
         {
-            /* socket 已存在，但可能是即将退出的 wineserver 残留。
-             * 短暂 poll 确认 socket 稳定存在（2 秒），消失则 fall through 去 spawn。 */
-            int stable = 1;
-            for (int wait = 0; wait < 10; wait++)
-            {
-                usleep(200000);
-                int still_there = 0;
-                struct stat st;
-                if (stat(sockdir_check, &st) == 0 && S_ISDIR(st.st_mode))
-                {
-                    DIR *d = opendir(sockdir_check);
-                    if (d)
-                    {
-                        struct dirent *de;
-                        while ((de = readdir(d)))
-                        {
-                            if (de->d_name[0] == '.') continue;
-                            char sub[1024];
-                            snprintf(sub, sizeof(sub), "%s/%s/socket", sockdir_check, de->d_name);
-                            if (stat(sub, &st) == 0 && S_ISSOCK(st.st_mode))
-                                { still_there = 1; break; }
-                        }
-                        closedir(d);
-                    }
-                }
-                if (!still_there) { stable = 0; break; }
-            }
-            if (stable)
-            {
+            /* socket 已存在，确认非残留（2 秒内不消失） */
+            if (ohos_broker_scan_wineserver(prefix, 2, 1))
                 started = TRUE;
-            }
         }
 #else
         /* 标准 Linux: posix_spawn wineserver */
         int status;
         pid_t pid;
-        char *argv[3];
-        static char debug_flag[] = "-d";
 
         argv[1] = debug ? debug_flag : NULL;
         argv[2] = NULL;
@@ -1744,9 +1656,7 @@ static void load_ntdll_wow64_functions( HMODULE module )
 
     pLdrSystemDllInitBlock->ntdll_handle = (ULONG_PTR)module;
 
-#define GET_FUNC(name) do { \
-    pLdrSystemDllInitBlock->p##name = find_named_export( module, exports, #name ); \
-} while(0)
+#define GET_FUNC(name) pLdrSystemDllInitBlock->p##name = find_named_export( module, exports, #name )
     GET_FUNC( KiUserApcDispatcher );
     GET_FUNC( KiUserCallbackDispatcher );
     GET_FUNC( KiUserExceptionDispatcher );

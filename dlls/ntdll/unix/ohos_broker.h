@@ -52,6 +52,12 @@ int ohos_broker_spawn_wineserver( int *child_pid );
  * Returns 0 on success (sets *child_pid), -1 on failure. */
 int ohos_broker_spawn_child( char **argv, int socketfd, int *child_pid );
 
+/* Scan for wineserver socket in WINEPREFIX/.wineserver/<host>/socket.
+ * poll_sec: 0=single check; >0=poll N seconds (200ms intervals)
+ * vanish_mode: 0=socket must appear; 1=socket must NOT vanish
+ * Returns 1 if condition met, 0 otherwise. */
+int ohos_broker_scan_wineserver( const char *prefix, int poll_sec, int vanish_mode );
+
 #endif /* __OHOS__ */
 
 #endif /* __WINE_OHOS_BROKER_H */

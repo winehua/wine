@@ -24,11 +24,13 @@
 
 #include "config.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -238,4 +240,79 @@ int ohos_broker_spawn_child( char **argv, int socketfd, int *child_pid )
     ret = ohos_broker_spawn(entryParams, fd_names, fds, n_send_fds, child_pid);
     free(entryParams);
     return ret;
+}
+
+
+/* Internal: single-shot scan for wineserver socket in sockdir. */
+static int scan_socket_dir(const char *sockdir)
+{
+    struct stat st;
+    DIR *d;
+    struct dirent *de;
+    int found = 0;
+
+    if (stat(sockdir, &st) != 0 || !S_ISDIR(st.st_mode)) return 0;
+    d = opendir(sockdir);
+    if (!d) return 0;
+    while ((de = readdir(d)))
+    {
+        if (de->d_name[0] == '.') continue;
+        char sub[1024];
+        snprintf(sub, sizeof(sub), "%s/%s/socket", sockdir, de->d_name);
+        if (stat(sub, &st) == 0 && S_ISSOCK(st.st_mode))
+        {
+            found = 1;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+
+/***********************************************************************
+ *           ohos_broker_scan_wineserver
+ *
+ * Scan WINEPREFIX/.wineserver/<host>/socket.
+ * - poll_sec == 0: one-shot check
+ * - poll_sec > 0 && !vanish_mode: poll until socket appears (200ms steps)
+ * - poll_sec > 0 && vanish_mode:  confirm socket does NOT vanish
+ *
+ * Returns 1 when condition is met, 0 otherwise.
+ */
+int ohos_broker_scan_wineserver(const char *prefix, int poll_sec, int vanish_mode)
+{
+    const char *p = prefix ? prefix : "/data/storage/el2/base/files/.wine";
+    char sockdir[512];
+    int i, found;
+    int steps;
+
+    snprintf(sockdir, sizeof(sockdir), "%s/.wineserver", p);
+
+    if (poll_sec <= 0)
+        return scan_socket_dir(sockdir);
+
+    steps = poll_sec * 5; /* 200ms intervals */
+    if (vanish_mode)
+    {
+        /* Socket must NOT vanish during poll window */
+        for (i = 0; i < steps; i++)
+        {
+            usleep(200000);
+            if (!scan_socket_dir(sockdir))
+                return 0;
+        }
+        return 1;
+    }
+    else
+    {
+        /* Wait for socket to appear */
+        for (i = 0; i < steps; i++)
+        {
+            if (scan_socket_dir(sockdir))
+                return 1;
+            usleep(200000);
+        }
+        return 0;
+    }
 }
