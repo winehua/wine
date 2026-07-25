@@ -1661,18 +1661,13 @@ static void update_wineprefix( BOOL force )
     int fd;
     struct stat st;
 
-    MESSAGE("OHOS-WB: update_wineprefix force=%d config_dir=%s inf_path=%s\n",
-        force, debugstr_w(config_dir), debugstr_w(inf_path));
-
     if (!inf_path)
     {
-        MESSAGE("OHOS-WB: wine.inf not found!\n");
         WINE_MESSAGE( "wine: failed to update %s, wine.inf not found\n", debugstr_w( config_dir ));
         return;
     }
     if ((fd = _wopen( inf_path, O_RDONLY )) == -1)
     {
-        MESSAGE("OHOS-WB: cannot open wine.inf: %s\n", strerror(errno));
         WINE_MESSAGE( "wine: failed to update %s with %s: %s\n",
                       debugstr_w(config_dir), debugstr_w(inf_path), strerror(errno) );
         goto done;
@@ -1685,7 +1680,6 @@ static void update_wineprefix( BOOL force )
         HANDLE process;
         DWORD count = 0;
 
-        MESSAGE("OHOS-WB: starting rundll32 PreInstall...\n");
         if ((process = start_rundll32( inf_path, L"PreInstall", IMAGE_FILE_MACHINE_TARGET_HOST )))
         {
             HWND hwnd = show_wait_window();
@@ -1710,15 +1704,11 @@ static void update_wineprefix( BOOL force )
                 count++;
             }
             DestroyWindow( hwnd );
-            MESSAGE("OHOS-WB: rundll32 loop complete\n");
-        } else {
-            MESSAGE("OHOS-WB: start_rundll32 PreInstall FAILED\n");
         }
-        MESSAGE("OHOS-WB: calling install_root_pnp_devices...\n");
         install_root_pnp_devices();
         update_user_profile();
-        MESSAGE("OHOS-WB: pnp + user_profile done\n");
 
+        TRACE( "wine: configuration in %s has been updated.\n", debugstr_w(prettyprint_configdir()) );
     }
 
 done:
@@ -1830,7 +1820,6 @@ int __cdecl main( int argc, char *argv[] )
     BOOL is_wow64;
 
     end_session = force = init = kill = restart = shutdown = update = FALSE;
-    MESSAGE("OHOS-WB: MAIN entry argc=%d argv[0]=%s\n", argc, argv[0] ? argv[0] : "(null)");
     GetWindowsDirectoryW( windowsdir, MAX_PATH );
     if( !SetCurrentDirectoryW( windowsdir ) )
         WINE_ERR("Cannot set the dir to %s (%ld)\n", wine_dbgstr_w(windowsdir), GetLastError() );
@@ -1914,39 +1903,23 @@ int __cdecl main( int argc, char *argv[] )
     NtCreateEvent( &event, EVENT_ALL_ACCESS, &attr, NotificationEvent, 0 );
 
     ResetEvent( event );  /* in case this is a restart */
-    MESSAGE("OHOS-WB: event created, proceeding with init...\n");
 
     create_user_shared_data();
-    MESSAGE("OHOS-WB: create_user_shared_data done\n");
     create_hardware_registry_keys();
-    MESSAGE("OHOS-WB: create_hardware_registry_keys done\n");
     create_dynamic_registry_keys();
-    MESSAGE("OHOS-WB: create_dynamic_registry_keys done\n");
     create_computer_name_keys();
-    MESSAGE("OHOS-WB: create_computer_name_keys done\n");
     wininit();
-    MESSAGE("OHOS-WB: wininit done\n");
     pendingRename();
-    MESSAGE("OHOS-WB: pendingRename done\n");
 
     ProcessWindowsFileProtection();
-    MESSAGE("OHOS-WB: ProcessWindowsFileProtection done\n");
     ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunServicesOnce", TRUE, FALSE );
-    MESSAGE("OHOS-WB: ProcessRunKeys RunServicesOnce done\n");
 
     if (init || (kill && !restart))
     {
         ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunServices", FALSE, FALSE );
-        MESSAGE("OHOS-WB: ProcessRunKeys RunServices done\n");
         start_services_process();
-        MESSAGE("OHOS-WB: start_services_process done\n");
     }
-    MESSAGE("OHOS-WB: INIT=%d UPD=%d about to update_wineprefix(update=%d)\n", init, update, update);
-    if (init || update) {
-        MESSAGE("OHOS-WB: calling update_wineprefix...\n");
-        update_wineprefix( update );
-        MESSAGE("OHOS-WB: update_wineprefix done\n");
-    }
+    if (init || update) update_wineprefix( update );
 
     create_volatile_environment_registry_key();
     create_known_dlls();
@@ -1963,7 +1936,6 @@ int __cdecl main( int argc, char *argv[] )
     }
 
     WINE_TRACE("Operation done\n");
-    MESSAGE("OHOS-WB: all init done, signaling event and exiting\n");
 
     SetEvent( event );
     return 0;

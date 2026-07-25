@@ -1700,6 +1700,7 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
     }
     else TRACE("(%p %s,%s,%p) - CALL\n", module, debugstr_w(wm->ldr.BaseDllName.Buffer),
                reason_names[reason], lpReserved );
+
     __TRY
     {
         retv = call_dll_entry_point( entry, module, reason, lpReserved );
@@ -3245,10 +3246,7 @@ static NTSTATUS search_dll_file( LPCWSTR paths, LPCWSTR search, UNICODE_STRING *
         wcscpy( name + len, search );
 
         nt_name->Buffer = NULL;
-        if ((status = RtlDosPathNameToNtPathName_U_WithStatus( name, nt_name, NULL, NULL )))
-        {
-            goto done;
-        }
+        if ((status = RtlDosPathNameToNtPathName_U_WithStatus( name, nt_name, NULL, NULL ))) goto done;
 
         status = open_dll_file( nt_name, pwm, mapping, image_info, id );
         if (status == STATUS_NOT_SUPPORTED) found_image = TRUE;
@@ -3345,6 +3343,7 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
     NTSTATUS nts = STATUS_DLL_NOT_FOUND;
     BOOL redirected;
     void *prev;
+
     TRACE( "looking for %s in %s\n", debugstr_w(libname), debugstr_w(load_path) );
 
     if (system && system_dll_path.Buffer)
@@ -4554,10 +4553,8 @@ void loader_init( CONTEXT *context, void **entry )
         if (wm->ldr.ActivationContext)
             RtlActivateActivationContext( 0, wm->ldr.ActivationContext, &cookie );
 
-        status = process_attach( node_ntdll, context );
-        if (!status)
-            status = process_attach( node_kernel32, context );
-        if (status)
+        if ((status = process_attach( node_ntdll, context ))
+             || (status = process_attach( node_kernel32, context )))
         {
             ERR( "Initializing system dll for %s failed, status %lx\n",
                  debugstr_w(NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer), status );
