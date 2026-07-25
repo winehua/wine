@@ -986,10 +986,7 @@ static void add_path_var( WCHAR **env, SIZE_T *pos, SIZE_T *size, const char *na
 {
     WCHAR *nt_name = NULL;
 
-    if (path && unix_to_nt_file_name( path, &nt_name, FILE_OPEN ))
-    {
-        return;
-    }
+    if (path && unix_to_nt_file_name( path, &nt_name, FILE_OPEN )) return;
     append_envW( env, pos, size, name, nt_name );
     free( nt_name );
 }
@@ -1960,26 +1957,32 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     TRACE( "image %s cmdline %s dir %s\n",
            debugstr_w(main_wargv[0]), debugstr_w(cmdline), debugstr_w(curdir) );
 
+#ifdef __OHOS__
     /* OHOS: build DllPath from WINEDLLPATH for PE DLL search */
     DWORD dllpath_len = 0;
     WCHAR *dllpath_w = NULL;
-    const char *winedllpath = getenv("WINEDLLPATH");
-    if (winedllpath)
     {
-        DWORD ulen = strlen(winedllpath);
-        dllpath_w = malloc((ulen + 2) * sizeof(WCHAR));
-        if (dllpath_w)
+        const char *winedllpath = getenv("WINEDLLPATH");
+        if (winedllpath)
         {
-            for (const char *s = winedllpath; *s; s++)
-                dllpath_w[dllpath_len++] = (*s == ':') ? ';' : *s;
-            dllpath_w[dllpath_len] = 0;
-            dllpath_len = (dllpath_len + 1) * sizeof(WCHAR);
+            DWORD ulen = strlen(winedllpath);
+            dllpath_w = malloc((ulen + 2) * sizeof(WCHAR));
+            if (dllpath_w)
+            {
+                for (const char *s = winedllpath; *s; s++)
+                    dllpath_w[dllpath_len++] = (*s == ':') ? ';' : *s;
+                dllpath_w[dllpath_len] = 0;
+                dllpath_len = (dllpath_len + 1) * sizeof(WCHAR);
+            }
         }
     }
+#endif
 
     size = (sizeof(*params)
             + MAX_PATH * sizeof(WCHAR)  /* curdir */
+#ifdef __OHOS__
             + dllpath_len               /* dll path */
+#endif
             + (wcslen( cmdline ) + 1) * sizeof(WCHAR)  /* command line */
             + (wcslen( main_wargv[0] ) + 1) * sizeof(WCHAR) * 2 /* image path + window title */
             + env_pos * sizeof(WCHAR));
@@ -2003,6 +2006,7 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     put_unicode_string( main_wargv[0], &dst, &params->ImagePathName );
     put_unicode_string( cmdline, &dst, &params->CommandLine );
     put_unicode_string( main_wargv[0], &dst, &params->WindowTitle );
+#ifdef __OHOS__
     if (dllpath_w)
     {
         memcpy(dst, dllpath_w, dllpath_len);
@@ -2012,6 +2016,7 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
         dst += dllpath_len / sizeof(WCHAR);
         free(dllpath_w);
     }
+#endif
     free( nt_name.Buffer );
     free( cmdline );
     free( curdir );

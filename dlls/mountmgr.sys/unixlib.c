@@ -292,11 +292,9 @@ static NTSTATUS get_dosdev_symlink( void *args )
     ret = readlink( path, params->dest, params->size );
     free( path );
 #ifdef __OHOS__
-    /* OHOS: symlink() not available in NAPI sandbox. For known drive
-     * letters, return hardcoded default mount points, but ONLY if the
-     * target directory actually exists (avoids creating phantom drives).
-     * c: → $WINEPREFIX/drive_c, z: → /storage/Users/currentUserstorage/Users/currentUser
-     * :: (block device) variants are skipped (no real device). */
+    /* OHOS: symlink unavailable, fall back to default drive mapping.
+     * z: → /storage/Users/currentUser, c-y: → $WINEPREFIX/drive_X
+     * (only if dir exists). */
     if (ret == -1)
     {
         const char *dev = params->dev;
