@@ -57,6 +57,7 @@ SOURCES = \
 	unix/loader.c \
 	unix/loadorder.c \
 	unix/ohos_broker.c \
+	unix/ohos_virtual.c \
 	unix/process.c \
 	unix/registry.c \
 	unix/security.c \

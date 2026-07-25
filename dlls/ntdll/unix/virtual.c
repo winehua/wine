@@ -36,8 +36,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <sys/prctl.h>
 #include <sys/ioctl.h>
+#include "ohos_virtual.h"
 #ifdef HAVE_SYS_SYSINFO_H
 # include <sys/sysinfo.h>
 #endif
@@ -630,6 +630,7 @@ static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
     }
     return ptr;
 }
+
 
 static void reserve_area( void *addr, void *end )
 {
@@ -1947,23 +1948,20 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
     if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
     {
         TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
-        /* OHOS: enable exec on noexec filesystem. Keep JIT on. */
-        prctl( 0x6a6974, 0, 0 );
+#ifdef __OHOS__
+        ohos_jit_enable();
+#endif
         if (!mprotect( base, size, unix_prot | PROT_EXEC )) return 0;
         /* exec + write may legitimately fail, in that case fall back to write only */
         if (!(unix_prot & PROT_WRITE)) return -1;
         /* fall through to regular mprotect without exec */
     }
 
-    /* OHOS: for noexec filesystem, activate JIT before PROT_EXEC mprotect.
-     * Do NOT turn JIT off — Box64's InternalMmap & NewBrick also need it. */
+#ifdef __OHOS__
+    /* OHOS: for noexec filesystem, delegate to ohos_virtual.c */
     if (unix_prot & PROT_EXEC)
-    {
-        int ret;
-        prctl( 0x6a6974, 0, 0 );
-        ret = mprotect( base, size, unix_prot );
-        return ret;
-    }
+        return ohos_mprotect_exec( base, size, unix_prot );
+#endif
 
     return mprotect( base, size, unix_prot );
 }
@@ -3198,31 +3196,17 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
             goto done;
         }
 
-        /* OHOS: for executable sections, use anonymous memory to avoid noexec filesystem */
+#ifdef __OHOS__
         if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
         {
-            char *sec_addr = (char *)view->base + sec[i].VirtualAddress;
-            size_t sec_offset = sec[i].VirtualAddress & host_page_mask;
-            size_t sec_map_size = ROUND_SIZE( sec[i].VirtualAddress, file_size, host_page_mask );
-
-            prctl( 0x6a6974, 0, 0 );
-            if (mmap( sec_addr - sec_offset, sec_map_size + sec_offset,
-                      PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0 ) == MAP_FAILED)
-            {
-                prctl( 0x6a6974, 0, 1 );
-                ERR_(module)( "Could not map %s section %.8s with anon mmap\n",
-                              debugstr_us(nt_name), sec[i].Name );
+            if (!ohos_map_exec_section( view->base, fd, sec[i].VirtualAddress,
+                                        file_size, file_start,
+                                        host_page_mask, debugstr_us(nt_name) ))
                 goto done;
-            }
-            prctl( 0x6a6974, 0, 1 );
-            if (pread( fd, sec_addr, file_size, file_start ) != (ssize_t)file_size)
-            {
-                ERR_(module)( "Could not read %s section %.8s\n",
-                              debugstr_us(nt_name), sec[i].Name );
-                goto done;
-            }
         }
-        else if (map_file_into_view( view, fd, sec[i].VirtualAddress, file_size, file_start,
+        else
+#endif
+        if (map_file_into_view( view, fd, sec[i].VirtualAddress, file_size, file_start,
                                      VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY,
                                      removable ) != STATUS_SUCCESS)
         {
