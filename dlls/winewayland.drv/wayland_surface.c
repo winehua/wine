@@ -31,6 +31,9 @@
 #include "waylanddrv.h"
 #include "wine/debug.h"
 #include "wine/server.h"
+#ifdef __OHOS__
+#include "wayland_surface_ohos.h"
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
@@ -239,58 +242,6 @@ void wayland_surface_destroy(struct wayland_surface *surface)
     wl_display_flush(process_wayland.wl_display);
 
     free(surface);
-}
-
-/**********************************************************************
- *          wayland_surface_update_min_max
- *
- * 发送窗口 resize 约束到 compositor, 使不可 resize 的窗口在鸿蒙侧也被禁止 resize。
- *
- * 判断逻辑:
- *   WS_THICKFRAME 且 !WS_DLGFRAME → 可 resize (min=小值, max=0=无限制)
- *   否则 (对话框/message box 等) → 不可 resize (min == max == 当前尺寸)
- *
- * 调用时机: wayland_surface_reconfigure() 中每次窗口状态变化时更新。
- */
-static void wayland_surface_update_min_max(struct wayland_surface *surface)
-{
-    LONG style;
-    int cur_w, cur_h;
-
-    if (!surface->xdg_toplevel) return;
-
-    style = NtUserGetWindowLongW(surface->hwnd, GWL_STYLE);
-
-    /* 当前窗口尺寸 (surface-local) */
-    cur_w = surface->window.rect.right - surface->window.rect.left;
-    cur_h = surface->window.rect.bottom - surface->window.rect.top;
-    wayland_surface_coords_from_window(surface, cur_w, cur_h, &cur_w, &cur_h);
-
-    /* WS_THICKFRAME 且非 WS_DLGFRAME → 可 resize, 否则锁定尺寸 */
-    if ((style & WS_THICKFRAME) && !(style & WS_DLGFRAME))
-    {
-        /* 可 resize: 设一个很小的 min 避免窗口塌陷, max=0 无限制 */
-        surface->min_width = max(1, cur_w / 4);
-        surface->min_height = max(1, cur_h / 4);
-        surface->max_width = 0;
-        surface->max_height = 0;
-    }
-    else
-    {
-        /* 不可 resize (对话框等): min == max, 鸿蒙侧自动禁止用户拖拽 resize */
-        surface->min_width = cur_w;
-        surface->min_height = cur_h;
-        surface->max_width = cur_w;
-        surface->max_height = cur_h;
-    }
-
-    TRACE("hwnd=%p style=0x%x min=%dx%d max=%dx%d\n",
-          surface->hwnd, (unsigned)style,
-          surface->min_width, surface->min_height,
-          surface->max_width, surface->max_height);
-
-    xdg_toplevel_set_min_size(surface->xdg_toplevel, surface->min_width, surface->min_height);
-    xdg_toplevel_set_max_size(surface->xdg_toplevel, surface->max_width, surface->max_height);
 }
 
 /**********************************************************************
@@ -609,16 +560,19 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
 
     if (!IsRectEmpty(&rect))
     {
-        // 桌面模式: 传递窗口在虚拟桌面中的屏幕坐标
-        // 独立窗口模式: 使用 (0,0) 相对坐标
+        /* desktop mode: forward screen coords; standalone: use (0,0) relative */
         int geo_x = 0, geo_y = 0;
+#ifdef __OHOS__
         if (getenv("WINEHUA_DESKTOP_MODE") && atoi(getenv("WINEHUA_DESKTOP_MODE")))
         {
-            if (surface->window.rect.left > -32768 && surface->window.rect.left < 32768)
+            if (surface->window.rect.left > WINEHUA_DESKTOP_COORD_MIN &&
+                surface->window.rect.left < WINEHUA_DESKTOP_COORD_MAX)
                 geo_x = surface->window.rect.left;
-            if (surface->window.rect.top > -32768 && surface->window.rect.top < 32768)
+            if (surface->window.rect.top > WINEHUA_DESKTOP_COORD_MIN &&
+                surface->window.rect.top < WINEHUA_DESKTOP_COORD_MAX)
                 geo_y = surface->window.rect.top;
         }
+#endif
         xdg_surface_set_window_geometry(surface->xdg_surface,
                                         geo_x, geo_y,
                                         rect.right - rect.left,
@@ -790,7 +744,9 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
         if (!surface->xdg_surface) break; /* surface role has been cleared */
         if (!wayland_surface_reconfigure_xdg(surface, width, height)) return FALSE;
+#ifdef __OHOS__
         wayland_surface_update_min_max(surface);
+#endif
         break;
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
         if (!surface->wl_subsurface) break; /* surface role has been cleared */
