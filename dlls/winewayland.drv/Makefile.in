@@ -11,6 +11,8 @@ SOURCES = \
 	display.c \
 	dllmain.c \
 	opengl.c \
+	opengl_diag.c \
+	opengl_readback.c \
 	pointer-constraints-unstable-v1.xml \
 	pointer-warp-v1.xml \
 	relative-pointer-unstable-v1.xml \
