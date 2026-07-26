@@ -309,6 +309,18 @@ static struct vulkan_physical_device *vulkan_instance_get_physical_device(struct
     return NULL;
 }
 
+static BOOL winehua_frame_assoc_trace_enabled(void)
+{
+    static int enabled = -1;
+    const char *value;
+
+    if (enabled >= 0) return enabled;
+
+    value = getenv("WINEHUA_DXVK_TRACE_CAMERA");
+    enabled = value && value[0] == '1' && !value[1];
+    return enabled;
+}
+
 VkResult wine_vkAllocateCommandBuffers(VkDevice client_device, const VkCommandBufferAllocateInfo *allocate_info,
                                        VkCommandBuffer *buffers )
 {
@@ -353,6 +365,11 @@ VkResult wine_vkAllocateCommandBuffers(VkDevice client_device, const VkCommandBu
 
         vulkan_object_init_ptr(&buffer->obj, (UINT_PTR)host_command_buffer, &client_command_buffer->obj);
         buffer->device = device;
+
+        if (winehua_frame_assoc_trace_enabled())
+            fprintf(stderr,
+                    "WineHuaWineFrameAssoc: command-buffer clientCmd=%p guestCmd=%p\n",
+                    client_command_buffer, host_command_buffer);
         instance->p_insert_object(instance, &buffer->obj);
     }
 
