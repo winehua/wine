@@ -23,6 +23,7 @@
 
 #include "config.h"
 #include <time.h>
+#include <unistd.h>
 
 #include "vulkan_private.h"
 #include "wine/vulkan_driver.h"
@@ -368,8 +369,8 @@ VkResult wine_vkAllocateCommandBuffers(VkDevice client_device, const VkCommandBu
 
         if (winehua_frame_assoc_trace_enabled())
             fprintf(stderr,
-                    "WineHuaWineFrameAssoc: command-buffer clientCmd=%p guestCmd=%p\n",
-                    client_command_buffer, host_command_buffer);
+                    "WineHuaWineFrameAssoc: unixPid=%d command-buffer clientCmd=%p guestCmd=%p\n",
+                    getpid(), client_command_buffer, host_command_buffer);
         instance->p_insert_object(instance, &buffer->obj);
     }
 
