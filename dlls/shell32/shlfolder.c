@@ -276,6 +276,7 @@ HRESULT SHELL32_BindToChild (LPCITEMIDLIST pidlRoot, const CLSID *clsidChild,
     } else {
         /* file system folder */
         CLSID clsidFolder = *clsidChild;
+        BOOL hasCustomClsid = FALSE;
         WCHAR wszCLSIDValue[CHARS_IN_GUID], wszFolderPath[MAX_PATH], *pwszPathTail = wszFolderPath;
 
         /* see if folder CLSID should be overridden by desktop.ini file */
@@ -288,10 +289,36 @@ HRESULT SHELL32_BindToChild (LPCITEMIDLIST pidlRoot, const CLSID *clsidChild,
 
         if (SHELL32_GetCustomFolderAttributeFromPath (wszFolderPath,
             L".ShellClassInfo", L"CLSID", wszCLSIDValue, CHARS_IN_GUID))
-            CLSIDFromString (wszCLSIDValue, &clsidFolder);
+        {
+            CLSID clsidCustom;
+            if (SUCCEEDED(CLSIDFromString(wszCLSIDValue, &clsidCustom)))
+            {
+                if (!IsEqualGUID(&clsidCustom, clsidChild))
+                {
+                    clsidFolder = clsidCustom;
+                    hasCustomClsid = TRUE;
+                }
+            }
+            else
+                ERR("desktop.ini has unparsable CLSID=%s in %s, ignoring\n",
+                    debugstr_w(wszCLSIDValue), debugstr_w(wszFolderPath));
+        }
 
         hr = SHELL32_CoCreateInitSF (pidlRoot, pathRoot, pidlChild,
                                      &clsidFolder, (LPVOID *)&pSF);
+
+        /* If the desktop.ini CLSID cannot be instantiated, fall back to the
+         * default file system folder handler.  desktop.ini customization is
+         * optional — a missing or unregistered CLSID should not prevent the
+         * user from browsing the folder. */
+        if (FAILED(hr) && hasCustomClsid)
+        {
+            ERR("Failed to bind folder using desktop.ini CLSID %s (hr=0x%08lx), "
+                "falling back to default file system folder handler\n",
+                debugstr_w(wszCLSIDValue), hr);
+            hr = SHELL32_CoCreateInitSF (pidlRoot, pathRoot, pidlChild,
+                                         clsidChild, (LPVOID *)&pSF);
+        }
     }
     ILFree (pidlChild);
 
