@@ -27,6 +27,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <unistd.h>
 
 #include "ntstatus.h"
@@ -72,6 +73,17 @@ static BOOL winehua_vulkan_present_enabled(void)
         return TRUE;
     }
     return FALSE;
+}
+
+static BOOL winehua_present_image_trace_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *value = getenv("WINEHUA_DXVK_TRACE_PRESENT_IMAGE");
+        enabled = value && value[0] == '1' && !value[1];
+    }
+    return enabled;
 }
 
 static BOOL winehua_private_surface_handle(VkSurfaceKHR handle)
@@ -2266,6 +2278,14 @@ acquired:
             pthread_mutex_unlock(&swapchain->mutex);
         }
     }
+    if (winehua_present_image_trace_enabled())
+        fprintf(stderr,
+                "WineHuaPresentImage: layer=wine event=acquire swapchain=0x%llx "
+                "index=%u image=0x%llx status=%d\n",
+                (unsigned long long)(uint64_t)swapchain->obj.client.swapchain,
+                *image_index,
+                (unsigned long long)(uintptr_t)swapchain->images[*image_index],
+                result);
     return result;
 }
 
@@ -2299,6 +2319,15 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
                            ((uint64_t)(uintptr_t)swapchain & UINT64_C(0x00000000ffffffff)));
         instance->p_insert_object(instance, &swapchain->obj.obj);
         *ret = swapchain->obj.client.swapchain;
+        if (winehua_present_image_trace_enabled())
+        {
+            for (uint32_t i = 0; i < swapchain->image_count; ++i)
+                fprintf(stderr,
+                        "WineHuaPresentImage: layer=wine event=image-map "
+                        "swapchain=0x%llx index=%u image=0x%llx\n",
+                        (unsigned long long)(uint64_t)*ret, i,
+                        (unsigned long long)(uintptr_t)swapchain->images[i]);
+        }
         return VK_SUCCESS;
     }
 
@@ -2502,12 +2531,22 @@ static VkResult winehua_queue_present(struct vulkan_queue *queue, VkPresentInfoK
         }
         else
         {
+            const uint32_t serial = ++swapchain->serial;
             client_surface_update(swapchain->surface->client);
             present_result = winehua_present_image(queue, swapchain->images[image_index],
                                                    swapchain->extents.width, swapchain->extents.height,
                                                    swapchain->format, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                                                    swapchain->surface->winehua_surface_id,
-                                                   ++swapchain->serial, &deadline);
+                                                   serial, &deadline);
+            if (winehua_present_image_trace_enabled())
+                fprintf(stderr,
+                        "WineHuaPresentImage: layer=wine event=present "
+                        "swapchain=0x%llx serial=%u index=%u image=0x%llx "
+                        "result=%d deadline=%llu\n",
+                        (unsigned long long)(uint64_t)present_info->pSwapchains[i],
+                        serial, image_index,
+                        (unsigned long long)(uintptr_t)swapchain->images[image_index],
+                        present_result, (unsigned long long)deadline);
             client_surface_present(swapchain->surface->client);
             pthread_mutex_lock(&swapchain->mutex);
             swapchain->acquired[image_index] = FALSE;
