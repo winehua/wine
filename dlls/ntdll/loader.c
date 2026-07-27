@@ -2263,6 +2263,8 @@ done:
  *
  * Build the module data for a mapped dll.
  */
+static inline const WCHAR *get_module_path_end( const WCHAR *module );
+
 static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, void **module,
                               const SECTION_IMAGE_INFORMATION *image_info, const struct file_id *id,
                               DWORD flags, BOOL system, BOOL redirected, WINE_MODREF **pwm )
@@ -2274,6 +2276,8 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
     WINE_MODREF *wm;
     NTSTATUS status;
     SIZE_T map_size;
+    WCHAR *module_load_path = NULL;
+    const WCHAR *imports_load_path = load_path;
 
     if (!(nt = RtlImageNtHeader( *module ))) return STATUS_INVALID_IMAGE_FORMAT;
 
@@ -2297,14 +2301,38 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
 
     /* fixup imports */
 
+    /* The ARM64 WoW64 entry path can build the initial x64 PE with a NULL
+     * load_path.  In that case the normal default path is the Wine runtime
+     * directory, so native DLLs beside the executable are skipped.  Recover
+     * the application directory from the PE's own NT name before resolving
+     * imports.  This is the standard Windows DLL search rule and is also
+     * required for managed DXVK d3d11/dxgi DLLs. */
+    if (!imports_load_path && nt_name && nt_name->Length > 4 * sizeof(WCHAR))
+    {
+        const WCHAR *full_name = nt_name->Buffer + 4; /* skip \\??\\ */
+        const WCHAR *end = get_module_path_end( full_name );
+        SIZE_T len = end - full_name;
+        if (len)
+        {
+            module_load_path = RtlAllocateHeap( GetProcessHeap(), 0,
+                                                 (len + 1) * sizeof(WCHAR) );
+            if (module_load_path)
+            {
+                memcpy( module_load_path, full_name, len * sizeof(WCHAR) );
+                module_load_path[len] = 0;
+                imports_load_path = module_load_path;
+            }
+        }
+    }
+
     if (!(flags & LDR_DONT_RESOLVE_REFS) &&
         ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) ||
          nt->OptionalHeader.Subsystem == IMAGE_SUBSYSTEM_NATIVE))
     {
         if (wm->ldr.Flags & LDR_COR_ILONLY)
-            status = fixup_imports_ilonly( wm, load_path, &wm->ldr.EntryPoint );
+            status = fixup_imports_ilonly( wm, imports_load_path, &wm->ldr.EntryPoint );
         else
-            status = fixup_imports( wm, load_path );
+            status = fixup_imports( wm, imports_load_path );
         if (status != STATUS_SUCCESS)
         {
             /* the module has only be inserted in the load & memory order lists */
@@ -2321,9 +2349,12 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
              * As these might reference our wm, we don't free it.
              */
             *module = NULL;
+            RtlFreeHeap( GetProcessHeap(), 0, module_load_path );
             return status;
         }
     }
+
+    RtlFreeHeap( GetProcessHeap(), 0, module_load_path );
 
     TRACE( "loaded %s %p %p\n", debugstr_us(nt_name), wm, *module );
 
@@ -3262,6 +3293,74 @@ done:
     return status;
 }
 
+/* Search WineHua's process-scoped DXVK overlay before the ordinary PE search
+ * path.  The overlay is a Unix runtime directory, not a C: prefix directory,
+ * and is therefore exposed to the loader as the internal \\??\\unix namespace.
+ * This is deliberately limited to d3d11/dxgi and to an explicit dxvk_* mode;
+ * WineD3D and ordinary applications retain the normal Windows search rules. */
+static NTSTATUS search_winehua_dxvk_overlay( LPCWSTR libname, UNICODE_STRING *nt_name,
+                                             WINE_MODREF **pwm, HANDLE *mapping,
+                                             SECTION_IMAGE_INFORMATION *image_info,
+                                             struct file_id *id )
+{
+    static const WCHAR backend_nameW[] = L"WINEHUA_D3D_BACKEND";
+    static const WCHAR root_nameW[] = L"WINEHUA_DXVK_ROOT";
+    static const WCHAR d3d11W[] = L"d3d11.dll";
+    static const WCHAR dxgiW[] = L"dxgi.dll";
+    static const WCHAR prefixW[] = L"\\??\\unix";
+    static const WCHAR *const archW[] = {L"x64", L"x86"};
+    UNICODE_STRING backend, root;
+    NTSTATUS status = STATUS_DLL_NOT_FOUND;
+    unsigned int i;
+
+    if (wcscmp( libname, d3d11W ) && wcscmp( libname, dxgiW )) return status;
+    if (get_env_var( backend_nameW, 0, &backend )) return status;
+    if (backend.Length < 5 * sizeof(WCHAR) ||
+        wcsncmp( backend.Buffer, L"dxvk_", 5 )) {
+        RtlFreeUnicodeString( &backend );
+        return status;
+    }
+    RtlFreeUnicodeString( &backend );
+    if (get_env_var( root_nameW, 0, &root )) return status;
+
+    for (i = 0; i < ARRAY_SIZE(archW); ++i)
+    {
+        SIZE_T length = ARRAY_SIZE(prefixW) - 1 + root.Length / sizeof(WCHAR) +
+                        1 + wcslen( archW[i] ) + 1 + wcslen( libname ) + 1;
+        WCHAR *path = RtlAllocateHeap( GetProcessHeap(), 0, length * sizeof(WCHAR) );
+        WCHAR *ptr;
+        if (!path) {
+            status = STATUS_NO_MEMORY;
+            break;
+        }
+        ptr = path;
+        wcscpy( ptr, prefixW );
+        ptr += wcslen( ptr );
+        memcpy( ptr, root.Buffer, root.Length );
+        ptr += root.Length / sizeof(WCHAR);
+        if (ptr == path || ptr[-1] != '\\') *ptr++ = '\\';
+        wcscpy( ptr, archW[i] );
+        ptr += wcslen( ptr );
+        *ptr++ = '\\';
+        wcscpy( ptr, libname );
+
+        nt_name->Buffer = NULL;
+        status = open_dll_file( (UNICODE_STRING *)&(UNICODE_STRING){
+                                    length * sizeof(WCHAR), length * sizeof(WCHAR), path },
+                                pwm, mapping, image_info, id );
+        if (status == STATUS_SUCCESS) {
+            nt_name->Buffer = path;
+            nt_name->Length = (USHORT)(wcslen( path ) * sizeof(WCHAR));
+            nt_name->MaximumLength = (USHORT)(length * sizeof(WCHAR));
+            break;
+        }
+        RtlFreeHeap( GetProcessHeap(), 0, path );
+        if (status != STATUS_DLL_NOT_FOUND && status != STATUS_NOT_SUPPORTED) break;
+    }
+    RtlFreeUnicodeString( &root );
+    return status;
+}
+
 /***********************************************************************
  *	find_dll_file
  *
@@ -3313,7 +3412,20 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
 
     if (RtlDetermineDosPathNameType_U( libname ) == RtlPathTypeRelative)
     {
+        status = search_winehua_dxvk_overlay( libname, nt_name, pwm, mapping,
+                                              image_info, id );
+        if (status == STATUS_SUCCESS) goto done;
+        if (status != STATUS_DLL_NOT_FOUND && status != STATUS_NOT_SUPPORTED) goto done;
         status = search_dll_file( load_path, libname, nt_name, pwm, mapping, image_info, id );
+        /* A caller-specific directory (normally the importing PE's
+         * application directory) must not replace Wine's default system and
+         * runtime paths.  The x64 OHOS WoW64 path now supplies the former
+         * explicitly; continue with the latter for dependencies such as
+         * vulkan-1.dll and Wine builtin imports. */
+        if (status == STATUS_DLL_NOT_FOUND && load_path && default_load_path &&
+            wcscmp( load_path, default_load_path ))
+            status = search_dll_file( default_load_path, libname, nt_name, pwm,
+                                      mapping, image_info, id );
         if (status == STATUS_DLL_NOT_FOUND)
             status = find_builtin_without_file( libname, nt_name, pwm, mapping, image_info, id );
     }
@@ -3322,6 +3434,7 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
 
     if (status == STATUS_NOT_SUPPORTED) status = STATUS_INVALID_IMAGE_FORMAT;
 
+done:
     RtlFreeHeap( GetProcessHeap(), 0, fullname );
     if (wow64_old_value) RtlWow64EnableFsRedirectionEx( 1, &wow64_old_value );
     return status;
@@ -4507,10 +4620,34 @@ void loader_init( CONTEXT *context, void **entry )
         if (needs_elevation())
             elevate_token();
         get_env_var( L"WINESYSTEMDLLPATH", 0, &system_dll_path );
+        /* build_main_module() intentionally defers import resolution until
+         * after the loader bootstrap.  Preserve the Windows rule that the
+         * executable directory is searched first; the x64 OHOS path used to
+         * pass NULL here and therefore skipped native DLLs beside the PE. */
+        WCHAR *main_load_path = NULL;
+        const WCHAR *main_import_path = NULL;
+        if (wm->ldr.FullDllName.Buffer)
+        {
+            const WCHAR *end = get_module_path_end( wm->ldr.FullDllName.Buffer );
+            SIZE_T len = end - wm->ldr.FullDllName.Buffer;
+            if (len)
+            {
+                main_load_path = RtlAllocateHeap( GetProcessHeap(), 0,
+                                                  (len + 1) * sizeof(WCHAR) );
+                if (main_load_path)
+                {
+                    memcpy( main_load_path, wm->ldr.FullDllName.Buffer,
+                            len * sizeof(WCHAR) );
+                    main_load_path[len] = 0;
+                    main_import_path = main_load_path;
+                }
+            }
+        }
         if (wm->ldr.Flags & LDR_COR_ILONLY)
-            status = fixup_imports_ilonly( wm, NULL, entry );
+            status = fixup_imports_ilonly( wm, main_import_path, entry );
         else
-            status = fixup_imports( wm, NULL );
+            status = fixup_imports( wm, main_import_path );
+        RtlFreeHeap( GetProcessHeap(), 0, main_load_path );
 
         if (status)
         {

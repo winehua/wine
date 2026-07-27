@@ -138,6 +138,24 @@ PFN_vkVoidFunction WINAPI vkGetDeviceProcAddr(VkDevice device, const char *name)
     if (!device || !name)
         return NULL;
 
+    /* WineHua's private swapchain functions are implemented by win32u and
+     * intentionally do not exist in the Host Venus VkDevice dispatch table.
+     * Bypass the Host availability query for exactly the KHR swapchain entry
+     * points exposed by the client extension. */
+    if (device->extensions.has_VK_KHR_swapchain &&
+        (!strcmp(name, "vkCreateSwapchainKHR") ||
+         !strcmp(name, "vkDestroySwapchainKHR") ||
+         !strcmp(name, "vkGetSwapchainImagesKHR") ||
+         !strcmp(name, "vkAcquireNextImageKHR") ||
+         !strcmp(name, "vkAcquireNextImage2KHR") ||
+         !strcmp(name, "vkQueuePresentKHR") ||
+         !strcmp(name, "vkGetDeviceGroupPresentCapabilitiesKHR") ||
+         !strcmp(name, "vkGetDeviceGroupSurfacePresentModesKHR")))
+    {
+        func = wine_vk_get_device_proc_addr(name);
+        if (func) return func;
+    }
+
     if (device->extensions.has_VK_KHR_external_memory_win32)
     {
         if (!strcmp(name, "vkGetMemoryWin32HandleKHR"))
@@ -361,6 +379,16 @@ static BOOL is_instance_extension_supported(const char *extension, struct vulkan
 
 static BOOL is_device_extension_supported(VkPhysicalDevice physical_device, const char *extension, struct vulkan_device_extensions *extensions)
 {
+#if 1
+    /* Host Venus intentionally has no WSI extension.  WineHua implements the
+     * swapchain in win32u/virgl and therefore advertises this client-facing
+     * capability even though it must not be sent to the Host vkCreateDevice. */
+    if (!strcmp(extension, VK_KHR_SWAPCHAIN_EXTENSION_NAME))
+    {
+        extensions->has_VK_KHR_swapchain = 1;
+        return TRUE;
+    }
+#endif
 #define USE_VK_EXT(x) if (!strcmp(extension, #x)) return (extensions->has_ ## x = physical_device->extensions.has_ ## x);
     ALL_VK_CLIENT_DEVICE_EXTS
 #undef USE_VK_EXT
@@ -572,6 +600,16 @@ VkResult WINAPI vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physical_d
         if (!is_device_extension_supported(physical_device, extension, &extensions)) continue;
         TRACE("  - %s\n", extension);
         if (len++ < capacity && properties) properties[len - 1] = host_properties[i];
+    }
+    /* This WineHua build owns the Win32 WSI boundary.  The Host Venus ICD
+     * deliberately has no VK_KHR_swapchain, so expose the client extension
+     * regardless of whether the per-process environment reached this loader
+     * instance.  win32u strips it again before Host vkCreateDevice. */
+    {
+        static const VkExtensionProperties VK_KHR_swapchain =
+            {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_SWAPCHAIN_SPEC_VERSION};
+        TRACE("  - VK_KHR_swapchain (WineHua private present)\n");
+        if (len++ < capacity && properties) properties[len - 1] = VK_KHR_swapchain;
     }
     if (physical_device->extensions.has_VK_KHR_external_memory_win32)
     {
