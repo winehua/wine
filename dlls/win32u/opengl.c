@@ -1193,6 +1193,14 @@ static void init_device_info( struct egl_platform *egl, const struct opengl_func
         funcs->p_eglMakeCurrent( egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, context );
 
         renderer = strdup( (const char *)funcs->p_glGetString( GL_RENDERER ) );
+        /* OHOS / platforms without DRM: Mesa registers only _eglSoftwareDevice,
+         * so the display device reports EGL_MESA_device_software regardless of
+         * the actual GL driver.  Override accelerated when virgl is active. */
+        if (!egl->accelerated && strstr( renderer, "virgl" ))
+        {
+            egl->accelerated = TRUE;
+            TRACE( "  + overrode accelerated to TRUE for virgl device\n" );
+        }
         egl->device_name = gpu_device_name( egl->vendor_id, egl->device_id, renderer );
         if (egl->device_name != renderer) free( renderer );
 
