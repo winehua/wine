@@ -97,7 +97,7 @@ static void write_state(const struct probe_state *state, const char *status,
              "{\"loaderApiVersion\":\"%s\",\"deviceApiVersion\":\"%s\","
              "\"deviceName\":\"%s\",\"vendorId\":%u,\"deviceId\":%u,"
              "\"graphicsQueueFamily\":%u,\"vulkanModule\":\"%s\","
-             "\"winevulkanModule\":\"%s\"," 
+             "\"winevulkanModule\":\"%s\","
              "\"checks\":{\"bufferCopy\":%s,\"imageClear\":%s,"
              "\"storageImageWrite\":%s,\"storageImageRead\":%s,"
              "\"sampledImageFetch\":%s,\"combinedImageSampler\":%s,"
