@@ -64,7 +64,7 @@ int ohos_map_exec_section( void *view_base, int fd,
 {
     char *sec_addr = (char *)view_base + virtual_address;
     size_t sec_offset = virtual_address & host_page_mask;
-    size_t sec_map_size = (virtual_address + file_size + host_page_mask) & ~host_page_mask;
+    size_t sec_map_size = (file_size + sec_offset + host_page_mask) & ~host_page_mask;
 
     ohos_jit_enable();
     if (mmap( sec_addr - sec_offset, sec_map_size + sec_offset,
