@@ -1962,15 +1962,19 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     DWORD dllpath_len = 0;
     WCHAR *dllpath_w = NULL;
     {
+        static const char system_dll_path[] = ";C:\\windows\\system32;C:\\windows";
         const char *winedllpath = getenv("WINEDLLPATH");
         if (winedllpath)
         {
             DWORD ulen = strlen(winedllpath);
-            dllpath_w = malloc((ulen + 2) * sizeof(WCHAR));
+            DWORD system_len = strlen(system_dll_path);
+            dllpath_w = malloc((ulen + system_len + 1) * sizeof(WCHAR));
             if (dllpath_w)
             {
                 for (const char *s = winedllpath; *s; s++)
                     dllpath_w[dllpath_len++] = (*s == ':') ? ';' : *s;
+                for (const char *s = system_dll_path; *s; s++)
+                    dllpath_w[dllpath_len++] = *s;
                 dllpath_w[dllpath_len] = 0;
                 dllpath_len = (dllpath_len + 1) * sizeof(WCHAR);
             }
