@@ -2035,6 +2035,21 @@ static UINT add_screen_size( SIZE *sizes, UINT count, SIZE size )
     return 1;
 }
 
+static BOOL virtual_mode_fits_compatibility_envelope( const DEVMODEW *maximum, UINT width, UINT height )
+{
+    static const SIZE compatibility_envelope = {1280, 800};
+    UINT maximum_width = devmode_get( maximum, DM_PELSWIDTH );
+    UINT maximum_height = devmode_get( maximum, DM_PELSHEIGHT );
+    SIZE physical = {max( maximum_width, maximum_height ), min( maximum_width, maximum_height )};
+    SIZE candidate = {max( width, height ), min( width, height )};
+
+    /* A single-mode host is already using Wine's virtual modeset path. Keep a
+     * 1280x800 logical envelope so 1024x768 remains available on 720-line
+     * widescreen outputs; the host compositor scales it to the physical mode. */
+    return (candidate.cx <= physical.cx && candidate.cy <= physical.cy) ||
+           (candidate.cx <= compatibility_envelope.cx && candidate.cy <= compatibility_envelope.cy);
+}
+
 static UINT add_virtual_mode( DEVMODEW *modes, UINT count, const DEVMODEW *mode )
 {
     TRACE( "adding mode %s\n", debugstr_devmodew(mode) );
@@ -2063,6 +2078,7 @@ static SIZE *get_screen_sizes( const DEVMODEW *maximum, const DEVMODEW *modes, U
         {2880, 1620},
         {3200, 1800},
         /* 16:10 */
+        {1280,  800},
         {1440,  900},
         {1680, 1050},
         {1920, 1200},
@@ -2091,7 +2107,7 @@ static SIZE *get_screen_sizes( const DEVMODEW *maximum, const DEVMODEW *modes, U
     count = add_screen_size( sizes, 0, max_size );
     for (i = 0; i < ARRAY_SIZE(default_sizes); i++)
     {
-        if (default_sizes[i].cx > max_size.cx || default_sizes[i].cy > max_size.cy) continue;
+        if (!virtual_mode_fits_compatibility_envelope( maximum, default_sizes[i].cx, default_sizes[i].cy )) continue;
         count += add_screen_size( sizes, count, default_sizes[i] );
     }
 
@@ -2145,7 +2161,7 @@ static DEVMODEW *get_virtual_modes( const DEVMODEW *initial, const DEVMODEW *max
             mode.dmPelsWidth = vertical ? screen_sizes[j].cy : screen_sizes[j].cx;
             mode.dmPelsHeight = vertical ? screen_sizes[j].cx : screen_sizes[j].cy;
 
-            if (mode.dmPelsWidth > maximum->dmPelsWidth || mode.dmPelsHeight > maximum->dmPelsHeight) continue;
+            if (!virtual_mode_fits_compatibility_envelope( maximum, mode.dmPelsWidth, mode.dmPelsHeight )) continue;
             if (mode.dmPelsWidth == maximum->dmPelsWidth && mode.dmPelsHeight == maximum->dmPelsHeight) continue;
             if (mode.dmPelsWidth == initial->dmPelsWidth && mode.dmPelsHeight == initial->dmPelsHeight) continue;
             count += add_virtual_mode( modes, count, &mode );
