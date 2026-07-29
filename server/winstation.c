@@ -418,11 +418,8 @@ static void close_desktop_timeout( void *private )
     struct desktop *desktop = private;
 
     desktop->close_timeout = NULL;
-    if (!no_auto_close)
-    {
-        unlink_named_object( &desktop->obj );  /* make sure no other process can open it */
-        post_desktop_message( desktop, WM_CLOSE, 0, 0 );  /* and signal the owner to quit */
-    }
+    unlink_named_object( &desktop->obj );  /* make sure no other process can open it */
+    post_desktop_message( desktop, WM_CLOSE, 0, 0 );  /* and signal the owner to quit */
 }
 
 /* add a user of the desktop and cancel the close timeout */

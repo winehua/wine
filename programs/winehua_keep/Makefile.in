@@ -1,0 +1,7 @@
+MODULE    = winehua_keep.exe
+IMPORTS   = user32
+
+EXTRADLLFLAGS = -mwindows
+
+SOURCES = \
+	main.c
