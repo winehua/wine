@@ -1268,7 +1268,8 @@ static const struct wl_buffer_listener dummy_buffer_listener =
  * Ensure that the wayland surface has up-to-date contents, by committing
  * a dummy buffer if necessary.
  */
-void wayland_surface_ensure_contents(struct wayland_surface *surface)
+void wayland_surface_ensure_contents(struct wayland_surface *surface,
+                                     struct wayland_shm_buffer *window_contents)
 {
     struct wayland_shm_buffer *dummy_shm_buffer;
     HRGN damage;
@@ -1298,6 +1299,15 @@ void wayland_surface_ensure_contents(struct wayland_surface *surface)
 
     if (!(damage = NtGdiCreateRectRgn(0, 0, width, height)))
         WARN("Failed to create damage region for dummy buffer\n");
+
+    /*
+     * The client subsurface covers only the Win32 client area. Preserve the
+     * latest GDI caption and borders while still attaching a correctly sized
+     * parent buffer. Skipping this attach leaves resize/configure state
+     * incomplete and can stall a Vulkan client after its first present.
+     */
+    if (damage && window_contents)
+        wayland_shm_buffer_copy(window_contents, dummy_shm_buffer, damage);
 
     if (wayland_surface_reconfigure(surface))
     {
