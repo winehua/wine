@@ -15,6 +15,7 @@
 #include "wine/vulkan.h"
 
 #include "../winehua_smoke_protocol.h"
+#include "../../../../smoke/vkd3d_capability_audit.h"
 
 struct probe_state
 {
@@ -23,6 +24,18 @@ struct probe_state
     uint32_t loader_api;
     VkPhysicalDeviceProperties properties;
     uint32_t queue_family;
+    BOOL descriptor_indexing;
+    BOOL robustness2;
+    BOOL timeline_semaphore;
+    BOOL synchronization2;
+    BOOL dynamic_rendering;
+    BOOL maintenance4;
+    BOOL buffer_device_address;
+    uint32_t max_update_after_bind_descriptors_in_all_pools;
+    uint32_t max_descriptor_set_update_after_bind_sampled_images;
+    uint32_t max_descriptor_set_update_after_bind_storage_images;
+    uint32_t max_descriptor_set_update_after_bind_storage_buffers;
+    char *capability_audit;
     BOOL buffer_copy_ok;
     BOOL image_clear_ok;
     BOOL storage_image_write_ok;
@@ -78,10 +91,91 @@ static void load_module_paths(struct probe_state *state)
                                    sizeof(state->winevulkan_module));
 }
 
+static BOOL has_extension(const VkExtensionProperties *extensions, uint32_t count,
+                          const char *name)
+{
+    uint32_t i;
+    for (i = 0; i < count; ++i)
+        if (!strcmp(extensions[i].extensionName, name)) return TRUE;
+    return FALSE;
+}
+
+static BOOL query_extended_capabilities(VkPhysicalDevice physical,
+                                        struct probe_state *state)
+{
+    uint32_t count = 0;
+    VkExtensionProperties *extensions = NULL;
+    VkPhysicalDeviceFeatures2 features2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    VkPhysicalDeviceVulkan12Features vulkan12 = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan13Features vulkan13 = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceRobustness2FeaturesEXT robustness2 = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    VkPhysicalDeviceProperties2 properties2 = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    VkPhysicalDeviceVulkan12Properties properties12 = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+    VkPhysicalDeviceIDProperties id_properties = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    void **tail = &features2.pNext;
+    BOOL api12 = state->properties.apiVersion >= VK_API_VERSION_1_2;
+    BOOL api13 = state->properties.apiVersion >= VK_API_VERSION_1_3;
+    BOOL has_robustness2;
+
+    if (vkEnumerateDeviceExtensionProperties(physical, NULL, &count, NULL) != VK_SUCCESS)
+        return FALSE;
+    extensions = calloc(count ? count : 1, sizeof(*extensions));
+    if (!extensions) return FALSE;
+    if (count && vkEnumerateDeviceExtensionProperties(physical, NULL, &count, extensions) != VK_SUCCESS)
+    {
+        free(extensions);
+        return FALSE;
+    }
+    has_robustness2 = has_extension(extensions, count, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+#define APPEND_FEATURE(feature, enabled) do { \
+    if (enabled) { *tail = &(feature); tail = &(feature).pNext; } \
+} while (0)
+    APPEND_FEATURE(vulkan12, api12);
+    APPEND_FEATURE(vulkan13, api13);
+    APPEND_FEATURE(robustness2, has_robustness2);
+#undef APPEND_FEATURE
+    vkGetPhysicalDeviceFeatures2(physical, &features2);
+    properties2.pNext = &properties12;
+    properties12.pNext = &id_properties;
+    vkGetPhysicalDeviceProperties2(physical, &properties2);
+    state->descriptor_indexing = api12 && vulkan12.descriptorIndexing;
+    state->timeline_semaphore = api12 && vulkan12.timelineSemaphore;
+    state->buffer_device_address = api12 && vulkan12.bufferDeviceAddress;
+    state->robustness2 = has_robustness2 && robustness2.robustBufferAccess2 &&
+                         robustness2.robustImageAccess2 && robustness2.nullDescriptor;
+    state->synchronization2 = api13 && vulkan13.synchronization2;
+    state->dynamic_rendering = api13 && vulkan13.dynamicRendering;
+    state->maintenance4 = api13 && vulkan13.maintenance4;
+    state->max_update_after_bind_descriptors_in_all_pools =
+        properties12.maxUpdateAfterBindDescriptorsInAllPools;
+    state->max_descriptor_set_update_after_bind_sampled_images =
+        properties12.maxDescriptorSetUpdateAfterBindSampledImages;
+    state->max_descriptor_set_update_after_bind_storage_images =
+        properties12.maxDescriptorSetUpdateAfterBindStorageImages;
+    state->max_descriptor_set_update_after_bind_storage_buffers =
+        properties12.maxDescriptorSetUpdateAfterBindStorageBuffers;
+    state->capability_audit = winehua_vkd3d_capability_audit(
+        physical, extensions, count, &vulkan12, &vulkan13,
+        &properties12, &id_properties);
+    if (!state->capability_audit)
+    {
+        free(extensions);
+        return FALSE;
+    }
+    free(extensions);
+    return TRUE;
+}
+
 static void write_state(const struct probe_state *state, const char *status,
                         const char *stage, const char *message)
 {
-    char metrics[2048];
+    char metrics[65536];
     char loader_version[32];
     char device_version[32];
     char device_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE + 16];
@@ -96,7 +190,17 @@ static void write_state(const struct probe_state *state, const char *status,
     snprintf(metrics, sizeof(metrics),
              "{\"loaderApiVersion\":\"%s\",\"deviceApiVersion\":\"%s\","
              "\"deviceName\":\"%s\",\"vendorId\":%u,\"deviceId\":%u,"
-             "\"graphicsQueueFamily\":%u,\"vulkanModule\":\"%s\","
+             "\"driverVersion\":%u,\"graphicsQueueFamily\":%u,"
+             "\"descriptorIndexing\":%s,\"robustness2\":%s,"
+             "\"timelineSemaphore\":%s,\"synchronization2\":%s,"
+             "\"dynamicRendering\":%s,\"maintenance4\":%s,"
+             "\"bufferDeviceAddress\":%s,\"updateAfterBindLimits\":{"
+             "\"maxUpdateAfterBindDescriptorsInAllPools\":%u,"
+            "\"maxDescriptorSetUpdateAfterBindSampledImages\":%u,"
+            "\"maxDescriptorSetUpdateAfterBindStorageImages\":%u,"
+            "\"maxDescriptorSetUpdateAfterBindStorageBuffers\":%u},"
+            "\"capabilityAudit\":%s,"
+            "\"vulkanModule\":\"%s\","
              "\"winevulkanModule\":\"%s\","
              "\"checks\":{\"bufferCopy\":%s,\"imageClear\":%s,"
              "\"storageImageWrite\":%s,\"storageImageRead\":%s,"
@@ -118,8 +222,21 @@ static void write_state(const struct probe_state *state, const char *status,
              "\"perFrameDeviceWaitIdle\":0,\"fallbackDetected\":%s,"
              "\"durationMs\":%llu}",
              loader_version, device_version, device_name,
-             state->properties.vendorID, state->properties.deviceID,
-             state->queue_family, vulkan_module, winevulkan_module,
+             state->properties.vendorID, state->properties.deviceID, state->properties.driverVersion,
+             state->queue_family,
+             state->descriptor_indexing ? "true" : "false",
+             state->robustness2 ? "true" : "false",
+             state->timeline_semaphore ? "true" : "false",
+             state->synchronization2 ? "true" : "false",
+             state->dynamic_rendering ? "true" : "false",
+             state->maintenance4 ? "true" : "false",
+             state->buffer_device_address ? "true" : "false",
+             state->max_update_after_bind_descriptors_in_all_pools,
+            state->max_descriptor_set_update_after_bind_sampled_images,
+            state->max_descriptor_set_update_after_bind_storage_images,
+            state->max_descriptor_set_update_after_bind_storage_buffers,
+            state->capability_audit ? state->capability_audit : "{}",
+            vulkan_module, winevulkan_module,
              state->buffer_copy_ok ? "true" : "false",
              state->image_clear_ok ? "true" : "false",
              state->sampled_only ? "null" : (state->storage_image_write_ok ? "true" : "false"),
@@ -783,12 +900,15 @@ int main(int argc, char **argv)
     void *mapped = NULL;
     VkDeviceMemory mapped_memory = VK_NULL_HANDLE;
     const char *failure = "unknown Wine Vulkan failure";
+    BOOL capability_audit = FALSE;
     int exit_code = 1;
 
     memset(&state, 0, sizeof(state));
     state.started_ms = winehua_smoke_timestamp_ms();
     state.loader_api = VK_API_VERSION_1_0;
     state.queue_family = UINT32_MAX;
+    for (i = 1; i < (uint32_t)argc; ++i)
+        if (!strcmp(argv[i], "--capability-audit")) capability_audit = TRUE;
     if (!winehua_smoke_parse_options(&state.smoke, argc, argv, 1)) return 6;
     load_module_paths(&state);
     write_state(&state, "STARTED", "startup", "Wine Vulkan offscreen smoke starting");
@@ -816,7 +936,9 @@ int main(int argc, char **argv)
     application.applicationVersion = 1;
     application.pEngineName = "WineHua";
     application.engineVersion = 1;
-    application.apiVersion = VK_API_VERSION_1_1;
+    /* Capability audit must request the API level vkd3d-proton will use.
+     * Keep ordinary Wine Vulkan smoke on 1.1 for the established baseline. */
+    application.apiVersion = capability_audit ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;
     instance_info.pApplicationInfo = &application;
     if (state.smoke.present)
     {
@@ -848,6 +970,11 @@ int main(int argc, char **argv)
         }
     }
     vkGetPhysicalDeviceProperties(physical, &state.properties);
+    if (capability_audit && !query_extended_capabilities(physical, &state))
+    {
+        failure = "Wine Vulkan extended capability query failed";
+        goto cleanup;
+    }
     state.fallback_detected = strstr(state.properties.deviceName, "llvmpipe") != NULL ||
                               strstr(state.properties.deviceName, "softpipe") != NULL;
     if (state.fallback_detected)
@@ -1184,5 +1311,6 @@ cleanup:
     if (device && source_memory) vkFreeMemory(device, source_memory, NULL);
     if (device) vkDestroyDevice(device, NULL);
     if (instance) vkDestroyInstance(instance, NULL);
+    free(state.capability_audit);
     return exit_code;
 }
