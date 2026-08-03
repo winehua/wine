@@ -106,6 +106,8 @@ static BOOL query_extended_capabilities(VkPhysicalDevice physical,
     uint32_t count = 0;
     VkExtensionProperties *extensions = NULL;
     VkPhysicalDeviceFeatures2 features2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    VkPhysicalDeviceVulkan11Features vulkan11 = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceVulkan12Features vulkan12 = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan13Features vulkan13 = {
@@ -119,6 +121,7 @@ static BOOL query_extended_capabilities(VkPhysicalDevice physical,
     VkPhysicalDeviceIDProperties id_properties = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
     void **tail = &features2.pNext;
+    BOOL api11 = state->properties.apiVersion >= VK_API_VERSION_1_1;
     BOOL api12 = state->properties.apiVersion >= VK_API_VERSION_1_2;
     BOOL api13 = state->properties.apiVersion >= VK_API_VERSION_1_3;
     BOOL has_robustness2;
@@ -136,6 +139,7 @@ static BOOL query_extended_capabilities(VkPhysicalDevice physical,
 #define APPEND_FEATURE(feature, enabled) do { \
     if (enabled) { *tail = &(feature); tail = &(feature).pNext; } \
 } while (0)
+    APPEND_FEATURE(vulkan11, api11);
     APPEND_FEATURE(vulkan12, api12);
     APPEND_FEATURE(vulkan13, api13);
     APPEND_FEATURE(robustness2, has_robustness2);
@@ -161,7 +165,7 @@ static BOOL query_extended_capabilities(VkPhysicalDevice physical,
     state->max_descriptor_set_update_after_bind_storage_buffers =
         properties12.maxDescriptorSetUpdateAfterBindStorageBuffers;
     state->capability_audit = winehua_vkd3d_capability_audit(
-        physical, extensions, count, &vulkan12, &vulkan13,
+        physical, extensions, count, &vulkan11, &vulkan12, &vulkan13,
         &properties12, &id_properties);
     if (!state->capability_audit)
     {
