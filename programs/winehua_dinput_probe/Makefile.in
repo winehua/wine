@@ -1,0 +1,7 @@
+MODULE    = winehua_dinput_probe.exe
+IMPORTS   = dinput8 dxguid user32 gdi32
+
+EXTRADLLFLAGS = -mconsole
+
+SOURCES = \
+	main.c
