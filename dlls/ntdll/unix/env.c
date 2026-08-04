@@ -1536,6 +1536,32 @@ static WCHAR *build_command_line( WCHAR **wargv )
 /***********************************************************************
  *           run_wineboot
  */
+static void write_winehua_wineboot_status( const char *format, ... )
+{
+    static const char status_name[] = "/.winehua-wineboot-init-status";
+    char record[96];
+    char *path;
+    va_list args;
+    int fd, length;
+
+    if (!config_dir || asprintf( &path, "%s%s", config_dir, status_name ) == -1) return;
+
+    /* Only a launcher-created request enables this private completion channel.
+     * Ordinary Wine processes must not create or mutate the marker. */
+    if ((fd = open( path, O_WRONLY | O_TRUNC | O_CLOEXEC )) == -1)
+    {
+        free( path );
+        return;
+    }
+
+    va_start( args, format );
+    length = vsnprintf( record, sizeof(record), format, args );
+    va_end( args );
+    if (length > 0 && length < sizeof(record)) write( fd, record, length );
+    close( fd );
+    free( path );
+}
+
 static void run_wineboot( WCHAR *env, SIZE_T size )
 {
     static const WCHAR eventW[] = {'\\','K','e','r','n','e','l','O','b','j','e','c','t','s',
@@ -1554,6 +1580,8 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
     LARGE_INTEGER timeout;
     unsigned int status;
     int count = 1;
+
+    write_winehua_wineboot_status( "wineboot-dispatch" );
 
     init_unicode_string( &nameW, eventW );
     InitializeObjectAttributes( &attr, &nameW, OBJ_OPENIF, 0, NULL );
@@ -1592,6 +1620,7 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
     if (status)
     {
         ERR( "failed to start wineboot %x\n", status );
+        write_winehua_wineboot_status( "wineboot-create-failed-%08x", status );
         NtClose( handles[0] );
         return;
     }
@@ -1601,8 +1630,25 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
 
 wait:
     timeout.QuadPart = (ULONGLONG)5 * 60 * 1000 * -10000;
-    if (NtWaitForMultipleObjects( count, handles, WaitAny, FALSE, &timeout ) == WAIT_TIMEOUT)
+    status = NtWaitForMultipleObjects( count, handles, WaitAny, FALSE, &timeout );
+    if (status == WAIT_OBJECT_0)
+        write_winehua_wineboot_status( "wineboot-init-ok" );
+    else if (status == WAIT_TIMEOUT)
+    {
         ERR( "boot event wait timed out\n" );
+        write_winehua_wineboot_status( "wineboot-event-timeout" );
+    }
+    else if (count > 1 && status == WAIT_OBJECT_0 + 1)
+    {
+        PROCESS_BASIC_INFORMATION info;
+        NTSTATUS query_status = NtQueryInformationProcess( process, ProcessBasicInformation,
+                                                           &info, sizeof(info), NULL );
+        if (!query_status)
+            write_winehua_wineboot_status( "wineboot-process-exit-%08x", info.ExitStatus );
+        else
+            write_winehua_wineboot_status( "wineboot-process-exit-query-%08x", query_status );
+    }
+    else write_winehua_wineboot_status( "wineboot-wait-failed-%08x", status );
     while (count) NtClose( handles[--count] );
 }
 
