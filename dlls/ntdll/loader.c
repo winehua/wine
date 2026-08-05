@@ -3296,8 +3296,9 @@ done:
 /* Search WineHua's process-scoped DXVK overlay before the ordinary PE search
  * path.  The overlay is a Unix runtime directory, not a C: prefix directory,
  * and is therefore exposed to the loader as the internal \\??\\unix namespace.
- * This is deliberately limited to d3d11/dxgi and to an explicit dxvk_* mode;
- * WineD3D and ordinary applications retain the normal Windows search rules. */
+ * This is deliberately limited to d3d11/dxgi and to an explicit DXVK or
+ * mixed VKD3D product mode; WineD3D and ordinary applications retain the
+ * normal Windows search rules. */
 static NTSTATUS search_winehua_dxvk_overlay( LPCWSTR libname, UNICODE_STRING *nt_name,
                                              WINE_MODREF **pwm, HANDLE *mapping,
                                              SECTION_IMAGE_INFORMATION *image_info,
@@ -3316,7 +3317,8 @@ static NTSTATUS search_winehua_dxvk_overlay( LPCWSTR libname, UNICODE_STRING *nt
     if (wcscmp( libname, d3d11W ) && wcscmp( libname, dxgiW )) return status;
     if (get_env_var( backend_nameW, 0, &backend )) return status;
     if (backend.Length < 5 * sizeof(WCHAR) ||
-        wcsncmp( backend.Buffer, L"dxvk_", 5 )) {
+        (wcsncmp( backend.Buffer, L"dxvk_", 5 ) &&
+         wcscmp( backend.Buffer, L"vkd3d_limited_500k" ))) {
         RtlFreeUnicodeString( &backend );
         return status;
     }
