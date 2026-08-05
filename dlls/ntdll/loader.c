@@ -3296,34 +3296,39 @@ done:
 /* Search WineHua's process-scoped DXVK overlay before the ordinary PE search
  * path.  The overlay is a Unix runtime directory, not a C: prefix directory,
  * and is therefore exposed to the loader as the internal \\??\\unix namespace.
- * This is deliberately limited to d3d11/dxgi and to an explicit DXVK or
- * mixed VKD3D product mode; WineD3D and ordinary applications retain the
- * normal Windows search rules. */
+ * DXVK supplies d3d11/dxgi, while mixed VKD3D sessions also supply d3d12.
+ * WineD3D and ordinary applications retain the normal Windows search rules. */
 static NTSTATUS search_winehua_dxvk_overlay( LPCWSTR libname, UNICODE_STRING *nt_name,
                                              WINE_MODREF **pwm, HANDLE *mapping,
                                              SECTION_IMAGE_INFORMATION *image_info,
                                              struct file_id *id )
 {
     static const WCHAR backend_nameW[] = L"WINEHUA_D3D_BACKEND";
-    static const WCHAR root_nameW[] = L"WINEHUA_DXVK_ROOT";
+    static const WCHAR dxvk_root_nameW[] = L"WINEHUA_DXVK_ROOT";
+    static const WCHAR vkd3d_root_nameW[] = L"WINEHUA_VKD3D_ROOT";
     static const WCHAR d3d11W[] = L"d3d11.dll";
     static const WCHAR dxgiW[] = L"dxgi.dll";
+    static const WCHAR d3d12W[] = L"d3d12.dll";
     static const WCHAR prefixW[] = L"\\??\\unix";
     static const WCHAR *const archW[] = {L"x64", L"x86"};
     UNICODE_STRING backend, root;
     NTSTATUS status = STATUS_DLL_NOT_FOUND;
     unsigned int i;
 
-    if (wcscmp( libname, d3d11W ) && wcscmp( libname, dxgiW )) return status;
+    const BOOL is_d3d12 = !wcscmp( libname, d3d12W );
+    if (wcscmp( libname, d3d11W ) && wcscmp( libname, dxgiW ) && !is_d3d12)
+        return status;
     if (get_env_var( backend_nameW, 0, &backend )) return status;
+    const BOOL is_mixed_vkd3d = !wcscmp( backend.Buffer, L"vkd3d_limited_500k" );
     if (backend.Length < 5 * sizeof(WCHAR) ||
-        (wcsncmp( backend.Buffer, L"dxvk_", 5 ) &&
-         wcscmp( backend.Buffer, L"vkd3d_limited_500k" ))) {
+        (!is_mixed_vkd3d && wcsncmp( backend.Buffer, L"dxvk_", 5 )) ||
+        (is_d3d12 && !is_mixed_vkd3d)) {
         RtlFreeUnicodeString( &backend );
         return status;
     }
     RtlFreeUnicodeString( &backend );
-    if (get_env_var( root_nameW, 0, &root )) return status;
+    const WCHAR *root_name = is_d3d12 ? vkd3d_root_nameW : dxvk_root_nameW;
+    if (get_env_var( root_name, 0, &root )) return status;
 
     for (i = 0; i < ARRAY_SIZE(archW); ++i)
     {
