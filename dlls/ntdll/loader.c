@@ -3314,12 +3314,14 @@ static NTSTATUS search_winehua_dxvk_overlay( LPCWSTR libname, UNICODE_STRING *nt
     UNICODE_STRING backend, root;
     NTSTATUS status = STATUS_DLL_NOT_FOUND;
     unsigned int i;
+    BOOL is_d3d12, is_mixed_vkd3d;
+    const WCHAR *root_name;
 
-    const BOOL is_d3d12 = !wcscmp( libname, d3d12W );
+    is_d3d12 = !wcscmp( libname, d3d12W );
     if (wcscmp( libname, d3d11W ) && wcscmp( libname, dxgiW ) && !is_d3d12)
         return status;
     if (get_env_var( backend_nameW, 0, &backend )) return status;
-    const BOOL is_mixed_vkd3d = !wcscmp( backend.Buffer, L"vkd3d_limited_500k" );
+    is_mixed_vkd3d = !wcscmp( backend.Buffer, L"vkd3d_limited_500k" );
     if (backend.Length < 5 * sizeof(WCHAR) ||
         (!is_mixed_vkd3d && wcsncmp( backend.Buffer, L"dxvk_", 5 )) ||
         (is_d3d12 && !is_mixed_vkd3d)) {
@@ -3327,7 +3329,7 @@ static NTSTATUS search_winehua_dxvk_overlay( LPCWSTR libname, UNICODE_STRING *nt
         return status;
     }
     RtlFreeUnicodeString( &backend );
-    const WCHAR *root_name = is_d3d12 ? vkd3d_root_nameW : dxvk_root_nameW;
+    root_name = is_d3d12 ? vkd3d_root_nameW : dxvk_root_nameW;
     if (get_env_var( root_name, 0, &root )) return status;
 
     for (i = 0; i < ARRAY_SIZE(archW); ++i)
