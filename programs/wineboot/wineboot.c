@@ -1641,7 +1641,12 @@ static void update_user_profile(void)
                              KEY_ALL_ACCESS, NULL, &profile_hkey, NULL))
         {
             DWORD flags = 0;
-            if (SHGetSpecialFolderPathW(NULL, profile, CSIDL_PROFILE, TRUE))
+            /* The legacy helper is a delayed shell32 import.  On the OHOS
+             * first-prefix path Box64 can resolve that entry to Wine's
+             * unimplemented thunk even though the equivalent modern helper
+             * is available and is already used by create_volatile_environment_registry_key(). */
+            if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PROFILE | CSIDL_FLAG_CREATE,
+                                            NULL, SHGFP_TYPE_CURRENT, profile)))
                 set_reg_value(profile_hkey, L"ProfileImagePath", profile);
             RegSetValueExW( profile_hkey, L"Flags", 0, REG_DWORD, (const BYTE *)&flags, sizeof(flags) );
             RegCloseKey(profile_hkey);
