@@ -435,23 +435,14 @@ static BOOL get_win9x_registry_version( RTL_OSVERSIONINFOEXW *version )
 
 
 /**********************************************************************
- *         parse_win_version
+ *         parse_version_string
  *
- * Parse the contents of the Version key.
+ * Parse a Windows version name (as used in the Version key / the
+ * WINEHUA_WINDOWS_VERSION environment variable).
  */
-static BOOL parse_win_version( HANDLE hkey )
+static BOOL parse_version_string( const WCHAR *name )
 {
-    UNICODE_STRING valueW;
-    WCHAR *name, tmp[64];
-    KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)tmp;
-    DWORD i, count;
-
-    RtlInitUnicodeString( &valueW, L"Version" );
-    if (NtQueryValueKey( hkey, &valueW, KeyValuePartialInformation, tmp, sizeof(tmp) - sizeof(WCHAR), &count ))
-        return FALSE;
-
-    name = (WCHAR *)info->Data;
-    name[info->DataLength / sizeof(WCHAR)] = 0;
+    int i;
 
     for (i = 0; i < ARRAY_SIZE(version_names); i++)
     {
@@ -463,6 +454,27 @@ static BOOL parse_win_version( HANDLE hkey )
 
     ERR( "Invalid Windows version value %s specified in config file.\n", debugstr_w(name) );
     return FALSE;
+}
+
+/**********************************************************************
+ *         parse_win_version
+ *
+ * Parse the contents of the Version key.
+ */
+static BOOL parse_win_version( HANDLE hkey )
+{
+    UNICODE_STRING valueW;
+    WCHAR *name, tmp[64];
+    KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)tmp;
+    DWORD count;
+
+    RtlInitUnicodeString( &valueW, L"Version" );
+    if (NtQueryValueKey( hkey, &valueW, KeyValuePartialInformation, tmp, sizeof(tmp) - sizeof(WCHAR), &count ))
+        return FALSE;
+
+    name = (WCHAR *)info->Data;
+    name[info->DataLength / sizeof(WCHAR)] = 0;
+    return parse_version_string( name );
 }
 
 
@@ -481,6 +493,24 @@ void version_init(void)
     NtQuerySystemInformation( SystemWineVersionInformation, wine_version, sizeof(wine_version), NULL );
 
     current_version = &VersionData[WIN10];
+
+    /* winehua: Windows 版本兼容模式 — 优先取环境变量 WINEHUA_WINDOWS_VERSION
+     * (移植自 CrossOver 的 CX_WINDOWS_VERSION 补丁), 未设置再回落注册表 */
+    {
+        static const WCHAR cxverW[] = {'W','I','N','E','H','U','A','_','W','I','N','D','O','W','S','_','V','E','R','S','I','O','N',0};
+        UNICODE_STRING valueW;
+        WCHAR cxversion[32];
+
+        RtlInitUnicodeString( &nameW, cxverW );
+        valueW.MaximumLength = sizeof(cxversion);
+        valueW.Buffer = cxversion;
+        if (RtlQueryEnvironmentVariable_U(NULL, &nameW, &valueW) == STATUS_SUCCESS)
+        {
+            TRACE( "getting version from WINEHUA_WINDOWS_VERSION\n" );
+            got_win_ver = parse_version_string( cxversion );
+            goto done;
+        }
+    }
 
     RtlOpenCurrentUser( KEY_ALL_ACCESS, &root );
     InitializeObjectAttributes( &attr, &nameW, OBJ_CASE_INSENSITIVE, root, NULL );
