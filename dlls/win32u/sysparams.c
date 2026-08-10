@@ -26,6 +26,7 @@
 
 #include <pthread.h>
 #include <assert.h>
+#include <stdlib.h>
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -166,6 +167,15 @@ static UINT64 monitor_update_serial;
 static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static BOOL emulate_modeset;
+/* winehua: per-process simulated ChangeDisplaySettings in virtual desktop mode.
+ * gated by the WINEHUA_SIMULATE_RESOLUTION environment variable (default off).
+ * When the calling process changes the display settings, the requested mode is
+ * recorded here and reported back to the same process (EnumDisplaySettings,
+ * SM_CXSCREEN, MONITORINFO.rcMonitor, ...) instead of the virtual desktop size.
+ * Other processes have their own win32u instance and are not affected. */
+static BOOL simulate_resolution;
+static BOOL resolution_override_valid;
+static DEVMODEW resolution_override;
 BOOL decorated_mode = TRUE;
 UINT64 thunk_lock_callback = 0;
 
@@ -2396,10 +2406,26 @@ static RECT map_monitor_rect( struct monitor *monitor, RECT rect, UINT dpi_from,
     return map_dpi_rect( rect, dpi_from, dpi_to );
 }
 
+/* winehua: record / report the per-process simulated display mode. */
+static void set_resolution_override( const DEVMODEW *mode )
+{
+    resolution_override_valid = simulate_resolution && !!mode;
+    if (resolution_override_valid) resolution_override = *mode;
+}
+
+static BOOL get_resolution_override( DEVMODEW *mode )
+{
+    if (!resolution_override_valid) return FALSE;
+    memcpy( &mode->dmFields, &resolution_override.dmFields,
+            offsetof(DEVMODEW, dmICMMethod) - offsetof(DEVMODEW, dmFields) );
+    return TRUE;
+}
+
 /* display_lock must be held */
 static RECT monitor_get_rect( struct monitor *monitor, UINT dpi, MONITOR_DPI_TYPE type )
 {
     DEVMODEW current_mode = {.dmSize = sizeof(DEVMODEW)};
+    DEVMODEW override_mode;
     RECT rect = {0, 0, 1024, 768};
     struct source *source;
     UINT dpi_from, x, y;
@@ -2407,6 +2433,18 @@ static RECT monitor_get_rect( struct monitor *monitor, UINT dpi, MONITOR_DPI_TYP
 
     /* services do not have any adapters, only a virtual monitor */
     if (!(source = monitor->source)) return rect;
+
+    /* winehua: report the simulated resolution in the app-visible MDT_DEFAULT
+     * space only; MDT_RAW_DPI / MDT_EFFECTIVE_DPI stay real so the driver keeps
+     * placing windows at the correct raw coordinates */
+    if (type == MDT_DEFAULT && get_resolution_override( &override_mode ))
+    {
+        SetRect( &rect, override_mode.dmPosition.x, override_mode.dmPosition.y,
+                 override_mode.dmPosition.x + override_mode.dmPelsWidth,
+                 override_mode.dmPosition.y + override_mode.dmPelsHeight );
+        dpi_from = monitor_get_dpi( monitor, type, &x, &y );
+        return map_dpi_rect( rect, dpi_from, dpi );
+    }
 
     SetRectEmpty( &rect );
     if (!(source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) return rect;
@@ -4462,6 +4500,19 @@ LONG WINAPI NtUserChangeDisplaySettings( UNICODE_STRING *devname, DEVMODEW *devm
     int ret = DISP_CHANGE_SUCCESSFUL;
     struct source *source;
 
+    /* winehua: 模拟分辨率开启时, CDS 即"记录请求模式" (虚拟桌面语义: 不真正
+     * 切换)。不依赖 apply_display_settings 的虚拟桌面分支 — is_virtual_desktop()
+     * 在本环境可能为 FALSE, 分支永不命中 → 记录从未生效 (实测 vd=0)。
+     * 这里直接短路: 记录 devmode 并返回成功 (游戏靠查询 EnumCURRENT 拿到
+     * 模拟分辨率, 不广播 WM_DISPLAYCHANGE — 避免 serial 联动其他进程重建
+     * display cache); CDS_TEST 保持原逻辑 (纯查询不改状态);
+     * devmode==NULL 清除 override (恢复真实模式)。 */
+    if (simulate_resolution && !(flags & CDS_TEST))
+    {
+        set_resolution_override( devmode );
+        return DISP_CHANGE_SUCCESSFUL;
+    }
+
     TRACE( "%s %p %p %#x %p\n", debugstr_us(devname), devmode, hwnd, flags, lparam );
     TRACE( "flags=%s\n", _CDS_flags(flags) );
 
@@ -4533,7 +4584,11 @@ BOOL WINAPI NtUserEnumDisplaySettings( UNICODE_STRING *device, DWORD index, DEVM
     devmode->dmDriverExtra = 0;
 
     if (index == ENUM_REGISTRY_SETTINGS) ret = source_get_registry_settings( source, devmode );
-    else if (index == ENUM_CURRENT_SETTINGS) ret = source_get_current_settings( source, devmode );
+    else if (index == ENUM_CURRENT_SETTINGS)
+    {
+        /* winehua: report the simulated mode in this process, if any */
+        if (!(ret = get_resolution_override( devmode ))) ret = source_get_current_settings( source, devmode );
+    }
     else if (index == WINE_ENUM_PHYSICAL_SETTINGS) ret = FALSE;
     else ret = source_enum_display_settings( source, index, devmode, flags );
     source_release( source );
@@ -5996,6 +6051,15 @@ void sysparams_init(void)
         decorated_mode = IS_OPTION_TRUE( buffer[0] );
     if (!get_config_key( hkey, appkey, "EmulateModeset", buffer, sizeof(buffer) ))
         emulate_modeset = IS_OPTION_TRUE( buffer[0] );
+
+    /* winehua: WINEHUA_SIMULATE_RESOLUTION enables the per-process simulated
+     * display settings, default off (unset or "0" keeps the original behavior):
+     *   "1" / "true" → record mode: simulated mode follows ChangeDisplaySettings */
+    {
+        const char *simulate = getenv( "WINEHUA_SIMULATE_RESOLUTION" );
+        if (simulate && *simulate && IS_OPTION_TRUE( simulate[0] ))
+            simulate_resolution = TRUE;
+    }
 
 #undef IS_OPTION_TRUE
 
