@@ -1384,6 +1384,20 @@ static HRESULT sample_allocator_allocate_sample(struct sample_allocator *allocat
                 hr = MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown *)texture, 0, FALSE, &buffer);
                 ID3D11Texture2D_Release(texture);
             }
+            else if ((desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
+                    && FAILED(hr))
+            {
+                /* Venus 虚拟 GPU 不支持 VK_KHR_external_memory_win32, D3D11 共享纹理
+                 * 无法创建 (DXVK 报 E_INVALIDARG)。降级为非共享纹理重试一次, 让
+                 * Media Foundation 视频解码在无共享纹理的环境下仍能工作。 */
+                TRACE("Shared D3D11 texture creation failed (hr %#lx), retrying without shared flags.\n", hr);
+                desc.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX);
+                if (SUCCEEDED(hr = ID3D11Device_CreateTexture2D(service->d3d11_device, &desc, NULL, &texture)))
+                {
+                    hr = MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown *)texture, 0, FALSE, &buffer);
+                    ID3D11Texture2D_Release(texture);
+                }
+            }
         }
         else
         {
