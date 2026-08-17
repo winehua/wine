@@ -2309,7 +2309,23 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
         if (win->dwStyle & WS_THICKFRAME) swp_flags |= WINE_SWP_RESIZABLE;
         if (is_child) monitor_rects = map_dpi_window_rects( *new_rects, dpi, raw_dpi );
-        else if (!IsRectEmpty( &win->present_rect ))
+        /* WineHua: 最小化窗口不做 present_rect 替换。
+         *
+         * 问题: 独占全屏呈现的游戏 (war3 等) 最小化后, 从任务栏还原会黑屏,
+         * 且点击窗口又自动最小化, 永远无法恢复。
+         *
+         * 机理: 本分支把呈报给驱动的 rect 替换为整个显示器矩形, 是全屏呈现
+         * 的正确行为; 但游戏被最小化后 present_rect 并不清除 (游戏仍在渲染),
+         * 于是最小化期间驱动拿到的仍是显示器矩形而非 -32000 哨兵位。
+         * winewayland 的「最小化→还原」握手 (window.c restoring_from_minimize)
+         * 依赖驱动侧 rect 停在哨兵位才向 Win32 发 SC_RESTORE; 条件恒不成立 →
+         * WS_MINIMIZE 永远清不掉 → wined3d 客户区缩成 1x1 不恢复 (黑屏),
+         * 且每次状态更新重发 xdg_toplevel_set_minimized (点击再最小化)。
+         *
+         * 解决: 最小化窗口没有呈现区域可言, 豁免 present_rect 替换, 让驱动
+         * 拿到真实 (哨兵) rect, 上游还原握手即可按原设计工作。还原后窗口
+         * 不再是 WS_MINIMIZE, 后续 SWP 自动恢复显示器矩形呈报, 无副作用。 */
+        else if (!IsRectEmpty( &win->present_rect ) && !(win->dwStyle & WS_MINIMIZE))
         {
             MONITORINFO monitor_info = monitor_info_from_rect( new_rects->window, dpi );
             struct window_rects rects = { monitor_info.rcMonitor, monitor_info.rcMonitor, monitor_info.rcMonitor };
