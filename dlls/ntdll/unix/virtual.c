@@ -5203,7 +5203,11 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     {
         base = NULL;
         size = ROUND_SIZE( 0, size, page_mask );
-#ifdef _WIN64
+#if defined(_WIN64) && defined(__aarch64__)
+        /* arm64 原生 (方案③): OHOS 低 4G 不可映射, wow64 32 位空间放 4G 以上
+         * (由转译器处理截断). x86_64 (方案①) 与 box64+wine (方案②) 的 wow64
+         * 是真 32 位指针语义, 强制 ≥4G 分配必然截断 → 跳空崩溃 (syswow64
+         * rundll32 Wow64Install 跳 0x0 挂死 wineboot, 2026-08 实测). */
         if (is_wow64() && (!limit_high || limit_high > limit_4g)) limit_low = limit_4g;
 #endif
     }
