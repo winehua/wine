@@ -628,7 +628,32 @@ static void process_sigkill( void *private )
 
     process->sigkill_delay *= 2;
     if (process->sigkill_delay >= TICKS_PER_SEC / 2)
+    {
+        const char *telemetry = getenv( "WINEHUA_PROCESS_EXIT_TELEMETRY" );
+
         signal = SIGKILL;
+        if (telemetry && telemetry[0] && strcmp( telemetry, "0" ))
+        {
+            const char *prefix = getenv( "WINEPREFIX" );
+            char path[PATH_MAX];
+            char record[96];
+            int fd, length;
+
+            if (prefix && prefix[0] &&
+                snprintf( path, sizeof(path), "%s/.winehua-process-exit-status", prefix ) < sizeof(path) &&
+                (fd = open( path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600 )) >= 0)
+            {
+                length = snprintf( record, sizeof(record), "%d %u %d\n",
+                                   process->unix_pid, process->id, process->exit_code );
+                if (length > 0 && length < sizeof(record)) write( fd, record, length );
+                close( fd );
+            }
+            fprintf( stderr,
+                     "[WineHuaProcessExit] windows_pid=%04x unix_pid=%d exit_code=%u wait_ticks=%lld action=SIGKILL\n",
+                     process->id, process->unix_pid, process->exit_code,
+                     (long long)process->sigkill_delay );
+        }
+    }
 
     if (!kill( process->unix_pid, signal ) && !signal)
         process->sigkill_timeout = add_timeout_user( -process->sigkill_delay, process_sigkill, process );
