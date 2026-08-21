@@ -2460,7 +2460,12 @@ static VkResult winehua_swapchain_create(struct vulkan_device *device,
         .arrayLayers = create_info->imageArrayLayers ? create_info->imageArrayLayers : 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = create_info->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        /* The private Host presenter normally only reads these images. Keep
+         * TRANSFER_DST available for the isolated VKD3D Maleoon compatibility
+         * profile, which copies the real D3D12 back buffer into the private
+         * swapchain image without changing the default DXVK path. */
+        .usage = create_info->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };

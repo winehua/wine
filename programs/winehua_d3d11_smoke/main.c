@@ -1,5 +1,5 @@
 /*
- * WineHua DXVK Legacy D3D11 smoke.
+ * WineHua DXVK D3D11 smoke.
  *
  * The test deliberately uses only the D3D11/DXGI public API.  It draws a
  * deterministic four-colour frame through a hardware D3D11 device and a
@@ -361,6 +361,13 @@ static BOOL dxvk_modules_loaded(struct smoke_state *state)
             module_is_managed_dxvk(state->dxgi_module));
 }
 
+static const char *active_d3d_backend(void)
+{
+    const char *backend = winehua_smoke_env("WINEHUA_D3D_BACKEND", "dxvk_legacy");
+
+    return !strcmp(backend, "dxvk_modern_2_6") ? backend : "dxvk_legacy";
+}
+
 static void write_state(struct smoke_state *state, const char *status,
                         const char *stage, const char *message)
 {
@@ -469,7 +476,7 @@ static void write_state(struct smoke_state *state, const char *status,
                      (const UINT *)state->bc_matrix_values,
                      WINEHUA_BC_MATRIX_FORMATS * 2);
     snprintf(metrics, sizeof(metrics),
-             "{\"d3dBackend\":\"dxvk_legacy\",\"dxvkVersion\":\"%s\","
+             "{\"d3dBackend\":\"%s\",\"dxvkVersion\":\"%s\","
              "\"d3d11Module\":\"%s\",\"dxgiModule\":\"%s\","
              "\"featureLevel\":\"%u.%u\",\"adapter\":\"DXVK Vulkan\","
              "\"vulkanDevice\":\"via winevulkan/Venus\",\"cpuReadBytes\":0,"
@@ -564,7 +571,7 @@ static void write_state(struct smoke_state *state, const char *status,
              "\"pass\":%s},"
              "\"decodedFormat\":\"R8G8B8A8_UNORM\",\"decodedBytes\":256,"
              "\"cpuDecodeUs\":0,\"durationMs\":%llu}",
-             version, d3d11_module, dxgi_module,
+             active_d3d_backend(), version, d3d11_module, dxgi_module,
              (unsigned int)((state->feature_level >> 12) & 0xf),
              (unsigned int)((state->feature_level >> 0) & 0xf),
              state->frame_count, state->frame_count, state->present_failure_frame,
@@ -5800,7 +5807,7 @@ int main(int argc, char **argv)
         write_state(&state, "UNSUPPORTED", "dxvk", "D3D11 smoke requires Win32 present");
         return 3;
     }
-    write_state(&state, "STARTED", "startup", "DXVK Legacy D3D11 smoke starting");
+    write_state(&state, "STARTED", "startup", "DXVK D3D11 smoke starting");
     if (!create_device(&state))
     {
         write_state(&state, "FAIL", "dxvk",
@@ -5855,8 +5862,8 @@ int main(int argc, char **argv)
         return 1;
     }
     write_state(&state, "PASS", "dxvk", long_run
-                ? "DXVK Legacy D3D11 long-run check passed"
-                : "DXVK Legacy D3D11 fixed-frame check passed");
+                ? "DXVK D3D11 long-run check passed"
+                : "DXVK D3D11 fixed-frame check passed");
     release_state(&state);
     return 0;
 }

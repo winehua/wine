@@ -212,7 +212,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hCursor = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = "DinputClickProbe";
     RegisterClassA(&wc);
@@ -235,9 +235,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     plog("==== probe start, pump=%d ====", g_pump);
     th = CreateThread(NULL, 0, PollThread, NULL, 0, NULL);
 
-    while (GetMessage(&msg, NULL, 0, 0) > 0) {
+    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        DispatchMessageA(&msg);
     }
     InterlockedExchange(&g_quit, 1);
     WaitForSingleObject(th, 2000);
