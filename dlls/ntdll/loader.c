@@ -3370,6 +3370,75 @@ static NTSTATUS search_winehua_dxvk_overlay( LPCWSTR libname, UNICODE_STRING *nt
     return status;
 }
 
+/* Search WineHua's cnc-ddraw overlay before the ordinary PE search path.
+ * OHOS builds DllPath from Unix WINEDLLPATH plus C:\windows\system32, and
+ * find_dll_file disables WoW64 redirection, so a 32-bit LoadLibrary("ddraw.dll")
+ * hits the 64-bit builtin, gets STATUS_NOT_SUPPORTED, and never reaches
+ * syswow64 or WINEDLLDIR.  Open the overlay through \\??\\unix like DXVK. */
+static NTSTATUS search_winehua_ddraw_overlay( LPCWSTR libname, UNICODE_STRING *nt_name,
+                                              WINE_MODREF **pwm, HANDLE *mapping,
+                                              SECTION_IMAGE_INFORMATION *image_info,
+                                              struct file_id *id )
+{
+    static const WCHAR backend_nameW[] = L"WINEHUA_DDRAW_BACKEND";
+    static const WCHAR root_nameW[] = L"WINEHUA_DDRAW_ROOT";
+    static const WCHAR ddrawW[] = L"ddraw.dll";
+    static const WCHAR prefixW[] = L"\\??\\unix";
+    static const WCHAR *const archW[] = {L"x86", L"x64"};
+    UNICODE_STRING backend, root;
+    NTSTATUS status = STATUS_DLL_NOT_FOUND;
+    unsigned int i;
+
+    if (wcscmp( libname, ddrawW )) return status;
+    if (get_env_var( backend_nameW, 0, &backend )) return status;
+    if (wcscmp( backend.Buffer, L"cnc" )) {
+        RtlFreeUnicodeString( &backend );
+        return status;
+    }
+    RtlFreeUnicodeString( &backend );
+    if (get_env_var( root_nameW, 0, &root )) return status;
+
+    for (i = 0; i < ARRAY_SIZE(archW); ++i)
+    {
+        SIZE_T length = ARRAY_SIZE(prefixW) - 1 + root.Length / sizeof(WCHAR) +
+                        1 + wcslen( archW[i] ) + 1 + wcslen( libname ) + 1;
+        WCHAR *path = RtlAllocateHeap( GetProcessHeap(), 0, length * sizeof(WCHAR) );
+        WCHAR *ptr;
+        if (!path) {
+            status = STATUS_NO_MEMORY;
+            break;
+        }
+        ptr = path;
+        wcscpy( ptr, prefixW );
+        ptr += wcslen( ptr );
+        memcpy( ptr, root.Buffer, root.Length );
+        ptr += root.Length / sizeof(WCHAR);
+        if (ptr == path || ptr[-1] != '\\') *ptr++ = '\\';
+        wcscpy( ptr, archW[i] );
+        ptr += wcslen( ptr );
+        *ptr++ = '\\';
+        wcscpy( ptr, libname );
+
+        nt_name->Buffer = NULL;
+        status = open_dll_file( (UNICODE_STRING *)&(UNICODE_STRING){
+                                    length * sizeof(WCHAR), length * sizeof(WCHAR), path },
+                                pwm, mapping, image_info, id );
+        if (status == STATUS_SUCCESS) {
+            nt_name->Buffer = path;
+            nt_name->Length = (USHORT)(wcslen( path ) * sizeof(WCHAR));
+            nt_name->MaximumLength = (USHORT)(length * sizeof(WCHAR));
+            break;
+        }
+        RtlFreeHeap( GetProcessHeap(), 0, path );
+        if (status != STATUS_DLL_NOT_FOUND && status != STATUS_NOT_SUPPORTED) break;
+    }
+    RtlFreeUnicodeString( &root );
+    /* A 64-bit process may reject the shipped x86 overlay; keep searching so
+     * Wine's builtin ddraw remains available when no x64 overlay exists. */
+    if (status == STATUS_NOT_SUPPORTED) status = STATUS_DLL_NOT_FOUND;
+    return status;
+}
+
 /***********************************************************************
  *	find_dll_file
  *
@@ -3423,6 +3492,10 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
     {
         status = search_winehua_dxvk_overlay( libname, nt_name, pwm, mapping,
                                               image_info, id );
+        if (status == STATUS_SUCCESS) goto done;
+        if (status != STATUS_DLL_NOT_FOUND && status != STATUS_NOT_SUPPORTED) goto done;
+        status = search_winehua_ddraw_overlay( libname, nt_name, pwm, mapping,
+                                               image_info, id );
         if (status == STATUS_SUCCESS) goto done;
         if (status != STATUS_DLL_NOT_FOUND && status != STATUS_NOT_SUPPORTED) goto done;
         status = search_dll_file( load_path, libname, nt_name, pwm, mapping, image_info, id );
