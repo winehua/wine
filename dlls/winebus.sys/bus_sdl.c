@@ -29,6 +29,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <dlfcn.h>
@@ -66,6 +67,7 @@ static void *sdl_handle = NULL;
 static UINT quit_event = -1;
 static struct list event_queue = LIST_INIT(event_queue);
 static struct list device_list = LIST_INIT(device_list);
+static BOOL winehua_controller_hub;
 
 #define MAKE_FUNCPTR(f) static typeof(f) * p##f = NULL
 MAKE_FUNCPTR(SDL_GetError);
@@ -943,6 +945,12 @@ static void sdl_add_device(unsigned int index)
     char buffer[ARRAY_SIZE(desc.product)];
     int axis_count, axis_offset;
 
+    if (winehua_controller_hub)
+    {
+        TRACE("WINEHUA_CONTROLLER_HUB=1: skipping SDL device index %u\n", index);
+        return;
+    }
+
     if ((joystick = pSDL_JoystickOpen(index)) == NULL)
     {
         WARN("Unable to open sdl device %i: %s\n", index, pSDL_GetError());
@@ -1079,6 +1087,21 @@ NTSTATUS sdl_bus_init(void *args)
     TRACE("args %p\n", args);
 
     options = (struct bus_options *)args;
+
+    {
+        const char *hub = getenv("WINEHUA_CONTROLLER_HUB");
+        const char *enable = getenv("WINEHUA_GAMEPAD_ENABLE");
+        const char *mode = getenv("WINEHUA_GAMEPAD_MODE");
+        winehua_controller_hub = TRUE;
+        if (mode && !strcmp(mode, "keyboard_legacy"))
+            winehua_controller_hub = FALSE;
+        else if (enable && !strcmp(enable, "0"))
+            winehua_controller_hub = FALSE;
+        else if (hub && !strcmp(hub, "0"))
+            winehua_controller_hub = FALSE;
+    }
+    if (winehua_controller_hub)
+        WARN("Controller Hub owns pads; SDL gamepad enumeration gated\n");
 
     if (!(sdl_handle = dlopen(SONAME_LIBSDL2, RTLD_NOW)))
     {
