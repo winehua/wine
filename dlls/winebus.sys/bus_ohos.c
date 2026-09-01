@@ -103,33 +103,28 @@ static void apply_neutral(struct unix_device *iface)
     bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
 }
 
-static void apply_state(struct unix_device *iface, const struct whgp_state_v1 *body)
+static void apply_state(struct unix_device *iface, const struct whgp_state_v2 *body)
 {
     struct hid_device_state *state = &iface->hid_device_state;
     ULONG i;
-    LONG ly, ry;
 
     for (i = 0; i < 11; ++i)
         hid_device_set_button(iface, i, (body->buttons & (1u << i)) != 0);
 
-    /* Invert Y to match XUSB / GIP (same as bus_sdl). Hub uses +Y=Up. */
-    ly = -(LONG)body->ly;
-    ry = -(LONG)body->ry;
-    if (ly > 32767) ly = 32767;
-    if (ly < -32768) ly = -32768;
-    if (ry > 32767) ry = 32767;
-    if (ry < -32768) ry = -32768;
-
+    /* WHGP v2 is Canonical Controller Space (+Y = Up), which matches XInput /
+     * GIP stick polarity. Pass analog axes through. bus_sdl inverts SDL raw
+     * thumbs (up is negative); that adapter rule does not apply to this
+     * WHGP canonical sink. */
     hid_device_set_abs_axis(iface, 0, body->lx);
-    hid_device_set_abs_axis(iface, 1, ly);
+    hid_device_set_abs_axis(iface, 1, whgp_stick_y_to_hid(body->ly));
     hid_device_set_abs_axis(iface, 2, body->rx);
-    hid_device_set_abs_axis(iface, 3, ry);
+    hid_device_set_abs_axis(iface, 3, whgp_stick_y_to_hid(body->ry));
     hid_device_set_abs_axis(iface, 4, body->lt);
     hid_device_set_abs_axis(iface, 5, body->rt);
 
-    /* HID hat +Y = Down; Hub +Y = Up. */
+    /* HID hatswitch helper is +Y = Down; WHGP hat_y is canonical +Y = Up. */
     hid_device_set_hatswitch_x(iface, 0, body->hat_x);
-    hid_device_set_hatswitch_y(iface, 0, -(LONG)body->hat_y);
+    hid_device_set_hatswitch_y(iface, 0, whgp_hat_y_to_hid(body->hat_y));
 
     bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
 }
@@ -431,7 +426,7 @@ static void drop_socket_if(int fd)
 static void process_one_message(struct unix_device *iface, int fd)
 {
     struct whgp_header hdr;
-    struct whgp_state_v1 body;
+    struct whgp_state_v2 body;
     BYTE discard[256];
     UINT left;
 
@@ -444,9 +439,16 @@ static void process_one_message(struct unix_device *iface, int fd)
         apply_neutral(iface);
         return;
     }
-    if (hdr.magic != WHGP_MAGIC || hdr.version != WHGP_VERSION)
+    if (hdr.magic != WHGP_MAGIC)
     {
-        WARN("WHGP bad header magic=%08x ver=%u\n", hdr.magic, hdr.version);
+        ERR("WHGP bad magic %08x\n", hdr.magic);
+        drop_socket_if(fd);
+        apply_neutral(iface);
+        return;
+    }
+    if (!whgp_version_matches(hdr.version))
+    {
+        ERR("WHGP protocol mismatch: peer=%u expected=2\n", hdr.version);
         drop_socket_if(fd);
         apply_neutral(iface);
         return;
