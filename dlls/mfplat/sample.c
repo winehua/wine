@@ -1384,6 +1384,26 @@ static HRESULT sample_allocator_allocate_sample(struct sample_allocator *allocat
                 hr = MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown *)texture, 0, FALSE, &buffer);
                 ID3D11Texture2D_Release(texture);
             }
+            else if ((desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
+                    && FAILED(hr))
+            {
+                /* WineHua: 默认不降级 — 共享纹理创建失败时让视频解码失败, Unity
+                 * (kqcs/LustFromTheDeep) 会跳过 OP 视频继续运行 (08-13 实测:
+                 * Loaded Objects 7004 + 渲染循环继续)。降级为非共享会让视频进入
+                 * 软件解码 (Box64 模拟 1080p 极慢) 卡死主循环。
+                 * 仅显式设 WINEHUA_MF_FALLBACK_NONSHARED=1 时才降级重试。 */
+                const char *winehua_mf_fb = getenv("WINEHUA_MF_FALLBACK_NONSHARED");
+                if (winehua_mf_fb && winehua_mf_fb[0] == '1')
+                {
+                    TRACE("Shared D3D11 texture creation failed (hr %#lx), retrying without shared flags.\n", hr);
+                    desc.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX);
+                    if (SUCCEEDED(hr = ID3D11Device_CreateTexture2D(service->d3d11_device, &desc, NULL, &texture)))
+                    {
+                        hr = MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown *)texture, 0, FALSE, &buffer);
+                        ID3D11Texture2D_Release(texture);
+                    }
+                }
+            }
         }
         else
         {
