@@ -254,8 +254,6 @@ static HRESULT DSOUND_PrimaryOpen(DirectSoundDevice *device, WAVEFORMATEX *wfx, 
     else
         device->normfunction = NULL;
 
-    DSOUND_D0_NotePrimary(device, forcewave, mixfloat);
-
     device->playpos = 0;
 
     for (i = 0; i < device->nrofbuffers; i++) {

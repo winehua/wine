@@ -94,42 +94,6 @@ struct DirectSoundDevice
     DSVOLUMEPAN                 volpan;
 
     normfunc normfunction;
-    BOOL                        d0_forcewave;
-    BOOL                        d0_mixfloat;
-    DWORD                       d0_state;
-    UINT                        d0_id;
-    float                      *d0_buf;
-    DWORD                       d0_cap_samples;
-    DWORD                       d0_written;
-    HANDLE                      d0_thread;
-    ULONGLONG                   d0_hz_tick;
-    DWORD                       d0_hz_calls;
-    DWORD                       d0_hz_frames;
-    DWORD                       d0_hz_audible_max;
-    double                      d0_hz_mix_us;
-    double                      d0_hz_mix_max_us;
-    float                       d0_hz_peak[2];
-    float                       d0_hz_maxdelta[2];
-    float                       d0_hz_prev[2];
-    BOOL                        d0_hz_have_prev[2];
-    double                      d0_hz_sumsq[2];
-    DWORD                       d0_hz_samples[2];
-    DWORD                       d0_hz_over1[2];
-    DWORD                       d0_hz_over125[2];
-    DWORD                       d0_hz_over15[2];
-    DWORD                       d0_hz_over2[2];
-    DWORD                       d0_hz_signflip[2];
-    float                       d0_cap_peak[2];
-    float                       d0_cap_maxdelta[2];
-    float                       d0_cap_prev[2];
-    BOOL                        d0_cap_have_prev[2];
-    double                      d0_cap_sumsq[2];
-    DWORD                       d0_cap_over1[2];
-    DWORD                       d0_cap_over125[2];
-    DWORD                       d0_cap_over15[2];
-    DWORD                       d0_cap_over2[2];
-    DWORD                       d0_cap_signflip[2];
-    DWORD                       d0_cap_audible_max;
 
     /* DirectSound3DListener fields */
     DS3DLISTENER                ds3dl;
@@ -268,9 +232,6 @@ void DSOUND_RecalcFormat(IDirectSoundBufferImpl *dsb);
 DWORD DSOUND_secpos_to_bufpos(const IDirectSoundBufferImpl *dsb, DWORD secpos, DWORD secmixpos, float *overshot);
 
 DWORD CALLBACK DSOUND_mixthread(void *ptr);
-void DSOUND_D0_NotePrimary(DirectSoundDevice *device, BOOL forcewave, BOOL mixfloat);
-void DSOUND_D0_AfterMix(DirectSoundDevice *device, float *mix, DWORD frames, double mix_us);
-void DSOUND_D0_Destroy(DirectSoundDevice *device);
 
 /* sound3d.c */
 

@@ -30,8 +30,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -67,31 +65,7 @@ static const WCHAR capture_device_name[] =
 static const char capture_device_id[] = "capture-default";
 #define MIX_FRAMES_ERROR (~0u)
 
-#define W01_IDLE 0
-#define W01_ARMED 1
-#define W01_CAPTURING 2
-#define W01_READY 3
-#define W01_WRITING 4
-#define W01_WRITTEN 5
-
 static ULONG_PTR zero_bits = 0;
-static UINT32 g_w01_next_id;
-
-struct audio_diag_capture
-{
-    BYTE *data;
-    size_t capacity;
-    size_t written;
-    UINT32 sample_rate;
-    UINT32 channels;
-    UINT32 bits_per_sample;
-    UINT32 block_align;
-    UINT32 format_tag;
-    UINT32 valid_bits;
-    UINT32 channel_mask;
-    UINT32 is_float;
-    UINT64 first_qpc_100ns;
-};
 
 struct ohos_stream
 {
@@ -131,12 +105,6 @@ struct ohos_stream
     BYTE *local_buffer;
     BYTE *capture_wrap_buffer;
     INT16 *mix_buffer;
-    struct audio_diag_capture w0;
-    struct audio_diag_capture w1;
-    UINT32 w01_state;
-    UINT32 w01_capture_id;
-    UINT32 w01_client_frames;
-    UINT32 w01_mix_frames;
     pthread_mutex_t lock;
 };
 
@@ -248,326 +216,6 @@ static BOOL is_supported_sample_rate(UINT32 rate)
      * common shared-mode client streams and resample them on either side
      * of the mix rate instead of rejecting them up front. */
     return rate >= 8000 && rate <= 192000;
-}
-
-static void w01_log(const char *fmt, ...)
-{
-    va_list ap;
-
-    fputs("[w01] ", stderr);
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    fflush(stderr);
-}
-
-static void w01_mkdir_p(const char *path);
-
-static int w01_enabled(void)
-{
-    static int cached = -1;
-    const char *e;
-
-    if (cached >= 0) return cached;
-    e = getenv("WINEHUA_AUDIO_W01");
-    /* Default on: game processes may not see Host-injected env. Set 0 to disable. */
-    cached = (e && e[0] == '0' && !e[1]) ? 0 : 1;
-    w01_log("enabled=%d env=%s\n", cached, e ? e : "(null)");
-    return cached;
-}
-
-static int w01_dir_writable(const char *path)
-{
-    char probe[768];
-    FILE *fp;
-
-    if (!path || !path[0]) return 0;
-    w01_mkdir_p(path);
-    snprintf(probe, sizeof(probe), "%s/w01_probe.txt", path);
-    fp = fopen(probe, "ab");
-    if (!fp)
-    {
-        w01_log("probe fopen errno=%d path=%s\n", errno, probe);
-        return 0;
-    }
-    fprintf(fp, "ok\n");
-    fclose(fp);
-    return 1;
-}
-
-static const char *w01_dump_dir(void)
-{
-    static char dir[512];
-    static char scratch[512];
-    static int ready;
-    const char *e;
-
-    if (ready) return dir;
-    e = getenv("WINEHUA_AUDIO_W01_DIR");
-    if (e && e[0] && w01_dir_writable(e))
-    {
-        snprintf(dir, sizeof(dir), "%s", e);
-        ready = 1;
-        w01_log("dump dir=%s (W01_DIR)\n", dir);
-        return dir;
-    }
-    e = getenv("HOME");
-    if (e && e[0])
-    {
-        snprintf(scratch, sizeof(scratch), "%s/logs", e);
-        if (w01_dir_writable(scratch))
-        {
-            snprintf(dir, sizeof(dir), "%s", scratch);
-            ready = 1;
-            w01_log("dump dir=%s (HOME/logs)\n", dir);
-            return dir;
-        }
-        if (w01_dir_writable(e))
-        {
-            snprintf(dir, sizeof(dir), "%s", e);
-            ready = 1;
-            w01_log("dump dir=%s (HOME)\n", dir);
-            return dir;
-        }
-    }
-    e = getenv("WINEPREFIX");
-    if (e && e[0])
-    {
-        snprintf(scratch, sizeof(scratch), "%s/w01", e);
-        if (w01_dir_writable(scratch))
-        {
-            snprintf(dir, sizeof(dir), "%s", scratch);
-            ready = 1;
-            w01_log("dump dir=%s (WINEPREFIX/w01)\n", dir);
-            return dir;
-        }
-    }
-    e = getenv("TMPDIR");
-    if (e && e[0])
-    {
-        snprintf(scratch, sizeof(scratch), "%s/winehua-w01", e);
-        if (w01_dir_writable(scratch))
-        {
-            snprintf(dir, sizeof(dir), "%s", scratch);
-            ready = 1;
-            w01_log("dump dir=%s (TMPDIR)\n", dir);
-            return dir;
-        }
-    }
-    snprintf(dir, sizeof(dir), "/data/storage/el2/base/files/.wine/w01");
-    w01_mkdir_p(dir);
-    ready = 1;
-    w01_log("dump dir=%s (fallback)\n", dir);
-    return dir;
-}
-
-static void w01_mkdir_p(const char *path)
-{
-    char tmp[512];
-    size_t i, n;
-
-    if (!path || !path[0]) return;
-    n = strlen(path);
-    if (n >= sizeof(tmp)) return;
-    memcpy(tmp, path, n + 1);
-    for (i = 1; i < n; ++i)
-    {
-        if (tmp[i] != '/') continue;
-        tmp[i] = 0;
-        mkdir(tmp, 0777);
-        tmp[i] = '/';
-    }
-    mkdir(tmp, 0777);
-}
-
-static void w01_append(struct audio_diag_capture *cap, const void *src, size_t bytes)
-{
-    size_t room, n;
-
-    if (!cap || !cap->data || !src || !bytes) return;
-    if (cap->written >= cap->capacity) return;
-    room = cap->capacity - cap->written;
-    n = bytes < room ? bytes : room;
-    memcpy(cap->data + cap->written, src, n);
-    cap->written += n;
-}
-
-static void w01_alloc(struct ohos_stream *stream)
-{
-    UINT32 rate, bpf, bytes_per_sec;
-    size_t w0, w1;
-
-    if (!w01_enabled() || !stream || is_capture_stream(stream) || !stream->fmt) return;
-
-    rate = stream->fmt->Format.nSamplesPerSec;
-    bpf = stream->client_bytes_per_frame;
-    bytes_per_sec = stream->fmt->Format.nAvgBytesPerSec;
-    if (!bytes_per_sec) bytes_per_sec = bpf * rate;
-    w0 = (size_t)bytes_per_sec * 2;
-    w1 = (size_t)48000 * 4 * 2;
-    if (w0 < 8192) w0 = 8192;
-    if (w0 > 2u * 1024u * 1024u) w0 = 2u * 1024u * 1024u;
-
-    stream->w0.data = calloc(1, w0);
-    stream->w0.capacity = stream->w0.data ? w0 : 0;
-    stream->w1.data = calloc(1, w1);
-    stream->w1.capacity = stream->w1.data ? w1 : 0;
-    if (!stream->w0.data || !stream->w1.data)
-    {
-        w01_log("alloc failed stream=%u\n", stream->broker_stream.stream_id);
-        free(stream->w0.data);
-        free(stream->w1.data);
-        memset(&stream->w0, 0, sizeof(stream->w0));
-        memset(&stream->w1, 0, sizeof(stream->w1));
-        return;
-    }
-
-    stream->w0.sample_rate = rate;
-    stream->w0.channels = stream->fmt->Format.nChannels;
-    stream->w0.bits_per_sample = stream->fmt->Format.wBitsPerSample;
-    stream->w0.block_align = stream->fmt->Format.nBlockAlign;
-    stream->w0.format_tag = stream->fmt->Format.wFormatTag;
-    stream->w0.valid_bits = get_valid_bits_per_sample(&stream->fmt->Format);
-    stream->w0.is_float = is_float_format(&stream->fmt->Format) ? 1 : 0;
-    if (stream->fmt->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE)
-        stream->w0.channel_mask = stream->fmt->dwChannelMask;
-    else
-        stream->w0.channel_mask = get_channel_mask(stream->fmt->Format.nChannels);
-
-    stream->w1.sample_rate = 48000;
-    stream->w1.channels = 2;
-    stream->w1.bits_per_sample = 16;
-    stream->w1.block_align = 4;
-    stream->w1.format_tag = WAVE_FORMAT_PCM;
-    stream->w1.valid_bits = 16;
-    stream->w1.channel_mask = KSAUDIO_SPEAKER_STEREO;
-    stream->w1.is_float = 0;
-    stream->w01_state = W01_IDLE;
-    w01_log("alloc stream=%u w0=%u w1=%u rate=%u ch=%u bits=%u float=%u tag=%u dir=%s\n",
-            stream->broker_stream.stream_id, (unsigned)w0, (unsigned)w1, rate,
-            stream->w0.channels, stream->w0.bits_per_sample, stream->w0.is_float,
-            stream->w0.format_tag, w01_dump_dir());
-}
-
-static void w01_flush_if_ready(struct ohos_stream *stream, int force_partial)
-{
-    const char *dir;
-    char resolved_dir[512];
-    char client_path[768];
-    char mix_path[768];
-    char json_path[768];
-    FILE *fp;
-    UINT32 stream_id, capture_id, state;
-    size_t w0_bytes, w1_bytes;
-    UINT32 client_frames, mix_frames;
-    UINT32 sample_rate, channels, bits, block_align, format_tag, valid_bits, channel_mask, is_float;
-    UINT64 first_qpc;
-    const char *git;
-    const char *box64_dynarec;
-
-    if (!stream || !stream->w0.data) return;
-
-    ohos_lock(stream);
-    state = stream->w01_state;
-    if (force_partial && state == W01_CAPTURING && (stream->w0.written || stream->w1.written))
-        stream->w01_state = W01_READY;
-    if (stream->w01_state != W01_READY)
-    {
-        ohos_unlock(stream);
-        return;
-    }
-    stream->w01_state = W01_WRITING;
-    stream_id = stream->broker_stream.stream_id;
-    capture_id = stream->w01_capture_id;
-    w0_bytes = stream->w0.written;
-    w1_bytes = stream->w1.written;
-    client_frames = stream->w01_client_frames;
-    mix_frames = stream->w01_mix_frames;
-    sample_rate = stream->w0.sample_rate;
-    channels = stream->w0.channels;
-    bits = stream->w0.bits_per_sample;
-    block_align = stream->w0.block_align;
-    format_tag = stream->w0.format_tag;
-    valid_bits = stream->w0.valid_bits;
-    channel_mask = stream->w0.channel_mask;
-    is_float = stream->w0.is_float;
-    first_qpc = stream->w0.first_qpc_100ns;
-    ohos_unlock(stream);
-
-    dir = w01_dump_dir();
-    snprintf(resolved_dir, sizeof(resolved_dir), "%s", dir);
-    w01_mkdir_p(resolved_dir);
-    snprintf(client_path, sizeof(client_path), "%s/m5_stream_%u_c%u_client.raw",
-             resolved_dir, stream_id, capture_id);
-    snprintf(mix_path, sizeof(mix_path), "%s/m5_stream_%u_c%u_mix.s16le",
-             resolved_dir, stream_id, capture_id);
-    snprintf(json_path, sizeof(json_path), "%s/m5_stream_%u_c%u.json",
-             resolved_dir, stream_id, capture_id);
-    w01_log("flush stream=%u capture=%u w0=%u w1=%u dir=%s\n",
-            stream_id, capture_id, (unsigned)w0_bytes, (unsigned)w1_bytes, resolved_dir);
-
-    fp = fopen(client_path, "wb");
-    if (fp)
-    {
-        if (w0_bytes) fwrite(stream->w0.data, 1, w0_bytes, fp);
-        fclose(fp);
-    }
-    else w01_log("fopen client errno=%d path=%s\n", errno, client_path);
-
-    fp = fopen(mix_path, "wb");
-    if (fp)
-    {
-        if (w1_bytes) fwrite(stream->w1.data, 1, w1_bytes, fp);
-        fclose(fp);
-    }
-    else w01_log("fopen mix errno=%d path=%s\n", errno, mix_path);
-
-    git = getenv("WINEHUA_AUDIO_GIT_COMMIT");
-    if (!git) git = "unknown";
-    box64_dynarec = getenv("BOX64_DYNAREC");
-    if (!box64_dynarec) box64_dynarec = "unset";
-
-    fp = fopen(json_path, "wb");
-    if (fp)
-    {
-        fprintf(fp,
-                "{\n"
-                "  \"streamId\": %u,\n"
-                "  \"captureId\": %u,\n"
-                "  \"sampleRate\": %u,\n"
-                "  \"channels\": %u,\n"
-                "  \"bitsPerSample\": %u,\n"
-                "  \"blockAlign\": %u,\n"
-                "  \"formatTag\": %u,\n"
-                "  \"validBitsPerSample\": %u,\n"
-                "  \"channelMask\": %u,\n"
-                "  \"isFloat\": %u,\n"
-                "  \"clientBytes\": %u,\n"
-                "  \"clientFrames\": %u,\n"
-                "  \"mixSampleRate\": 48000,\n"
-                "  \"mixChannels\": 2,\n"
-                "  \"mixFrames\": %u,\n"
-                "  \"mixBytes\": %u,\n"
-                "  \"firstQpc100ns\": %llu,\n"
-                "  \"gitCommit\": \"%s\",\n"
-                "  \"box64Dynarec\": \"%s\",\n"
-                "  \"clientPath\": \"%s\",\n"
-                "  \"mixPath\": \"%s\"\n"
-                "}\n",
-                stream_id, capture_id, sample_rate, channels, bits, block_align,
-                format_tag, valid_bits, channel_mask, is_float,
-                (unsigned)w0_bytes, client_frames, mix_frames, (unsigned)w1_bytes,
-                (unsigned long long)first_qpc, git, box64_dynarec,
-                client_path, mix_path);
-        fclose(fp);
-        w01_log("wrote stream=%u capture=%u clientBytes=%u mixBytes=%u json=%s\n",
-                stream_id, capture_id, (unsigned)w0_bytes, (unsigned)w1_bytes, json_path);
-    }
-    else w01_log("fopen json errno=%d path=%s\n", errno, json_path);
-
-    ohos_lock(stream);
-    stream->w01_state = W01_WRITTEN;
-    ohos_unlock(stream);
 }
 
 static HRESULT validate_format(const WAVEFORMATEX *fmt)
@@ -917,8 +565,6 @@ static void notify_thread_main(void *arg)
         signal_period_event_locked(stream);
         ohos_unlock(stream);
 
-        w01_flush_if_ready(stream, 0);
-
         delay.QuadPart = period_100ns;
         NtDelayExecution(FALSE, &delay);
     }
@@ -1039,13 +685,6 @@ static void store_prev_frame(struct ohos_stream *stream, const BYTE *buffer, UIN
     stream->have_prev_frame = TRUE;
 }
 
-static BOOL src_index_available(const struct ohos_stream *stream, UINT64 src_base, UINT64 last_idx, UINT64 idx)
-{
-    if (idx < src_base)
-        return stream->have_prev_frame;
-    return idx <= last_idx;
-}
-
 static void load_source_frame(const struct ohos_stream *stream, const BYTE *buffer, UINT32 frames,
                               UINT64 src_base, INT64 abs_index, float out[2])
 {
@@ -1106,51 +745,33 @@ static UINT32 convert_client_frames_to_mix_locked(struct ohos_stream *stream, co
     {
         UINT64 src_base = stream->client_input_frames;
         UINT64 src_total = src_base + in_frames;
-        UINT64 last_idx = src_total - 1;
-        UINT32 produced = 0;
+        UINT64 target_mix_total = (src_total * 48000ULL) / stream->fmt->Format.nSamplesPerSec;
+        UINT64 needed = target_mix_total - stream->mix_output_frames;
 
-        /* Do not clamp i0+1 to this ReleaseBuffer's last sample. Mix frames
-         * that still need the next input sample wait for the next write so
-         * prev_frame can interpolate across the block boundary. */
-        while (produced < dst_capacity_frames)
+        if (needed > dst_capacity_frames) return MIX_FRAMES_ERROR;
+
+        for (i = 0; i < needed; ++i)
         {
-            UINT64 out_abs = stream->mix_output_frames + produced;
+            UINT64 out_abs = stream->mix_output_frames + i;
             UINT64 scaled = out_abs * (UINT64)stream->fmt->Format.nSamplesPerSec;
             UINT64 i0 = scaled / 48000ULL;
-            UINT64 i1 = i0 + 1;
-            float frac = (scaled % 48000ULL) / 48000.0f;
+            UINT64 rem = scaled % 48000ULL;
+            float frac = rem / 48000.0f;
             float a[2], b[2], left, right;
 
-            if (!src_index_available(stream, src_base, last_idx, i0) ||
-                !src_index_available(stream, src_base, last_idx, i1))
-                break;
-
             load_source_frame(stream, src, in_frames, src_base, (INT64)i0, a);
-            load_source_frame(stream, src, in_frames, src_base, (INT64)i1, b);
+            load_source_frame(stream, src, in_frames, src_base, (INT64)i0 + 1, b);
             left = a[0] + (b[0] - a[0]) * frac;
             right = a[1] + (b[1] - a[1]) * frac;
             apply_client_volume(stream, &left, &right);
-            dst[produced * 2] = clamp_s16_float(left * 32767.0f);
-            dst[produced * 2 + 1] = clamp_s16_float(right * 32767.0f);
-            produced++;
-        }
-
-        if (produced == dst_capacity_frames)
-        {
-            UINT64 out_abs = stream->mix_output_frames + produced;
-            UINT64 scaled = out_abs * (UINT64)stream->fmt->Format.nSamplesPerSec;
-            UINT64 i0 = scaled / 48000ULL;
-            UINT64 i1 = i0 + 1;
-
-            if (src_index_available(stream, src_base, last_idx, i0) &&
-                src_index_available(stream, src_base, last_idx, i1))
-                return MIX_FRAMES_ERROR;
+            dst[i * 2] = clamp_s16_float(left * 32767.0f);
+            dst[i * 2 + 1] = clamp_s16_float(right * 32767.0f);
         }
 
         store_prev_frame(stream, src, in_frames);
         stream->client_input_frames = src_total;
-        stream->mix_output_frames += produced;
-        return produced;
+        stream->mix_output_frames = target_mix_total;
+        return (UINT32)needed;
     }
 }
 
@@ -1306,8 +927,6 @@ static void destroy_stream(struct ohos_stream *stream)
         stream->notify_thread = NULL;
     }
 
-    w01_flush_if_ready(stream, 1);
-
     if (stream->client)
     {
         ohos_audio_client_close_stream(stream->client, &stream->broker_stream);
@@ -1318,8 +937,6 @@ static void destroy_stream(struct ohos_stream *stream)
     free_client_buffer(&stream->local_buffer);
     free_client_buffer(&stream->capture_wrap_buffer);
     free(stream->mix_buffer);
-    free(stream->w0.data);
-    free(stream->w1.data);
     free(stream->fmt);
     pthread_mutex_destroy(&stream->lock);
     free(stream);
@@ -1463,8 +1080,6 @@ static NTSTATUS ohos_create_stream(void *args)
         goto fail;
     }
 
-    w01_alloc(stream);
-
     {
         static const WCHAR name[] =
         {
@@ -1521,11 +1136,6 @@ static NTSTATUS ohos_start(void *args)
     }
 
     stream->started = TRUE;
-    if (stream->w0.data && stream->w01_state == W01_IDLE)
-    {
-        stream->w01_state = W01_ARMED;
-        w01_log("arm stream=%u on start\n", stream->broker_stream.stream_id);
-    }
     signal_period_event_locked(stream);
     return ohos_unlock_result(stream, &params->result, S_OK);
 }
@@ -1549,10 +1159,7 @@ static NTSTATUS ohos_stop(void *args)
     }
 
     stream->started = FALSE;
-    ohos_unlock(stream);
-    w01_flush_if_ready(stream, 1);
-    params->result = S_OK;
-    return STATUS_SUCCESS;
+    return ohos_unlock_result(stream, &params->result, S_OK);
 }
 
 static NTSTATUS ohos_reset(void *args)
@@ -1613,10 +1220,6 @@ static NTSTATUS ohos_release_render_buffer(void *args)
     struct ohos_stream *stream = handle_get_stream(params->stream);
     UINT32 mix_frames;
     size_t written;
-    UINT64 saved_input;
-    UINT64 saved_mix;
-    float saved_prev[2];
-    BOOL saved_have_prev;
 
     ohos_lock(stream);
 
@@ -1634,61 +1237,17 @@ static NTSTATUS ohos_release_render_buffer(void *args)
     if (params->flags & AUDCLNT_BUFFERFLAGS_SILENT)
         memset(stream->local_buffer, 0, params->written_frames * stream->client_bytes_per_frame);
 
-    if (stream->w0.data && stream->w01_state == W01_IDLE)
-    {
-        stream->w01_state = W01_ARMED;
-        w01_log("arm stream=%u on release\n", stream->broker_stream.stream_id);
-    }
-    if (stream->w01_state == W01_ARMED)
-    {
-        stream->w01_state = W01_CAPTURING;
-        stream->w01_capture_id = __sync_add_and_fetch(&g_w01_next_id, 1);
-        stream->w0.first_qpc_100ns = query_qpc_100ns();
-        stream->w1.first_qpc_100ns = stream->w0.first_qpc_100ns;
-        stream->w01_client_frames = 0;
-        stream->w01_mix_frames = 0;
-        stream->w0.written = 0;
-        stream->w1.written = 0;
-        w01_log("capture start stream=%u capture=%u\n",
-                stream->broker_stream.stream_id, stream->w01_capture_id);
-    }
-    if (stream->w01_state == W01_CAPTURING)
-    {
-        w01_append(&stream->w0, stream->local_buffer,
-                   (size_t)params->written_frames * stream->client_bytes_per_frame);
-        stream->w01_client_frames += params->written_frames;
-    }
-
-    saved_input = stream->client_input_frames;
-    saved_mix = stream->mix_output_frames;
-    saved_prev[0] = stream->prev_frame[0];
-    saved_prev[1] = stream->prev_frame[1];
-    saved_have_prev = stream->have_prev_frame;
-
     mix_frames = convert_client_frames_to_mix_locked(stream, stream->local_buffer, params->written_frames,
                                                      stream->mix_buffer, stream->mix_buffer_capacity_frames);
-    if (stream->w01_state == W01_CAPTURING && mix_frames && mix_frames != MIX_FRAMES_ERROR)
-    {
-        w01_append(&stream->w1, stream->mix_buffer, (size_t)mix_frames * 4);
-        stream->w01_mix_frames += mix_frames;
-    }
-    if (stream->w01_state == W01_CAPTURING &&
-        (stream->w0.written >= stream->w0.capacity || stream->w1.written >= stream->w1.capacity))
-        stream->w01_state = W01_READY;
     if (mix_frames == MIX_FRAMES_ERROR)
     {
         stream->locked_frames = 0;
         return ohos_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_ERROR);
     }
 
-    written = mix_frames ? ohos_audio_client_write_frames(&stream->broker_stream, stream->mix_buffer, mix_frames) : 0;
+    written = ohos_audio_client_write_frames(&stream->broker_stream, stream->mix_buffer, mix_frames);
     if (written != mix_frames)
     {
-        stream->client_input_frames = saved_input;
-        stream->mix_output_frames = saved_mix;
-        stream->prev_frame[0] = saved_prev[0];
-        stream->prev_frame[1] = saved_prev[1];
-        stream->have_prev_frame = saved_have_prev;
         stream->locked_frames = 0;
         return ohos_unlock_result(stream, &params->result, AUDCLNT_E_BUFFER_TOO_LARGE);
     }
@@ -1803,17 +1362,20 @@ static NTSTATUS ohos_get_mix_format(void *args)
         return STATUS_SUCCESS;
     }
 
+    /* Windows shared-mode mix format is 48 kHz stereo IEEE float. Advertising
+     * S16 made BASS 2.4 WASAPI write float into 4-byte frames that we decoded
+     * as PCM, which produced M5 combat pops. */
     memset(fmt, 0, sizeof(*fmt));
     fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
     fmt->Format.nChannels = 2;
     fmt->Format.nSamplesPerSec = 48000;
-    fmt->Format.wBitsPerSample = 16;
-    fmt->Format.nBlockAlign = 4;
-    fmt->Format.nAvgBytesPerSec = 192000;
+    fmt->Format.wBitsPerSample = 32;
+    fmt->Format.nBlockAlign = 8;
+    fmt->Format.nAvgBytesPerSec = 384000;
     fmt->Format.cbSize = sizeof(*fmt) - sizeof(fmt->Format);
-    fmt->Samples.wValidBitsPerSample = 16;
+    fmt->Samples.wValidBitsPerSample = 32;
     fmt->dwChannelMask = KSAUDIO_SPEAKER_STEREO;
-    fmt->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+    fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
