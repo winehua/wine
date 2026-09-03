@@ -374,16 +374,17 @@ NTSTATUS ohos_bus_init(void *args)
     mode = getenv("WINEHUA_GAMEPAD_MODE");
     path = resolve_socket_path();
 
-    /* Only the explicit keyboard fallback opts out. Missing ENABLE used to
-     * kill this bus during wineboot (winedevice starts before explorer env). */
+    /* Opt-in 门禁: 仅 WineHua 宿主显式注入 ENABLE=1 才创建虚拟 pad; 缺省
+     * inactive — 无 env 的启动路径 (宿主测试/直跑 wine/WSL) 不再凭空多一个
+     * WHGP 手柄。keyboard_legacy 兜底优先; 两种 mode 由 wine_launch 注入保证。 */
     if (mode && !strcmp(mode, "keyboard_legacy"))
     {
         TRACE("keyboard_legacy mode; OHOS bus inactive\n");
         return STATUS_NOT_IMPLEMENTED;
     }
-    if (enable && !strcmp(enable, "0"))
+    if (!enable || strcmp(enable, "1"))
     {
-        TRACE("WINEHUA_GAMEPAD_ENABLE=0; OHOS bus inactive\n");
+        TRACE("WINEHUA_GAMEPAD_ENABLE unset or != 1; OHOS bus inactive\n");
         return STATUS_NOT_IMPLEMENTED;
     }
 

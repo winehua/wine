@@ -1089,16 +1089,18 @@ NTSTATUS sdl_bus_init(void *args)
     options = (struct bus_options *)args;
 
     {
+        /* 门禁 opt-in: 仅显式 HUB=1 / ENABLE=1 时 SDL 把手柄枚举让给 WHGP bus。
+         * 缺省 FALSE — 未注入 env 的启动 (宿主测试/直跑 wine/WSL) 不再吞物理手柄。 */
         const char *hub = getenv("WINEHUA_CONTROLLER_HUB");
         const char *enable = getenv("WINEHUA_GAMEPAD_ENABLE");
         const char *mode = getenv("WINEHUA_GAMEPAD_MODE");
-        winehua_controller_hub = TRUE;
+        winehua_controller_hub = FALSE;
         if (mode && !strcmp(mode, "keyboard_legacy"))
             winehua_controller_hub = FALSE;
-        else if (enable && !strcmp(enable, "0"))
-            winehua_controller_hub = FALSE;
-        else if (hub && !strcmp(hub, "0"))
-            winehua_controller_hub = FALSE;
+        else if (hub && !strcmp(hub, "1"))
+            winehua_controller_hub = TRUE;
+        else if (enable && !strcmp(enable, "1"))
+            winehua_controller_hub = TRUE;
     }
     if (winehua_controller_hub)
         WARN("Controller Hub owns pads; SDL gamepad enumeration gated\n");
