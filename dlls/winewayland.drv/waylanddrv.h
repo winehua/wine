@@ -39,6 +39,9 @@
 #include "wlr-data-control-unstable-v1-client-protocol.h"
 #include "xdg-toplevel-icon-v1-client-protocol.h"
 #include "pointer-warp-v1-client-protocol.h"
+#ifdef __OHOS__
+#include "winehua-toplevel-client-protocol.h"
+#endif
 
 #include "windef.h"
 #include "winbase.h"
@@ -180,6 +183,9 @@ struct wayland
     struct xdg_toplevel_icon_manager_v1 *xdg_toplevel_icon_manager_v1;
     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
+#ifdef __OHOS__
+    struct winehua_toplevel *winehua_toplevel;
+#endif
     struct wayland_seat seat;
     struct wayland_keyboard keyboard;
     struct wayland_pointer pointer;
@@ -296,6 +302,11 @@ struct wayland_surface
     /* xdg_toplevel min/max size 约束 (surface-local 坐标, 0 = 无限制) */
     int32_t min_width, min_height;
     int32_t max_width, max_height;
+
+#ifdef __OHOS__
+    /* 最近上报的模态 owner (NULL = 非模态/未上报); 变化才重发 set_modal */
+    HWND winehua_modal_owner;
+#endif
 };
 
 /**********************************************************************
@@ -342,6 +353,12 @@ void wayland_surface_ensure_contents(struct wayland_surface *surface,
 void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
 void wayland_surface_assign_icon(struct wayland_surface *surface);
 void wayland_surface_set_icon_buffer(struct wayland_surface *surface, UINT type, const ICONINFO *ii);
+
+#ifdef __OHOS__
+/* WineHua: 上报 toplevel 的模态关系 (winehua_toplevel.set_modal), 见 modal.c */
+void winehua_modal_update(struct wayland_surface *surface);
+void winehua_modal_release(struct wayland_surface *surface);
+#endif
 
 static inline BOOL wayland_surface_is_toplevel(struct wayland_surface *surface)
 {

@@ -493,6 +493,14 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         wayland_win_data_update_wayland_state(data);
     }
 
+#ifdef __OHOS__
+    /* WineHua: 探测/上报模态关系 (窗口本身上报自身: 模态对话框显示时 owner
+     * 已被 dialog.c 禁用, 此处判定成立; 隐藏/销毁时 surface 走 NULL 分支,
+     * 由 wayland_surface_destroy 内的 winehua_modal_release 清态) */
+    if (data->wayland_surface)
+        winehua_modal_update(data->wayland_surface);
+#endif
+
     wayland_win_data_release(data);
 }
 

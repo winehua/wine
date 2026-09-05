@@ -24,9 +24,11 @@ SOURCES = \
 	wayland_keyboard.c \
 	wayland_output.c \
 	wayland_pointer.c \
+	modal.c \
 	wayland_surface.c \
 	wayland_surface_ohos.c \
 	wayland_text_input.c \
+	winehua-toplevel.xml \
 	waylanddrv_main.c \
 	window.c \
 	window_surface.c \
