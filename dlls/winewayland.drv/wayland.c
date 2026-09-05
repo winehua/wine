@@ -205,6 +205,13 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         process_wayland.wp_pointer_warp_v1 =
             wl_registry_bind(registry, id, &wp_pointer_warp_v1_interface, 1);
     }
+#ifdef __OHOS__
+    else if (strcmp(interface, "winehua_toplevel") == 0)
+    {
+        process_wayland.winehua_toplevel =
+            wl_registry_bind(registry, id, &winehua_toplevel_interface, 1);
+    }
+#endif
 }
 
 static void registry_handle_global_remove(void *data, struct wl_registry *registry,
