@@ -8,6 +8,7 @@ VER_PRODUCTVERSION = 5,2,3790,4318
 
 SOURCES = \
 	libresolv.c \
+	libresolv_musl.c \
 	main.c \
 	name.c \
 	query.c \
