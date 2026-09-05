@@ -8,6 +8,13 @@
 */
 #include <stdint.h>
 
+/* ARM64EC: clang 为 ABI 兼容 x64 同时定义 __arm64ec__/__x86_64__/_MSC_VER/_M_X64,
+ * 但无 x86 SSE 指令集。minimp3 的 MSVC-x64 SIMD 检测会误命中并 include
+ * immintrin.h → 在 arm64ec 下编译错误。禁用 SIMD 走通用 C 路径。 */
+#if defined(__arm64ec__)
+#define MINIMP3_NO_SIMD
+#endif
+
 #define MINIMP3_MAX_SAMPLES_PER_FRAME (1152*2)
 
 typedef struct
@@ -191,7 +198,7 @@ static int have_simd()
 #define HAVE_SIMD 0
 #endif /* !defined(MINIMP3_NO_SIMD) */
 
-#if defined(__ARM_ARCH) && (__ARM_ARCH >= 6) && !defined(__aarch64__) && !defined(_M_ARM64)
+#if defined(__ARM_ARCH) && (__ARM_ARCH >= 6) && !defined(__aarch64__) && !defined(_M_ARM64) && !defined(__arm64ec__)
 #define HAVE_ARMV6 1
 static __inline__ __attribute__((always_inline)) int32_t minimp3_clip_int16_arm(int32_t a)
 {

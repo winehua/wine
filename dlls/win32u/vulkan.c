@@ -25,10 +25,20 @@
 #include "config.h"
 
 #include <dlfcn.h>
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#ifndef MREMAP_DONTUNMAP
+#define MREMAP_DONTUNMAP 4
+#endif
 
 #include "ntstatus.h"
 #include "win32u_private.h"
@@ -165,6 +175,10 @@ struct device_memory
     struct vulkan_device_memory obj;
     VkDeviceSize size;
     void *vm_map;
+    void *host_map;          /* 64-bit vkMapMemory pointer when WOW64 remapped */
+    BOOL wow64_alias;        /* vm_map shares pages with the Host Vulkan map */
+    BOOL wow64_copy;         /* vm_map is a CPU copy of host_map */
+    struct list wow64_entry;
 
     D3DKMT_HANDLE local;
     D3DKMT_HANDLE global;
@@ -231,6 +245,12 @@ typedef int (*winehua_present_fn)(VkQueue, VkImage, uint32_t, uint32_t, VkFormat
 
 static winehua_present_fn winehua_present;
 static pthread_once_t winehua_present_once = PTHREAD_ONCE_INIT;
+static struct list wow64_copy_maps = LIST_INIT( wow64_copy_maps );
+static pthread_mutex_t wow64_copy_mutex = PTHREAD_MUTEX_INITIALIZER;
+#ifdef _WIN64
+static void winehua_wow64_release_map( struct vulkan_device *device, struct device_memory *memory );
+static void winehua_wow64_flush_copies(void);
+#endif
 
 static void winehua_present_init(void)
 {
@@ -1163,6 +1183,11 @@ static void win32u_vkFreeMemory( VkDevice client_device, VkDeviceMemory client_m
     if (!client_memory) return;
     memory = device_memory_from_handle( client_memory );
 
+#ifdef _WIN64
+    if (memory->wow64_alias || memory->wow64_copy)
+        winehua_wow64_release_map( device, memory );
+    else
+#endif
     if (memory->vm_map && !physical_device->external_memory_align)
     {
         const VkMemoryUnmapInfoKHR info =
@@ -1239,6 +1264,305 @@ static VkResult win32u_vkGetMemoryWin32HandlePropertiesKHR( VkDevice client_devi
     return VK_SUCCESS;
 }
 
+#ifdef _WIN64
+static ULONG_PTR winehua_wow64_zero_bits(void)
+{
+    if (zero_bits) return zero_bits;
+    if (NtCurrentTeb()->WowTebOffset)
+    {
+        SYSTEM_BASIC_INFORMATION info;
+        if (!NtQuerySystemInformation( SystemEmulationBasicInformation, &info, sizeof(info), NULL ))
+            return (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
+        return 0x7fffffff;
+    }
+    return 0;
+}
+
+static void winehua_wow64_copy_register( struct device_memory *memory )
+{
+    list_init( &memory->wow64_entry );
+    pthread_mutex_lock( &wow64_copy_mutex );
+    list_add_tail( &wow64_copy_maps, &memory->wow64_entry );
+    pthread_mutex_unlock( &wow64_copy_mutex );
+}
+
+static void winehua_wow64_copy_unregister( struct device_memory *memory )
+{
+    if (!memory->wow64_copy) return;
+    pthread_mutex_lock( &wow64_copy_mutex );
+    list_remove( &memory->wow64_entry );
+    list_init( &memory->wow64_entry );
+    memory->wow64_copy = FALSE;
+    pthread_mutex_unlock( &wow64_copy_mutex );
+}
+
+static void winehua_wow64_flush_copies(void)
+{
+    struct device_memory *memory;
+
+    pthread_mutex_lock( &wow64_copy_mutex );
+    LIST_FOR_EACH_ENTRY( memory, &wow64_copy_maps, struct device_memory, wow64_entry )
+    {
+        if (memory->host_map && memory->vm_map && memory->size)
+            memcpy( memory->host_map, memory->vm_map, (size_t)memory->size );
+    }
+    pthread_mutex_unlock( &wow64_copy_mutex );
+}
+
+static BOOL winehua_find_vma( const void *ptr, uintptr_t *start, uintptr_t *end,
+                              unsigned long *offset, unsigned long *inode )
+{
+    FILE *fp;
+    char line[512];
+    uintptr_t addr = (uintptr_t)ptr;
+
+    if (!(fp = fopen( "/proc/self/maps", "r" ))) return FALSE;
+    while (fgets( line, sizeof(line), fp ))
+    {
+        uintptr_t s, e;
+        unsigned long off, ino;
+        unsigned int maj, min;
+        char perms[8];
+
+        if (sscanf( line, "%" SCNxPTR "-%" SCNxPTR " %7s %lx %x:%x %lu",
+                    &s, &e, perms, &off, &maj, &min, &ino ) < 7)
+            continue;
+        if (addr >= s && addr < e)
+        {
+            *start = s;
+            *end = e;
+            *offset = off;
+            *inode = ino;
+            fclose( fp );
+            return TRUE;
+        }
+    }
+    fclose( fp );
+    return FALSE;
+}
+
+static int winehua_open_inode_fd( unsigned long inode )
+{
+    DIR *dir;
+    struct dirent *de;
+
+    if (!(dir = opendir( "/proc/self/fd" ))) return -1;
+    while ((de = readdir( dir )))
+    {
+        struct stat st;
+        int fd, dupfd;
+
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        fd = atoi( de->d_name );
+        if (fd < 0 || fstat( fd, &st )) continue;
+        if (!S_ISREG( st.st_mode ) && !S_ISCHR( st.st_mode )) continue;
+        if ((unsigned long)st.st_ino != inode) continue;
+        dupfd = dup( fd );
+        closedir( dir );
+        return dupfd;
+    }
+    closedir( dir );
+    return -1;
+}
+
+static int winehua_open_vma_fd( uintptr_t start, uintptr_t end, unsigned long inode )
+{
+    char path[128];
+    int fd;
+
+    snprintf( path, sizeof(path), "/proc/self/map_files/%" PRIxPTR "-%" PRIxPTR, start, end );
+    if ((fd = open( path, O_RDWR )) >= 0) return fd;
+    return winehua_open_inode_fd( inode );
+}
+
+static BOOL winehua_wow64_ptr_mapped( const void *ptr )
+{
+    uintptr_t start, end;
+    unsigned long offset, inode;
+    return winehua_find_vma( ptr, &start, &end, &offset, &inode );
+}
+
+/* Harmony mremap(DONTUNMAP) may return success without sharing pages, or
+ * ignore DONTUNMAP and MOVE the VMA (leaving Venus holding a dangling
+ * 64-bit pointer).  Probe before trusting an "alias". */
+static BOOL winehua_wow64_alias_coherent( void *host, void *placed )
+{
+    volatile unsigned char *h = host;
+    volatile unsigned char *p = placed;
+    unsigned char orig, expect;
+
+    if (!winehua_wow64_ptr_mapped( host ) || !winehua_wow64_ptr_mapped( placed ))
+        return FALSE;
+
+    orig = *h;
+    expect = (unsigned char)(orig ^ 0xa5);
+    *p = expect;
+    __sync_synchronize();
+    if (*h != expect)
+    {
+        *p = orig;
+        return FALSE;
+    }
+    *h = orig;
+    __sync_synchronize();
+    if (*p != orig)
+    {
+        *p = orig;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void winehua_wow64_accept_map( struct device_memory *memory, void *placed, void *host,
+                                      BOOL alias, void **data, const char *how )
+{
+    memory->vm_map = placed;
+    memory->host_map = host;
+    memory->wow64_alias = alias;
+    memory->wow64_copy = !alias;
+    if (!alias) winehua_wow64_copy_register( memory );
+    *data = placed;
+    if (alias)
+        ERR( "WineHua: WOW64 aliased vkMapMemory %p -> %p via %s\n", host, placed, how );
+    else
+        ERR( "WineHua: WOW64 copying vkMapMemory %p -> %p (%s)\n", host, placed, how );
+}
+
+static BOOL winehua_wow64_alloc_placed( ULONG_PTR bits, SIZE_T *alloc_size, void **placed )
+{
+    *placed = NULL;
+    if (NtAllocateVirtualMemory( GetCurrentProcess(), placed, bits, alloc_size,
+                                 MEM_COMMIT, PAGE_READWRITE ))
+        return FALSE;
+    return TRUE;
+}
+
+static VkResult winehua_wow64_remap_map( struct device_memory *memory, void **data )
+{
+    ULONG_PTR bits = winehua_wow64_zero_bits();
+    SIZE_T alloc_size;
+    SIZE_T want_size;
+    void *placed = NULL;
+    void *host = *data;
+    uintptr_t start = 0, end = 0;
+    unsigned long offset = 0, inode = 0;
+    BOOL have_vma;
+    int fd;
+
+    if (!NtCurrentTeb()->WowTebOffset || !((UINT_PTR)host >> 32))
+        return VK_SUCCESS;
+    if (!bits)
+    {
+        ERR( "WineHua: WOW64 vkMapMemory %p does not fit 32-bit and zero_bits is unset\n", host );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+
+    want_size = (SIZE_T)memory->size;
+    alloc_size = want_size;
+    if (!winehua_wow64_alloc_placed( bits, &alloc_size, &placed ))
+    {
+        ERR( "WineHua: WOW64 NtAllocateVirtualMemory(%s) failed for vkMapMemory\n",
+             wine_dbgstr_longlong( memory->size ) );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+
+#ifdef MREMAP_DONTUNMAP
+    {
+        void *alias = mremap( host, alloc_size, alloc_size,
+                              MREMAP_MAYMOVE | MREMAP_DONTUNMAP | MREMAP_FIXED, placed );
+        if (alias != MAP_FAILED && alias == placed)
+        {
+            if (winehua_wow64_alias_coherent( host, placed ))
+            {
+                winehua_wow64_accept_map( memory, placed, host, TRUE, data, "mremap" );
+                return VK_SUCCESS;
+            }
+            ERR( "WineHua: WOW64 mremap not coherent host=%p dest=%p host_mapped=%d\n",
+                 host, placed, winehua_wow64_ptr_mapped( host ) );
+            if (!winehua_wow64_ptr_mapped( host ))
+            {
+                void *restored;
+                void *release;
+                SIZE_T z;
+
+                restored = mremap( placed, alloc_size, alloc_size,
+                                   MREMAP_MAYMOVE | MREMAP_FIXED, host );
+                if (restored != host)
+                {
+                    ERR( "WineHua: WOW64 cannot restore host map %p errno=%d\n", host, errno );
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+                z = 0;
+                release = placed;
+                NtFreeVirtualMemory( GetCurrentProcess(), &release, &z, MEM_RELEASE );
+                placed = NULL;
+                alloc_size = want_size;
+                if (!winehua_wow64_alloc_placed( bits, &alloc_size, &placed ))
+                {
+                    ERR( "WineHua: WOW64 NtAllocateVirtualMemory retry failed\n" );
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+            }
+        }
+        else
+            ERR( "WineHua: WOW64 mremap alias failed host=%p dest=%p errno=%d\n", host, placed, errno );
+    }
+#endif
+
+    have_vma = winehua_find_vma( host, &start, &end, &offset, &inode );
+    if (have_vma && (fd = winehua_open_vma_fd( start, end, inode )) >= 0)
+    {
+        off_t file_off = (off_t)( offset + ((uintptr_t)host - start) );
+        void *alias = mmap( placed, alloc_size, PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_FIXED, fd, file_off );
+        close( fd );
+        if (alias == placed)
+        {
+            if (winehua_wow64_alias_coherent( host, placed ))
+            {
+                winehua_wow64_accept_map( memory, placed, host, TRUE, data, "mmap fd" );
+                return VK_SUCCESS;
+            }
+            ERR( "WineHua: WOW64 mmap fd not coherent host=%p dest=%p off=0x%lx\n",
+                 host, placed, (unsigned long)file_off );
+        }
+        else
+            ERR( "WineHua: WOW64 mmap alias failed host=%p dest=%p errno=%d\n", host, placed, errno );
+    }
+    else
+        ERR( "WineHua: WOW64 could not open backing fd for map %p vma=%d\n", host, have_vma );
+
+    /* Last resort: CPU copy.  FlushMappedMemoryRanges bypasses win32u, so
+     * QueueSubmit copies the whole allocation.  Precise DXVK/Venus flushes
+     * may still race; prefer a coherent alias above. */
+    memcpy( placed, host, (size_t)(memory->size < (VkDeviceSize)alloc_size ? memory->size : (VkDeviceSize)alloc_size) );
+    winehua_wow64_accept_map( memory, placed, host, FALSE, data, "CPU fallback" );
+    return VK_SUCCESS;
+}
+
+static void winehua_wow64_release_map( struct vulkan_device *device, struct device_memory *memory )
+{
+    if (!memory->wow64_alias && !memory->wow64_copy) return;
+
+    if (memory->wow64_copy && memory->host_map && memory->vm_map && memory->size)
+        memcpy( memory->host_map, memory->vm_map, (size_t)memory->size );
+    winehua_wow64_copy_unregister( memory );
+
+    if (device && device->p_vkUnmapMemory && memory->obj.host.device_memory)
+        device->p_vkUnmapMemory( device->host.device, memory->obj.host.device_memory );
+
+    if (memory->vm_map)
+    {
+        SIZE_T alloc_size = 0;
+        NtFreeVirtualMemory( GetCurrentProcess(), &memory->vm_map, &alloc_size, MEM_RELEASE );
+    }
+    memory->vm_map = NULL;
+    memory->host_map = NULL;
+    memory->wow64_alias = FALSE;
+    memory->wow64_copy = FALSE;
+}
+#endif
+
 static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMapInfoKHR *map_info, void **data )
 {
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
@@ -1302,10 +1626,11 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
 #ifdef _WIN64
     if (NtCurrentTeb()->WowTebOffset && res == VK_SUCCESS && (UINT_PTR)*data >> 32)
     {
-        FIXME( "returned mapping %p does not fit 32-bit pointer\n", *data );
-        device->p_vkUnmapMemory( device->host.device, memory->obj.host.device_memory );
-        *data = NULL;
-        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        if ((res = winehua_wow64_remap_map( memory, data )) != VK_SUCCESS)
+        {
+            device->p_vkUnmapMemory( device->host.device, memory->obj.host.device_memory );
+            *data = NULL;
+        }
     }
 #endif
 
@@ -1334,6 +1659,16 @@ static VkResult win32u_vkUnmapMemory2KHR( VkDevice client_device, const VkMemory
     struct device_memory *memory = device_memory_from_handle( unmap_info->memory );
     VkMemoryUnmapInfoKHR info;
     VkResult res;
+
+    TRACE( "device %p, unmap_info %p\n", device, unmap_info );
+
+#ifdef _WIN64
+    if (memory->wow64_alias || memory->wow64_copy)
+    {
+        winehua_wow64_release_map( device, memory );
+        return VK_SUCCESS;
+    }
+#endif
 
     if (memory->vm_map && physical_device->external_memory_align) return VK_SUCCESS;
 
@@ -2785,6 +3120,10 @@ static VkResult win32u_vkQueueSubmit( VkQueue client_queue, uint32_t count, cons
 
     TRACE( "queue %p, count %u, submits %p, fence %p\n", queue, count, submits, fence );
 
+#ifdef _WIN64
+    winehua_wow64_flush_copies();
+#endif
+
     if (!(timelines = mem_alloc( &pool, count * sizeof(*timelines) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
     memset( timelines, 0, count * sizeof(*timelines) );
 
@@ -2933,6 +3272,10 @@ static VkResult queue_submit( struct vulkan_queue *queue, uint32_t count, const 
     struct vulkan_fence *fence = client_fence ? vulkan_fence_from_handle( client_fence ) : NULL;
     struct mempool pool = {0};
     VkResult res;
+
+#ifdef _WIN64
+    winehua_wow64_flush_copies();
+#endif
 
     for (uint32_t i = 0; i < count; i++)
     {

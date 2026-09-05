@@ -102,6 +102,7 @@ static void     (WINAPI *pBTCpuProcessInit)(void);
 static NTSTATUS (WINAPI *pBTCpuSetContext)(HANDLE,HANDLE,void *,void *);
 static void     (WINAPI *pBTCpuThreadInit)(void);
 static void     (WINAPI *pBTCpuSimulate)(void) __attribute__((used));
+static NTSTATUS (WINAPI *pBTCpuSuspendLocalThread)(HANDLE,ULONG *);
 static void *   (WINAPI *p__wine_get_unix_opcode)(void);
 static void *   (WINAPI *pKiRaiseUserExceptionDispatcher)(void);
 void     (WINAPI *pBTCpuFlushInstructionCache2)( const void *, SIZE_T ) = NULL;
@@ -902,6 +903,26 @@ static HMODULE load_64bit_module( const WCHAR *name )
 }
 
 
+static DWORD wow64GetEnvironmentVariableW( LPCWSTR name, LPWSTR val, DWORD size )
+{
+    UNICODE_STRING us_name, us_value;
+    NTSTATUS status;
+    DWORD len;
+
+    RtlInitUnicodeString( &us_name, name );
+    us_value.Length = 0;
+    us_value.MaximumLength = (size ? size - 1 : 0) * sizeof(WCHAR);
+    us_value.Buffer = val;
+
+    status = RtlQueryEnvironmentVariable_U( NULL, &us_name, &us_value );
+    len = us_value.Length / sizeof(WCHAR);
+    if (status == STATUS_BUFFER_TOO_SMALL) return len + 1;
+    if (status) return 0;
+    if (!size) return len + 1;
+    val[len] = 0;
+    return len;
+}
+
 /**********************************************************************
  *           get_cpu_dll_name
  */
@@ -909,18 +930,26 @@ static const WCHAR *get_cpu_dll_name(void)
 {
     static ULONG buffer[32];
     KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
+    WCHAR *cpu_dll = (WCHAR*)buffer;
     OBJECT_ATTRIBUTES attr;
     UNICODE_STRING nameW;
     const WCHAR *ret;
     HANDLE key;
     ULONG size;
+    UINT res;
+
+    /* HODLL 环境变量显式指定 32 位模拟器 DLL (FEX: libwow64fex.dll), 最高优先。
+     * 对标 64 位侧的 HODLL64 (ntdll/loader.c load_arm64ec_module)。 */
+    if ((res = wow64GetEnvironmentVariableW( L"HODLL", cpu_dll, ARRAY_SIZE(buffer))) &&
+        res < ARRAY_SIZE(buffer))
+        return cpu_dll;
 
     switch (current_machine)
     {
     case IMAGE_FILE_MACHINE_I386:
-        RtlInitUnicodeString( &nameW, L"\\Registry\\Machine\\Software\\Microsoft\\Wow64\\x86" );
-        ret = (native_machine == IMAGE_FILE_MACHINE_ARM64 ? L"xtajit.dll" : L"wow64cpu.dll");
-        break;
+        if (native_machine == IMAGE_FILE_MACHINE_ARM64)
+            return L"libwow64fex.dll";
+        return L"wow64cpu.dll";
     case IMAGE_FILE_MACHINE_ARMNT:
         RtlInitUnicodeString( &nameW, L"\\Registry\\Machine\\Software\\Microsoft\\Wow64\\arm" );
         ret = L"wowarmhw.dll";
@@ -1014,6 +1043,7 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
     GET_PTR( BTCpuProcessInit );
     GET_PTR( BTCpuThreadInit );
     GET_PTR( BTCpuResetToConsistentState );
+    GET_PTR( BTCpuSuspendLocalThread );
     GET_PTR( BTCpuSetContext );
     GET_PTR( BTCpuSimulate );
     GET_PTR( BTCpuFlushInstructionCache2 );
@@ -1710,4 +1740,12 @@ NTSTATUS WINAPI Wow64RaiseException( int code, EXCEPTION_RECORD *rec )
     raise_exception( &rec32, &ctx32, first_chance, rec );
 
     return STATUS_SUCCESS;
+}
+
+/**********************************************************************
+ *            Wow64SuspendLocalThread (wow64.@)
+ */
+NTSTATUS WINAPI Wow64SuspendLocalThread( HANDLE thread, ULONG *count )
+{
+    return pBTCpuSuspendLocalThread( thread, count );
 }
