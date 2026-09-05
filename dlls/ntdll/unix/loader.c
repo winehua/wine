@@ -40,6 +40,7 @@
 #ifdef __OHOS__
 #include <dirent.h>
 #include "ohos_broker.h"
+#include "ohos_virtual.h"
 #endif
 #include <unistd.h>
 #include <dlfcn.h>
@@ -1054,6 +1055,22 @@ static NTSTATUS unwind_builtin_dll( void *args )
 #endif /* SO_DLLS_SUPPORTED */
 
 
+static NTSTATUS unixcall_ohos_set_wowbox64_fault( void *args )
+{
+#ifdef __OHOS__
+    const struct ohos_set_wowbox64_fault_params *params = args;
+    if (params)
+    {
+        ohos_set_wowbox64_host_fault( params->handler );
+        if (params->p_unix_mprotect)
+            *params->p_unix_mprotect = (void *)ohos_mprotect_exec;
+    }
+    else ohos_set_wowbox64_host_fault( NULL );
+#endif
+    return STATUS_SUCCESS;
+}
+
+
 static const unixlib_entry_t unix_call_funcs[] =
 {
     load_so_dll,
@@ -1064,6 +1081,7 @@ static const unixlib_entry_t unix_call_funcs[] =
     unixcall_wine_server_handle_to_fd,
     unixcall_wine_spawnvp,
     system_time_precise,
+    unixcall_ohos_set_wowbox64_fault,
 };
 
 
@@ -1082,6 +1100,7 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_wine_server_handle_to_fd,
     wow64_wine_spawnvp,
     system_time_precise,
+    unixcall_ohos_set_wowbox64_fault,
 };
 
 #endif  /* _WIN64 */
