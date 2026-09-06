@@ -58,6 +58,9 @@
 #include "wine/asm.h"
 #include "unix_private.h"
 #include "wine/debug.h"
+#ifdef __OHOS__
+#include "ohos_virtual.h"
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 
@@ -92,12 +95,34 @@ static inline struct arm64_thread_data *arm64_thread_data( struct thread_data *d
 # define FP_sig(context)            REGn_sig(29, context)    /* Frame pointer */
 # define LR_sig(context)            REGn_sig(30, context)    /* Link Register */
 
+#ifndef EXTRA_MAGIC
+#define EXTRA_MAGIC 0x45585401
+#endif
+
 static struct _aarch64_ctx *get_extended_sigcontext( const ucontext_t *sigcontext, unsigned int magic )
 {
     struct _aarch64_ctx *ctx = (struct _aarch64_ctx *)sigcontext->uc_mcontext.__reserved;
-    while ((char *)ctx < (char *)(&sigcontext->uc_mcontext + 1) && ctx->magic && ctx->size)
+    const char *end = (const char *)(&sigcontext->uc_mcontext + 1);
+
+    while ((char *)ctx < end && ctx->magic && ctx->size)
     {
         if (ctx->magic == magic) return ctx;
+        /* Kernel extra_context.datap points at overflow records (ESR/SVE)
+         * that do not fit in uc_mcontext.__reserved. */
+        if (ctx->magic == EXTRA_MAGIC)
+        {
+            struct
+            {
+                struct _aarch64_ctx head;
+                unsigned long datap;
+                unsigned int size;
+                unsigned int pad[3];
+            } *extra = (void *)ctx;
+            if (!extra->datap || !extra->size) break;
+            ctx = (struct _aarch64_ctx *)(uintptr_t)extra->datap;
+            end = (const char *)ctx + extra->size;
+            continue;
+        }
         ctx = (struct _aarch64_ctx *)((char *)ctx + ctx->size);
     }
     return NULL;
@@ -1140,6 +1165,18 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
     rec.NumberParameters = 2;
 
+    /* No ESR in ucontext: do not default a permission abort to READ.
+     * wowbox64 only unprotects WRITE faults; OHOS DFX runs before Wine and
+     * the usr ucontext often has no ESR_MAGIC. SEGV_ACCERR at an address
+     * other than PC is a data permission abort (Heaven Qt was WNR=1). */
+    if (!esr && siginfo->si_code == SEGV_ACCERR && siginfo->si_addr)
+    {
+        if ((ULONG_PTR)siginfo->si_addr == (ULONG_PTR)PC_sig(sigcontext))
+            rec.ExceptionInformation[0] = EXCEPTION_EXECUTE_FAULT;
+        else
+            rec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
+    }
+
     if (!virtual_handle_fault( data, &rec, (void *)SP_sig(sigcontext) )) return;
     if (handle_syscall_fault( data, sigcontext, &rec )) return;
 
@@ -1498,6 +1535,12 @@ void signal_init_process( TEB *teb )
     sig_act.sa_sigaction = segv_handler;
     if (sigaction( SIGBUS, &sig_act, NULL ) == -1) goto error;
     if (sigaction( SIGSEGV, &sig_act, NULL ) == -1) goto error;
+#ifdef __OHOS__
+    /* libc sigaction only fills the usr slot. OHOS musl sigchain runs DFX
+     * special handlers first and ProcessDump freezes the thread. Claim
+     * SIGSEGV/SIGBUS and route Box64 SMC to wowbox64 before Wine SEH. */
+    ohos_install_sigchain_fault_handlers( segv_handler );
+#endif
     sig_act.sa_sigaction = ill_handler;
     if (sigaction( SIGILL, &sig_act, NULL ) == -1) goto error;
     return;

@@ -23,6 +23,7 @@
 
 #ifdef __OHOS__
 
+#include <signal.h>
 #include <sys/prctl.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -54,6 +55,15 @@ int ohos_map_exec_section( void *view_base, int fd,
                            size_t virtual_address, size_t file_size, off_t file_start,
                            size_t host_page_mask,
                            const char *section_name );
+
+/* Register Wine's SIGSEGV/SIGBUS handler as an OHOS musl sigchain special
+ * handler so recoverable dynarec write faults are claimed before DFX dumps
+ * and freezes the thread. wine_handler is the existing ntdll segv_handler. */
+void ohos_install_sigchain_fault_handlers( void (*wine_handler)(int, siginfo_t *, void *) );
+
+/* wowbox64.dll (PE) registers this from BTCpuProcessInit. handler is
+ * wowbox64_handle_host_fault; NULL unregisters. */
+void ohos_set_wowbox64_host_fault( void *handler );
 
 #endif /* __OHOS__ */
 

@@ -66,6 +66,16 @@ struct unwind_builtin_dll_params
     CONTEXT                    *context;
 };
 
+/* wowbox64.dll registers a host SIGSEGV consumer so OHOS musl sigchain can
+ * digest Box64 dynarec SMC faults without entering Wine SEH.
+ * p_unix_mprotect is a PE slot; unix writes ohos_mprotect_exec so unprotectDB
+ * can restore kernel WRITE from a POSIX handler without NtProtectVirtualMemory. */
+struct ohos_set_wowbox64_fault_params
+{
+    void *handler;
+    void **p_unix_mprotect;
+};
+
 enum ntdll_unix_funcs
 {
     unix_load_so_dll,
@@ -76,6 +86,7 @@ enum ntdll_unix_funcs
     unix_wine_server_handle_to_fd,
     unix_wine_spawnvp,
     unix_system_time_precise,
+    unix_ohos_set_wowbox64_fault,
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;
