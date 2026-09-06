@@ -3297,7 +3297,14 @@ done:
  * path.  The overlay is a Unix runtime directory, not a C: prefix directory,
  * and is therefore exposed to the loader as the internal \\??\\unix namespace.
  * DXVK supplies d3d11/dxgi, while mixed VKD3D sessions also supply d3d12.
- * WineD3D and ordinary applications retain the normal Windows search rules. */
+ * WineD3D and ordinary applications retain the normal Windows search rules.
+ *
+ * Scheme ③ packs 64-bit DXVK as ARM64X under arm64x/, not x64/. Searching
+ * only x64 then x86 misses that file; the next hit is Wine's ARM64 builtin
+ * system32\d3d11.dll, which WINEDLLOVERRIDES=d3d11=n rejects — Unity AMD64
+ * LoadLibrary then fails with TYPE_E_CANTLOADLIBRARY (0x80029C4A).
+ * 32-bit ntdll rejects ARM64X (STATUS_NOT_SUPPORTED) and continues to x86.
+ * d3d12 stays x64-only (vkd3d ARM64X was abandoned). */
 static NTSTATUS search_winehua_dxvk_overlay( LPCWSTR libname, UNICODE_STRING *nt_name,
                                              WINE_MODREF **pwm, HANDLE *mapping,
                                              SECTION_IMAGE_INFORMATION *image_info,
@@ -3310,7 +3317,7 @@ static NTSTATUS search_winehua_dxvk_overlay( LPCWSTR libname, UNICODE_STRING *nt
     static const WCHAR dxgiW[] = L"dxgi.dll";
     static const WCHAR d3d12W[] = L"d3d12.dll";
     static const WCHAR prefixW[] = L"\\??\\unix";
-    static const WCHAR *const archW[] = {L"x64", L"x86"};
+    static const WCHAR *const archW[] = { L"arm64x", L"x64", L"x86" };
     UNICODE_STRING backend, root;
     NTSTATUS status = STATUS_DLL_NOT_FOUND;
     unsigned int i;
@@ -3332,7 +3339,7 @@ static NTSTATUS search_winehua_dxvk_overlay( LPCWSTR libname, UNICODE_STRING *nt
     root_name = is_d3d12 ? vkd3d_root_nameW : dxvk_root_nameW;
     if (get_env_var( root_name, 0, &root )) return status;
 
-    for (i = 0; i < ARRAY_SIZE(archW); ++i)
+    for (i = is_d3d12 ? 1 : 0; i < ARRAY_SIZE(archW); ++i)
     {
         SIZE_T length = ARRAY_SIZE(prefixW) - 1 + root.Length / sizeof(WCHAR) +
                         1 + wcslen( archW[i] ) + 1 + wcslen( libname ) + 1;
