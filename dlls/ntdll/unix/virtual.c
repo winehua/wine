@@ -2758,6 +2758,17 @@ static NTSTATUS map_pe_header( void *ptr, size_t size, size_t map_size, int fd, 
 
     if (!*removable && map_size)
     {
+#ifdef __OHOS__
+        /* OHOS 文件系统是 noexec: 从文件 mmap 出来的页之后无法再 mprotect 加
+         * PROT_EXEC (返回 EACCES)。PE 头不属于任何节, 走不到 ohos_map_exec_section
+         * 的匿名映射路径 — 若此处建文件映射, 加壳 stub 把整个模块改成 RWX 时会在
+         * PE 头页上失败 (Wine 返回 STATUS_ACCESS_DENIED, GetLastError=5), 而壳不
+         * 检查返回值继续写 → 只读页写入 → Access Violation (实测 wt_launcher)。
+         * 调用方已为 header 备好可写内存, 直接 pread: 页保持匿名, 后续任意
+         * mprotect 都成立。不要设 *removable — 那会连带影响后续的节映射。 */
+        pread( fd, ptr, size, 0 );
+        return STATUS_SUCCESS;
+#else
         if (mmap( ptr, map_size, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, fd, 0 ) != MAP_FAILED)
         {
             if (size > map_size) pread( fd, (char *)ptr + map_size, size - map_size, map_size );
@@ -2778,6 +2789,7 @@ static NTSTATUS map_pe_header( void *ptr, size_t size, size_t map_size, int fd, 
             return STATUS_NO_MEMORY;
         }
         *removable = TRUE;
+#endif
     }
     pread( fd, ptr, size, 0 );
     return STATUS_SUCCESS;  /* page protections will be updated later */
