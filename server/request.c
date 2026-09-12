@@ -332,6 +332,23 @@ void read_request( struct thread *thread )
     {
         if ((ret = read( get_unix_fd( thread->request_fd ), &thread->req,
                          sizeof(thread->req) )) != sizeof(thread->req)) goto error;
+        /* 开鸿 (OHOS x86_64) 实测 2026-09-12: 请求流里混入过外部写入 —— 客户端
+         * 自己的 TX 记录里从未出现过该字节序列, 且 pipe/socketpair 都一样, 说明
+         * 是进程内别的写者 (平台库按陈旧 fd 号写入) 插进来的记录。此时绝不能按
+         * header 里的 size 去 malloc 并死等数据段: 单线程 wineserver 会永久停摆
+         * (实测按 1.79GB 死等, 导致 explorer 卡在显示设备初始化、wineboot 永不退出)。
+         * 判定为协议失步, 终止该线程的请求通道。合法请求编号约 0..300, 实测最大
+         * 请求约 9KB, 故取 1000 / 1MB 作宽松上限。 */
+        if ((unsigned int)thread->req.request_header.req >= 1000 ||
+            thread->req.request_header.request_size > (1u << 20))
+        {
+            fprintf( stderr, "wineserver: bad request header (req=%d size=%u), "
+                     "dropping request channel of thread %04x\n",
+                     thread->req.request_header.req,
+                     (unsigned)thread->req.request_header.request_size, thread->id );
+            kill_thread( thread, 0 );
+            return;
+        }
         if (!(thread->req_toread = thread->req.request_header.request_size))
         {
             /* no data, handle request at once */

@@ -1028,6 +1028,24 @@ static void init_egl_devices( struct opengl_funcs *funcs )
     TRACE( "Found display platform device %p\n", display_egl.device );
     list_add_tail( &devices_egl, &display_egl.entry );
 
+    /* 开鸿 OpenHarmony x86_64 实测 (2026-09-12): 当软件渲染被强制时, 下面这轮硬件设备枚举
+     * 会与 Mesa 冲突 —— 每个设备都用 EGL_PLATFORM_DEVICE_EXT 显式选中硬件, Mesa 报
+     *   EGL-MAIN: error: Not allowed to force software rendering when API explicitly
+     *             selects a hardware device.
+     * 随后在 driCreateNewScreen3 段错误 (cppcrash: eglInitialize → driCreateNewScreen3 →
+     * libgallium), 发起调用的 explorer.exe 建窗即崩 → 桌面 root 永不出现。强制软件渲染时
+     * 硬件设备本来也用不到 (Mesa 也不会接受), 直接跳过这轮枚举。
+     * 触发场景: HarmonyOS PC 模拟器绕行会把 x86_64 guest 压到 GALLIUM_DRIVER=softpipe。 */
+    {
+        const char *gallium = getenv( "GALLIUM_DRIVER" );
+        if ((gallium && (!strcmp( gallium, "softpipe" ) || !strcmp( gallium, "llvmpipe" ))) ||
+            getenv( "LIBGL_ALWAYS_SOFTWARE" ))
+        {
+            WARN( "Skipping EGL device enumeration: software rendering is forced.\n" );
+            goto done;
+        }
+    }
+
     funcs->p_eglQueryDevicesEXT( 0, NULL, &count );
     if (!count || !(devices = calloc( count, sizeof(EGLDeviceEXT *) ))) goto done;
     funcs->p_eglQueryDevicesEXT( count, devices, &count );
