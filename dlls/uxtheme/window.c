@@ -32,21 +32,27 @@ static void uxtheme_draw_menu_button(HTHEME theme, HWND hwnd, HDC hdc, enum NONC
 {
     int part, state;
 
+    /* 映射到主窗口部件 [Window.CloseButton] 等。原先映射到 WP_MDI*BUTTON, 那是
+     * MDI 子窗口菜单按钮的部件 (尺寸/素材都不同), 且 WP_MDIMAXBUTTON 不存在导致
+     * 最大化按钮落回经典绘制 —— win32u 的 draw_nc_caption 现在用本函数绘制主窗口
+     * 标题栏按钮, 映射必须对应主窗口段。 */
     switch (type)
     {
     case MENU_CLOSE_BUTTON:
-        part = WP_MDICLOSEBUTTON;
+        part = WP_CLOSEBUTTON;
         break;
     case MENU_MIN_BUTTON:
-        part = WP_MDIMINBUTTON;
+        part = WP_MINBUTTON;
+        break;
+    case MENU_MAX_BUTTON:
+        part = WP_MAXBUTTON;
         break;
     case MENU_RESTORE_BUTTON:
-        part = WP_MDIRESTOREBUTTON;
+        part = WP_RESTOREBUTTON;
         break;
     case MENU_HELP_BUTTON:
-        part = WP_MDIHELPBUTTON;
+        part = WP_HELPBUTTON;
         break;
-    /* There is no WP_MDIMAXBUTTON */
     default:
         user_api.pNonClientButtonDraw(hwnd, hdc, type, rect, down, grayed);
         return;
