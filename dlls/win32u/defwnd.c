@@ -1667,8 +1667,22 @@ static void nc_paint( HWND hwnd, HRGN clip )
     if (has_static_outer_frame( ex_style ))
         draw_rect_edge( hdc, &rect, BDR_SUNKENOUTER, BF_RECT | BF_ADJUST, 1 );
     else if (has_big_frame( style, ex_style ))
-        InflateRect( &rect, -1, -1 );  /* 保留原 BF_ADJUST 的几何收缩; 去掉
-                                        * EDGE_RAISED 的明暗立体双线 */
+    {
+        /* 扁平化: 最外 1px 圈用标题栏色填充 — 去掉原 EDGE_RAISED 的明暗立体
+         * 双线, 但**绘制本身必须保留**: 只做 InflateRect 会让这一圈在整个
+         * nc_paint 里无人绘制 (内侧的 draw_nc_frame / draw_nc_caption 都在
+         * 内缩后的 rect 上工作, 不覆盖它), buffer 重建 (窗口还原 / 子窗口
+         * 重新显示) 后露出未初始化底色 — 实测表现为窗口四周 1px 黑边,
+         * 2026-09-14 "窗口还原后标题栏顶上有黑线"。 */
+        RECT r = rect;
+        NtGdiSelectBrush( hdc, get_sys_color_brush( active ? COLOR_ACTIVECAPTION
+                                                          : COLOR_INACTIVECAPTION ));
+        NtGdiPatBlt( hdc, r.left, r.top, r.right - r.left, 1, PATCOPY );
+        NtGdiPatBlt( hdc, r.left, r.top, 1, r.bottom - r.top, PATCOPY );
+        NtGdiPatBlt( hdc, r.left, r.bottom - 1, r.right - r.left, -1, PATCOPY );
+        NtGdiPatBlt( hdc, r.right - 1, r.top, -1, r.bottom - r.top, PATCOPY );
+        InflateRect( &rect, -1, -1 );
+    }
 
     draw_nc_frame( hdc, &rect, active, style, ex_style );
 
