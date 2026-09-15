@@ -1362,17 +1362,20 @@ static NTSTATUS ohos_get_mix_format(void *args)
         return STATUS_SUCCESS;
     }
 
+    /* Windows shared-mode mix format is 48 kHz stereo IEEE float. Advertising
+     * S16 made BASS 2.4 WASAPI write float into 4-byte frames that we decoded
+     * as PCM, which produced M5 combat pops. */
     memset(fmt, 0, sizeof(*fmt));
     fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
     fmt->Format.nChannels = 2;
     fmt->Format.nSamplesPerSec = 48000;
-    fmt->Format.wBitsPerSample = 16;
-    fmt->Format.nBlockAlign = 4;
-    fmt->Format.nAvgBytesPerSec = 192000;
+    fmt->Format.wBitsPerSample = 32;
+    fmt->Format.nBlockAlign = 8;
+    fmt->Format.nAvgBytesPerSec = 384000;
     fmt->Format.cbSize = sizeof(*fmt) - sizeof(fmt->Format);
-    fmt->Samples.wValidBitsPerSample = 16;
+    fmt->Samples.wValidBitsPerSample = 32;
     fmt->dwChannelMask = KSAUDIO_SPEAKER_STEREO;
-    fmt->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+    fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
     params->result = S_OK;
     return STATUS_SUCCESS;
 }
