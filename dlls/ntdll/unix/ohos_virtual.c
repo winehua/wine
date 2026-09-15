@@ -176,8 +176,12 @@ int ohos_map_exec_section( void *view_base, int fd,
     size_t sec_map_size = (file_size + sec_offset + host_page_mask) & ~host_page_mask;
 
     ohos_jit_enable();
+    /* OHOS 上页权限在创建时确定: mprotect 无法把已存在的 RW 页变为可执行
+     * (实测返回成功但权限不变, 执行即 SEGV_ACCERR), 而新建匿名页的权限是
+     * 生效的。故映射时直接带上 PROT_EXEC —— 页随后保持 RWX (wine 的
+     * set_vprot(RX) 在 OHOS 上不生效), 可执行性已满足。 */
     if (mmap( sec_addr - sec_offset, sec_map_size + sec_offset,
-              PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0 ) == MAP_FAILED)
+              PROT_READ | PROT_WRITE | PROT_EXEC, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0 ) == MAP_FAILED)
     {
         ohos_jit_disable();
         ERR( "Could not map %s section with anon mmap\n", section_name );
