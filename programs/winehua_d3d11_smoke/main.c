@@ -809,6 +809,16 @@ static ID3D11PixelShader *create_probe_pixel_shader(
     return shader;
 }
 
+/* 不支持 BC 的设备上（Vulkan 报支持但实际创建失败，如 venus 的能力误报），
+ * BC 专项覆盖拿不到，但后半段资源与 heaven 探针不该被一起挡掉 —— 诊断这类
+ * 设备的其它问题时设 WINEHUA_SMOKE_ALLOW_BC_FAIL=1 放行，缺失的 BC 项在
+ * metrics 里如实留空（coverage 判定照样会点出来）。 */
+static BOOL allow_bc_fail(void)
+{
+    const char *value = winehua_smoke_env("WINEHUA_SMOKE_ALLOW_BC_FAIL", "0");
+    return value && value[0] == '1';
+}
+
 static BOOL create_bc_texture(struct smoke_state *state)
 {
     /* One BC1 block whose first palette entry is opaque red. The texture is
@@ -5328,8 +5338,12 @@ static BOOL create_device(struct smoke_state *state)
 
     state->shader_model_5_ready = TRUE;
 
-    if (!create_bc_texture(state)) return FALSE;
-    if (!create_bc_matrix_resources(state)) return FALSE;
+    if (!create_bc_texture(state) || !create_bc_matrix_resources(state)) {
+        if (!allow_bc_fail())
+            return FALSE;
+        fprintf(stderr, "winehua_d3d11_smoke: BC resources unavailable, "
+                        "continuing (WINEHUA_SMOKE_ALLOW_BC_FAIL=1)\n");
+    }
     if (!create_pattern_texture(state)) return FALSE;
     if (!create_rgba_sample_texture(state)) return FALSE;
     if (!create_descriptor_identity_resources(state)) return FALSE;
