@@ -568,8 +568,8 @@ uint32_t FAudio_PlatformGetDeviceDetails(
 		return FAUDIO_E_INVALID_CALL;
 	}
 
-	if (FAILED(hr = FAudio_OpenDevice(index, &device)))
-		return hr;
+	hr = FAudio_OpenDevice(index, &device);
+	FAudio_assert(!FAILED(hr) && "Failed to get audio endpoint!");
 
 	if (index == 0)
 	{
@@ -581,42 +581,31 @@ uint32_t FAudio_PlatformGetDeviceDetails(
 	}
 
 	/* Set the Device Display Name */
-	if (FAILED(hr = IMMDevice_OpenPropertyStore(device, STGM_READ, &properties)))
-	{
-		IMMDevice_Release(device);
-		return hr;
-	}
-	if (FAILED(hr = IPropertyStore_GetValue(properties, (PROPERTYKEY *)&DEVPKEY_Device_FriendlyName, &deviceName)))
-	{
-		IPropertyStore_Release(properties);
-		IMMDevice_Release(device);
-		return hr;
-	}
+	hr = IMMDevice_OpenPropertyStore(device, STGM_READ, &properties);
+	FAudio_assert(!FAILED(hr) && "Failed to open device property store!");
+	hr = IPropertyStore_GetValue(properties, (PROPERTYKEY*)&DEVPKEY_Device_FriendlyName, &deviceName);
+	FAudio_assert(!FAILED(hr) && "Failed to get audio device friendly name!");
 	lstrcpynW((LPWSTR)details->DisplayName, deviceName.pwszVal, ARRAYSIZE(details->DisplayName) - 1);
 	PropVariantClear(&deviceName);
 	IPropertyStore_Release(properties);
 
 	/* Set the Device ID */
-	if (FAILED(hr = IMMDevice_GetId(device, &str)))
-	{
-		IMMDevice_Release(device);
-		return hr;
-	}
+	hr = IMMDevice_GetId(device, &str);
+	FAudio_assert(!FAILED(hr) && "Failed to get audio endpoint id!");
 	lstrcpynW((LPWSTR)details->DeviceID, str, ARRAYSIZE(details->DeviceID) - 1);
 	CoTaskMemFree(str);
 
-	if (FAILED(hr = IMMDevice_Activate(device, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&client)))
-	{
-		IMMDevice_Release(device);
-		return hr;
-	}
+	hr = IMMDevice_Activate(
+		device,
+		&IID_IAudioClient,
+		CLSCTX_ALL,
+		NULL,
+		(void **)&client
+	);
+	FAudio_assert(!FAILED(hr) && "Failed to activate audio client!");
 
-	if (FAILED(hr = IAudioClient_GetMixFormat(client, &format)))
-	{
-		IAudioClient_Release(client);
-		IMMDevice_Release(device);
-		return hr;
-	}
+	hr = IAudioClient_GetMixFormat(client, &format);
+	FAudio_assert(!FAILED(hr) && "Failed to get audio client mix format!");
 
 	if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
 	{

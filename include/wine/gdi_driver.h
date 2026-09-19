@@ -156,7 +156,7 @@ struct gdi_dc_funcs
     BOOL     (*pGetCharWidth)(PHYSDEV,UINT,UINT,const WCHAR*,LPINT);
     BOOL     (*pGetCharWidthInfo)(PHYSDEV,void*);
     INT      (*pGetDeviceCaps)(PHYSDEV,INT);
-    BOOL     (*pGetDeviceGammaRamp)(PHYSDEV,LPVOID);
+    UINT     (*pGetDeviceGammaRamp)(PHYSDEV,LPVOID);
     DWORD    (*pGetFontData)(PHYSDEV,DWORD,DWORD,LPVOID,DWORD);
     BOOL     (*pGetFontRealizationInfo)(PHYSDEV,void*);
     DWORD    (*pGetFontUnicodeRanges)(PHYSDEV,LPGLYPHSET);
@@ -201,8 +201,8 @@ struct gdi_dc_funcs
     COLORREF (*pSetDCBrushColor)(PHYSDEV, COLORREF);
     COLORREF (*pSetDCPenColor)(PHYSDEV, COLORREF);
     INT      (*pSetDIBitsToDevice)(PHYSDEV,INT,INT,DWORD,DWORD,INT,INT,UINT,UINT,LPCVOID,BITMAPINFO*,UINT);
-    VOID     (*pSetDeviceClipping)(PHYSDEV,HRGN);
-    BOOL     (*pSetDeviceGammaRamp)(PHYSDEV,LPVOID);
+    VOID     (*pSetDeviceClipping)(PHYSDEV,HRGN,HRGN);
+    UINT     (*pSetDeviceGammaRamp)(PHYSDEV,LPVOID);
     COLORREF (*pSetPixel)(PHYSDEV,INT,INT,COLORREF);
     COLORREF (*pSetTextColor)(PHYSDEV,COLORREF);
     INT      (*pStartDoc)(PHYSDEV,const DOCINFOW*);
@@ -319,7 +319,14 @@ W32KAPI struct window_surface *window_surface_create( UINT size, const struct wi
                                                       const RECT *rect, BITMAPINFO *info, HBITMAP bitmap );
 W32KAPI void window_surface_add_ref( struct window_surface *surface );
 W32KAPI void window_surface_release( struct window_surface *surface );
+W32KAPI void window_surface_lock( struct window_surface *surface );
+W32KAPI void window_surface_unlock( struct window_surface *surface );
+W32KAPI void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask );
+W32KAPI void window_surface_flush( struct window_surface *surface );
+W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_region );
 W32KAPI void window_surface_set_shape( struct window_surface *surface, HRGN shape_region );
+W32KAPI void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask );
+W32KAPI struct window_surface *window_surface_get( HWND hwnd );
 
 /* display manager interface, used to initialize display device registry data */
 
@@ -372,7 +379,7 @@ struct user_driver_funcs
     const KBDTABLES *(*pKbdLayerDescriptor)(HKL);
     void    (*pReleaseKbdTables)(const KBDTABLES *);
     /* IME functions */
-    UINT    (*pImeToAsciiEx)(UINT,UINT,const BYTE*,HIMC);
+    UINT    (*pImeProcessKey)(HIMC,UINT,UINT,const BYTE*);
     void    (*pNotifyIMEStatus)(HWND,UINT);
     BOOL    (*pSetIMECompositionRect)(HWND,RECT);
     /* cursor/icon functions */
@@ -400,6 +407,7 @@ struct user_driver_funcs
     LRESULT (*pDesktopWindowProc)(HWND,UINT,WPARAM,LPARAM);
     void    (*pDestroyWindow)(HWND);
     void    (*pFlashWindowEx)(FLASHWINFO*);
+    BOOL    (*pHasWindowManager)(const char *);
     void    (*pGetDC)(HDC,HWND,HWND,const RECT *,const RECT *,DWORD);
     BOOL    (*pProcessEvents)(DWORD);
     void    (*pReleaseDC)(HWND,HDC);

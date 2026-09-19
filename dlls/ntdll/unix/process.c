@@ -56,14 +56,15 @@
 # include <libprocstat.h>
 #endif
 #include <unistd.h>
-#ifdef PAD_MODE
-#include <sys/un.h>
+#ifdef __OHOS__
+#include "ohos_broker.h"
 #endif
 #ifdef HAVE_MACH_MACH_H
 # include <mach/mach.h>
 #endif
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
 #include "winioctl.h"
@@ -146,6 +147,120 @@ static char **build_argv( const UNICODE_STRING *cmdline, int reserved )
     argv[argc] = NULL;
     return argv;
 }
+
+
+#ifdef __OHOS__
+/* The process broker needs the executable as a distinct argv element.  When
+ * CreateProcess supplies ImagePathName separately, its command line may leave
+ * an executable path containing spaces unquoted; build_argv() then splits the
+ * path and the broker tries to start e.g. "C:\\Program". */
+static char **build_broker_argv( const RTL_USER_PROCESS_PARAMETERS *params )
+{
+    char **argv, **result, *image, *dst;
+    const char *image_path;
+    int argc, consumed = 0, i, image_wlen;
+    size_t image_len, offset = 0, len, total;
+
+    if (!(argv = build_argv( &params->CommandLine, 0 ))) return NULL;
+    image_wlen = params->ImagePathName.Length / sizeof(WCHAR);
+    if (!image_wlen || !(image = malloc( image_wlen * 3 + 1 ))) return argv;
+    len = ntdll_wcstoumbs( params->ImagePathName.Buffer, image_wlen, image, image_wlen * 3, FALSE );
+    image[len] = 0;
+    /* TEMP-DIAG(BROKER-ARGV): dump raw params while debugging Steam self-relaunch. */
+    {
+        int cmd_wlen = params->CommandLine.Length / sizeof(WCHAR);
+        char *cmd = NULL;
+        int diag_i;
+
+        fprintf( stderr, "[broker-argv-diag] pid=%d image_wlen=%d image='%s'\n",
+                 getpid(), image_wlen, image );
+        if (cmd_wlen > 0 && (cmd = malloc( cmd_wlen * 3 + 1 )))
+        {
+            int cmd_len = ntdll_wcstoumbs( params->CommandLine.Buffer, cmd_wlen, cmd,
+                                           cmd_wlen * 3, FALSE );
+            cmd[cmd_len] = 0;
+            fprintf( stderr, "[broker-argv-diag] pid=%d cmd_wlen=%d cmdline='%s'\n",
+                     getpid(), cmd_wlen, cmd );
+            free( cmd );
+        }
+        for (diag_i = 0; argv[diag_i] && diag_i < 8; diag_i++)
+            fprintf( stderr, "[broker-argv-diag] pid=%d argv[%d]='%s'\n",
+                     getpid(), diag_i, argv[diag_i] );
+    }
+    image_path = image;
+    /* ImagePathName may use the native DOS namespace even though the
+     * command line uses a Win32 drive path.  Normalize it before matching
+     * the command-line tokens; otherwise Steam's unquoted self-relaunch
+     * falls back to C:\\Program|Files|... in the OHOS broker. */
+    if (!strncasecmp( image_path, "\\??\\", 4 )) image_path += 4;
+    else if (!strncasecmp( image_path, "\\DosDevices\\", 12 )) image_path += 12;
+    image_len = strlen( image_path );
+
+    for (i = 0; argv[i]; i++)
+    {
+        len = strlen( argv[i] );
+        if (i)
+        {
+            if (offset >= image_len || image_path[offset] != ' ') break;
+            offset++;
+        }
+        if (len > image_len - offset || strncasecmp( image_path + offset, argv[i], len )) break;
+        offset += len;
+        if (offset == image_len ||
+            (offset + 4 == image_len && !strcasecmp( image_path + offset, ".exe" )))
+        {
+            consumed = i + 1;
+            break;
+        }
+    }
+    fprintf( stderr, "[broker-argv-diag] pid=%d consumed=%d image_len=%d image_path='%s'\n",
+             getpid(), consumed, (int)image_len, image_path );
+
+    /* Truncated command line: Steam's crash path passes a CommandLine that is
+     * only a prefix of ImagePathName (e.g. "...\Steam\steam" while the image is
+     * "...\Steam\steamerrorreporter.exe").  When every token of the command
+     * line matched a prefix of the image path and the tokens then ran out,
+     * treat ImagePathName as the program and keep the remaining tokens (none).
+     * This keeps the broker from starting a process literally named
+     * "C:\Program". */
+    if (!consumed && !argv[i] && i > 0 && offset > 0 && offset < image_len)
+        consumed = i;
+
+    if (!consumed)
+    {
+        free( image );
+        return argv;
+    }
+
+    for (argc = 0; argv[argc]; argc++);
+    total = image_len + 1;
+    for (i = consumed; i < argc; i++) total += strlen( argv[i] ) + 1;
+    if (!(result = malloc( (argc - consumed + 2) * sizeof(*result) + total )))
+    {
+        free( image );
+        return argv;
+    }
+
+    dst = (char *)(result + argc - consumed + 2);
+    result[0] = dst;
+    memcpy( dst, image_path, image_len + 1 );
+    dst += image_len + 1;
+    for (i = consumed; i < argc; i++)
+    {
+        result[i - consumed + 1] = dst;
+        len = strlen( argv[i] ) + 1;
+        memcpy( dst, argv[i], len );
+        dst += len;
+    }
+    result[argc - consumed + 1] = NULL;
+
+    TRACE( "broker executable path repaired to %s, consumed %d command-line element(s)\n",
+           debugstr_a( image_path ), consumed );
+    free( image );
+    free( argv );
+    return result;
+}
+#endif
 
 
 /***********************************************************************
@@ -278,7 +393,7 @@ static unsigned int get_pe_file_info( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *n
     }
     if (status)
     {
-        if (is_prefix_bootstrap && is_system_dir_path( attr->ObjectName, &info->machine ))
+        if (is_builtin_path( attr->ObjectName, &info->machine ))
         {
             TRACE( "assuming %04x builtin for %s\n", info->machine, debugstr_us(attr->ObjectName));
             return STATUS_SUCCESS;
@@ -400,6 +515,7 @@ static BOOL is_unix_console_handle( HANDLE handle )
 }
 
 
+
 /***********************************************************************
  *           spawn_process
  */
@@ -419,7 +535,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
         isatty(1) && is_unix_console_handle( params->hStdOutput ))
         stdout_fd = 1;
 
-#ifdef PAD_MODE
+#ifdef __OHOS__
     /* Process Broker: 通过 Unix socket 请求主进程创建子进程。
      *
      * 问题起因: wineboot 是 appspawn 子进程，它在 --init 阶段通过
@@ -431,100 +547,15 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
      * Broker 在主进程上下文（非 appspawn 子进程）调用 StartNativeChildProcess，
      * 并通过 SCM_RIGHTS 传递 wineserver socket fd 给子进程。 */
     {
-        const char *broker_path = getenv("PROCESSBROKER");
-        if (!broker_path) broker_path = "/data/storage/el2/base/files/.wine_broker";
-        const char *binDir = getenv("WINEBINDIR");
-        if (!binDir) binDir = "/data/storage/el2/base/files/wine/bin";
-        char *entryParams = NULL;
-        int broker_fd;
-        struct sockaddr_un addr;
-        struct msghdr msg;
-        union { char buf[CMSG_SPACE(sizeof(int))]; struct cmsghdr align; } ctrl;
-        struct cmsghdr *cmsg;
-        int i, len;
-        ssize_t sent, received;
-        int32_t response[2];
-
-        argv = build_argv( &params->CommandLine, 0 );
-
-        /* 构建 entryParams: "binDir|arg0|arg1|..."
-         * ARM64 Box64 in-process 模式下不需要 "|wine" 前缀，因为 Box64
-         * 已将目标 ELF 路径设为 guest argv[0]。x86_64 Pad 仍需前缀。 */
-        len = strlen(binDir) + 1;
-        if (!getenv("USE_LIBBOX64"))
-            len += 5; /* + "|wine" */
-        for (i = 0; argv[i]; i++) len += strlen(argv[i]) + 1;
-        entryParams = malloc(len + 1);
-        if (entryParams)
+        argv = build_broker_argv( params );
         {
-            char *p = entryParams;
-            if (getenv("USE_LIBBOX64"))
-                p += snprintf(p, len + 1, "%s", binDir);
+            int child_pid = -1;
+            if (ohos_broker_spawn_child( argv, socketfd, &child_pid ) == 0)
+                pid = child_pid;
             else
-                p += snprintf(p, len + 1, "%s|wine", binDir);
-            for (i = 0; argv[i]; i++)
-                p += snprintf(p, len + 1 - (p - entryParams), "|%s", argv[i]);
+                status = STATUS_UNSUCCESSFUL;
         }
-
-        /* 连接 broker */
-        broker_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (broker_fd >= 0)
-        {
-            memset(&addr, 0, sizeof(addr));
-            addr.sun_family = AF_UNIX;
-            strcpy(addr.sun_path, broker_path);
-
-            if (connect(broker_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0)
-            {
-                /* 构造请求: "SPAWN\n{entryParams}\n" + SCM_RIGHTS */
-                char req_hdr[32];
-                int hdr_len = snprintf(req_hdr, sizeof(req_hdr), "SPAWN\n");
-                size_t ep_len = entryParams ? strlen(entryParams) : 0;
-
-                struct iovec iov_parts[3];
-                iov_parts[0].iov_base = req_hdr;
-                iov_parts[0].iov_len = hdr_len;
-                iov_parts[1].iov_base = entryParams ? entryParams : (char*)"";
-                iov_parts[1].iov_len = ep_len;
-                iov_parts[2].iov_base = (char*)"\n";
-                iov_parts[2].iov_len = 1;
-
-                memset(&msg, 0, sizeof(msg));
-                msg.msg_iov = iov_parts;
-                msg.msg_iovlen = 3;
-                msg.msg_control = ctrl.buf;
-                msg.msg_controllen = sizeof(ctrl.buf);
-
-                cmsg = CMSG_FIRSTHDR(&msg);
-                cmsg->cmsg_level = SOL_SOCKET;
-                cmsg->cmsg_type = SCM_RIGHTS;
-                cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-                memcpy(CMSG_DATA(cmsg), &socketfd, sizeof(int));
-                msg.msg_controllen = cmsg->cmsg_len;
-
-                sent = sendmsg(broker_fd, &msg, MSG_NOSIGNAL);
-                if (sent >= 0)
-                {
-                    /* 接收响应: childPid + status (8 字节) */
-                    received = recv(broker_fd, response, sizeof(response), MSG_WAITALL);
-                    if (received == sizeof(response))
-                    {
-                        pid = response[0];
-                        int32_t broker_status = response[1];
-                        if (broker_status != 0 || pid <= 0)
-                            status = STATUS_UNSUCCESSFUL;
-                    }
-                    else status = STATUS_UNSUCCESSFUL;
-                }
-                else status = STATUS_UNSUCCESSFUL;
-            }
-            else status = STATUS_UNSUCCESSFUL;
-            close(broker_fd);
-        }
-        else status = STATUS_UNSUCCESSFUL;
-
         free(argv);
-        free(entryParams);
     }
 #else
     if (!(pid = fork()))  /* child */
@@ -675,7 +706,7 @@ NTSTATUS wow64_wine_spawnvp( void *args )
 static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, int unixdir,
                                const RTL_USER_PROCESS_PARAMETERS *params )
 {
-#ifdef PAD_MODE
+#ifdef __OHOS__
     /* Pad: native Unix binary execution not supported (no execve).
      * This path is rarely hit for core Wine (most exes are PE). */
     return STATUS_UNSUCCESSFUL;
@@ -768,7 +799,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
     if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
     if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
     return status;
-#endif /* !PAD_MODE */
+#endif /* !__OHOS__ */
 }
 
 static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_t **handles, data_size_t *handles_len )
@@ -815,7 +846,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     ULONG startup_info_size, env_size;
     int unixdir, socketfd[2] = { -1, -1 };
     struct pe_image_info pe_info;
-    ULONG process_id, thread_id;
+    CLIENT_ID id;
     USHORT machine = 0;
     HANDLE parent = 0, debug = 0, token = 0;
     UNICODE_STRING nt_name, path = {0};
@@ -955,7 +986,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         if (!(status = wine_server_call( req )))
         {
             process_handle = wine_server_ptr_handle( reply->handle );
-            process_id     = reply->pid;
+            id.UniqueProcess = ULongToHandle( reply->pid );
         }
         process_info = wine_server_ptr_handle( reply->info );
     }
@@ -992,7 +1023,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         if (!(status = wine_server_call( req )))
         {
             thread_handle = wine_server_ptr_handle( reply->handle );
-            thread_id     = reply->tid;
+            id.UniqueThread = ULongToHandle( reply->tid );
         }
     }
     SERVER_END_REQ;
@@ -1025,7 +1056,8 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     }
 
     TRACE( "%s pid %04x tid %04x handles %p/%p\n", debugstr_us(&path),
-           process_id, thread_id, process_handle, thread_handle );
+           HandleToULong(id.UniqueProcess), HandleToULong(id.UniqueThread),
+           process_handle, thread_handle );
 
     /* update output attributes */
 
@@ -1035,7 +1067,6 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         {
         case PS_ATTRIBUTE_CLIENT_ID:
         {
-            CLIENT_ID id = make_client_id( process_id, thread_id );
             SIZE_T size = min( ps_attr->Attributes[i].Size, sizeof(id) );
             memcpy( ps_attr->Attributes[i].ValuePtr, &id, size );
             if (ps_attr->Attributes[i].ReturnLength) *ps_attr->Attributes[i].ReturnLength = size;
@@ -1076,6 +1107,8 @@ done:
     return status;
 }
 
+BOOL terminate_process_running;
+LONG terminate_process_exit_code;
 
 /******************************************************************************
  *              NtTerminateProcess  (NTDLL.@)
@@ -1085,6 +1118,19 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
     unsigned int ret;
     BOOL self;
 
+    TRACE("handle %p, exit_code %d, process_exiting %d.\n", handle, (int)exit_code, process_exiting);
+
+    if (handle == GetCurrentProcess())
+    {
+        if (process_termination_delay)
+        {
+            ERR( "HACK: delaying termination.\n" );
+            usleep( 50 * 1000 );
+        }
+        terminate_process_running = TRUE;
+        terminate_process_exit_code = exit_code;
+    }
+
     SERVER_START_REQ( terminate_process )
     {
         req->handle    = wine_server_obj_handle( handle );
@@ -1093,6 +1139,8 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
         self = reply->self;
     }
     SERVER_END_REQ;
+
+    TRACE("handle %p, self %d, process_exiting %d.\n", handle, self, process_exiting);
     if (self)
     {
         if (!handle) process_exiting = TRUE;
@@ -1122,6 +1170,11 @@ void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
         pvmi->PeakWorkingSetSize = info.resident_size_max;
     }
 #endif
+}
+
+int get_unix_debugger_pid(void)
+{
+    return 0;
 }
 
 #elif defined(linux)
@@ -1159,6 +1212,23 @@ void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
     fclose(f);
 }
 
+int get_unix_debugger_pid(void)
+{
+    int unix_pid = 0;
+    char line[256];
+    FILE *file;
+
+    if (!(file = fopen( "/proc/self/status", "r" ))) return 0;
+    while (fgets( line, sizeof(line), file ))
+    {
+        if (sscanf( line, "TracerPid: %d", &unix_pid )) break;
+        unix_pid = 0;
+    }
+    fclose( file );
+
+    return unix_pid;
+}
+
 #elif defined(HAVE_LIBPROCSTAT)
 
 void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
@@ -1183,6 +1253,11 @@ void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
     }
 }
 
+int get_unix_debugger_pid(void)
+{
+    return 0;
+}
+
 #else
 
 void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
@@ -1190,7 +1265,31 @@ void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
     /* FIXME : real data */
 }
 
+int get_unix_debugger_pid(void)
+{
+    return 0;
+}
+
 #endif
+
+static NTSTATUS get_unix_pid( HANDLE process, int *pid )
+{
+    NTSTATUS status;
+    HANDLE thread;
+
+    if ((status = NtGetNextThread( process, NULL, THREAD_QUERY_LIMITED_INFORMATION, 0, 0, &thread ))) return status;
+
+    SERVER_START_REQ( get_thread_times )
+    {
+        req->handle = wine_server_obj_handle( thread );
+        status = wine_server_call( req );
+        if (!status) *pid = reply->unix_pid;
+    }
+    SERVER_END_REQ;
+
+    NtClose( thread );
+    return status;
+}
 
 #define UNIMPLEMENTED_INFO_CLASS(c) \
     case c: \
@@ -1674,6 +1773,17 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
         else ret = STATUS_INFO_LENGTH_MISMATCH;
         break;
 
+    case ProcessWineUnixDebuggerPid:
+        if (handle != NtCurrentProcess()) ret = STATUS_INVALID_PARAMETER;
+        else if (size != sizeof(int)) ret = STATUS_INFO_LENGTH_MISMATCH;
+        else *(int *)info = get_unix_debugger_pid();
+        break;
+
+    case ProcessWineUnixPid:
+        if (size != sizeof(int)) ret = STATUS_INFO_LENGTH_MISMATCH;
+        else ret = get_unix_pid( handle, (int *)info );
+        break;
+
     case ProcessQuotaLimits:
         {
             QUOTA_LIMITS qlimits;
@@ -1807,6 +1917,33 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
         if (size != sizeof(UINT)) return STATUS_INVALID_PARAMETER;
         process_error_mode = *(UINT *)info;
         break;
+
+    case ProcessTlsInformation:
+    {
+        PROCESS_TLS_INFORMATION *t = info;
+        unsigned int i;
+
+        if (handle != NtCurrentProcess())
+        {
+            FIXME( "ProcessTlsInformation is not supported for the other process yet, handle %p.\n", handle );
+            return STATUS_INVALID_HANDLE;
+        }
+
+        if (size < sizeof(*t) || size != offsetof(PROCESS_TLS_INFORMATION, ThreadData[t->ThreadDataCount]))
+            return STATUS_INFO_LENGTH_MISMATCH;
+        if (t->Flags & ~PROCESS_TLS_INFORMATION_WOW64)
+        {
+            WARN( "ProcessTlsInformation: unknown flags %#x.\n", (int)t->Flags );
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if (t->Flags & PROCESS_TLS_INFORMATION_WOW64 && !(is_win64 && is_wow64()))
+            return STATUS_INVALID_PARAMETER;
+        if (t->OperationType >= MaxProcessTlsOperation) return STATUS_INFO_LENGTH_MISMATCH;
+        for (i = 0; i < t->ThreadDataCount; ++i)
+            if (t->ThreadData[i].Flags) return STATUS_INVALID_PARAMETER;
+        ret = virtual_set_tls_information( t );
+        break;
+    }
 
     case ProcessAffinityMask:
     {

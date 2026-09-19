@@ -20,6 +20,7 @@
 #define COBJMACROS
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windows.h"
 #include "appmodel.h"
 #include "shlwapi.h"

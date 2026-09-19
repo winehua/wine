@@ -30,12 +30,7 @@
 #define WIDL_using_Windows_Foundation
 #define WIDL_using_Windows_Foundation_Collections
 #define WIDL_using_Windows_UI_ViewManagement_Core
-#define WIDL_using_Windows_UI_Core
-#define WIDL_using_Windows_UI_Text_Core
-#define WIDL_using_Windows_Globalization
-#include "windows.globalization.h"
 #include "windows.ui.viewmanagement.core.h"
-#include "windows.ui.text.core.h"
 
 struct vector_iids
 {
@@ -45,8 +40,6 @@ struct vector_iids
     const GUID *iterator;
 };
 extern HRESULT vector_create(const struct vector_iids *iids, void **out);
-
-extern IActivationFactory *core_text_services_manager_factory;
 
 #define DEFINE_IINSPECTABLE_(pfx, iface_type, impl_type, impl_from, iface_mem, expr)        \
     static inline impl_type *impl_from(iface_type *iface)                                   \

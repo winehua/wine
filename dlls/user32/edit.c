@@ -147,16 +147,6 @@ static inline BOOL notify_parent(const EDITSTATE *es, INT code)
     return IsWindow(hwnd);
 }
 
-static EDITSTATE *get_control_state( HWND hwnd )
-{
-    return (EDITSTATE *)NtUserGetPrivateData( hwnd, 0, sizeof(EDITSTATE *) );
-}
-
-static EDITSTATE *set_control_state( HWND hwnd, EDITSTATE *state )
-{
-    return (EDITSTATE *)NtUserSetPrivateData( hwnd, 0, sizeof(EDITSTATE *), (LONG_PTR)state );
-}
-
 static LRESULT EDIT_EM_PosFromChar(EDITSTATE *es, INT index, BOOL after_wrap);
 
 /*********************************************************************
@@ -4400,7 +4390,7 @@ static LRESULT EDIT_WM_NCCreate(HWND hwnd, LPCREATESTRUCTW lpcs, BOOL unicode)
 
 	if (!(es = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*es))))
 		return FALSE;
-        set_control_state( hwnd, es );
+        SetWindowLongPtrW( hwnd, 0, (LONG_PTR)es );
 
        /*
         *      Note: since the EDITSTATE has not been fully initialized yet,
@@ -4489,7 +4479,7 @@ static LRESULT EDIT_WM_NCCreate(HWND hwnd, LPCREATESTRUCTW lpcs, BOOL unicode)
 	return TRUE;
 
 cleanup:
-	set_control_state( es->hwndSelf, NULL );
+	SetWindowLongPtrW(es->hwndSelf, 0, 0);
 	EDIT_InvalidateUniscribeData(es);
 	HeapFree(GetProcessHeap(), 0, es->first_line_def);
 	HeapFree(GetProcessHeap(), 0, es->undo_text);
@@ -4575,7 +4565,7 @@ static LRESULT EDIT_WM_NCDestroy(EDITSTATE *es)
 		pc = pp;
 	}
 
-	set_control_state( es->hwndSelf, NULL );
+	SetWindowLongPtrW( es->hwndSelf, 0, 0 );
 	HeapFree(GetProcessHeap(), 0, es->undo_text);
 	HeapFree(GetProcessHeap(), 0, es);
 
@@ -4600,13 +4590,11 @@ static inline LRESULT DefWindowProcT(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
  */
 LRESULT EditWndProc_common( HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, BOOL unicode )
 {
-	EDITSTATE *es = get_control_state( hwnd );
+	EDITSTATE *es = (EDITSTATE *)GetWindowLongPtrW( hwnd, 0 );
 	LRESULT result = 0;
 	POINT pt;
 
         TRACE("hwnd=%p msg=%x (%s) wparam=%Ix lparam=%Ix\n", hwnd, msg, SPY_GetMsgName(msg, hwnd), wParam, lParam);
-
-	if (msg == WM_NCCREATE) NtUserSetWindowFNID( hwnd, MAKE_FNID(NTUSER_WNDPROC_EDIT) );
 
 	if (!es && msg != WM_NCCREATE)
 		return DefWindowProcT(hwnd, msg, wParam, lParam, unicode);
@@ -5153,6 +5141,12 @@ LRESULT EditWndProc_common( HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, B
                     }
 		}
 		break;
+
+        case WM_GETOBJECT:
+                if (lParam == (DWORD)OBJID_QUERYCLASSNAMEIDX)
+                    result = 0x10004;
+
+                break;
 
 	default:
 		result = DefWindowProcT(hwnd, msg, wParam, lParam, unicode);

@@ -321,6 +321,30 @@ static Bool filter_event( Display *display, XEvent *event, char *arg )
     }
 }
 
+static void wait_grab_pointer( Display *display )
+{
+    RECT rect;
+
+    /* unnecessary on gamescope, windows cannot be moved with the mouse */
+    if (X11DRV_HasWindowManager( "steamcompmgr" )) return;
+
+    /* release cursor grab held by any Wine process */
+    NtUserGetClipCursor( &rect );
+    NtUserClipCursor( NULL );
+
+    while (XGrabPointer( display, root_window, False, 0, GrabModeAsync, GrabModeAsync,
+                         None, None, CurrentTime ) != GrabSuccess)
+    {
+        LARGE_INTEGER timeout = {.QuadPart = -10 * (ULONGLONG)10000};
+        NtDelayExecution( FALSE, &timeout );
+    }
+
+    XUngrabPointer( display, CurrentTime );
+    XFlush( display );
+
+    /* restore the previously used clipping rect */
+    NtUserClipCursor( &rect );
+}
 
 enum event_merge_action
 {
@@ -377,6 +401,10 @@ static enum event_merge_action merge_raw_motion_events( XIRawEvent *prev, XIRawE
  */
 static enum event_merge_action merge_events( XEvent *prev, XEvent *next )
 {
+#ifdef HAVE_X11_EXTENSIONS_XINPUT2_H
+    struct x11drv_thread_data *thread_data = x11drv_thread_data();
+#endif
+
     switch (prev->type)
     {
     case ConfigureNotify:
@@ -408,19 +436,21 @@ static enum event_merge_action merge_events( XEvent *prev, XEvent *next )
         case GenericEvent:
             if (next->xcookie.extension != xinput2_opcode) break;
             if (next->xcookie.evtype != XI_RawMotion) break;
-            if (x11drv_thread_data()->warp_serial) break;
+            if (thread_data->xinput2_rawinput) break;
+            if (thread_data->warp_serial) break;
             return MERGE_KEEP;
         }
         break;
     case GenericEvent:
         if (prev->xcookie.extension != xinput2_opcode) break;
         if (prev->xcookie.evtype != XI_RawMotion) break;
+        if (thread_data->xinput2_rawinput) break;
         switch (next->type)
         {
         case GenericEvent:
             if (next->xcookie.extension != xinput2_opcode) break;
             if (next->xcookie.evtype != XI_RawMotion) break;
-            if (x11drv_thread_data()->warp_serial) break;
+            if (thread_data->warp_serial) break;
             return merge_raw_motion_events( prev->xcookie.data, next->xcookie.data );
 #endif
         }
@@ -479,6 +509,12 @@ BOOL X11DRV_ProcessEvents( DWORD mask )
     XEvent event, prev_event;
     int count = 0;
     enum event_merge_action action = MERGE_DISCARD;
+    ULONG_PTR overlay_filter = QS_KEY | QS_MOUSEBUTTON | QS_MOUSEMOVE;
+    BOOL overlay_enabled = FALSE;
+    LARGE_INTEGER timeout = {0};
+
+    if (NtWaitForSingleObject(steam_overlay_event, FALSE, &timeout) == WAIT_OBJECT_0)
+        overlay_enabled = TRUE;
 
     if (!data) return FALSE;
     if (data->current_event) mask = 0;  /* don't process nested events */
@@ -501,6 +537,12 @@ BOOL X11DRV_ProcessEvents( DWORD mask )
         }
 
         count++;
+        if (overlay_enabled && filter_event( data->display, &event, (char *)overlay_filter ))
+        {
+            get_event_data( &event );
+            free_event_data( &event );
+            continue;
+        }
         if (XFilterEvent( &event, None )) continue;
         if (host_window_filter_event( &event, &prev_event )) continue;
 
@@ -614,7 +656,7 @@ static void set_input_focus( struct x11drv_win_data *data )
     if (EVENT_x11_time_to_win32_time(0))
         /* ICCCM says don't use CurrentTime, so try to use last message time if possible */
         /* FIXME: this is not entirely correct */
-        timestamp = NtUserGetThreadState(UserThreadStateMessageTime) - EVENT_x11_time_to_win32_time(0);
+        timestamp = NtUserGetThreadInfo()->message_time - EVENT_x11_time_to_win32_time(0);
     else
         timestamp = CurrentTime;
 
@@ -637,9 +679,11 @@ static void set_focus( Display *display, HWND focus, Time time )
     Window win;
     GUITHREADINFO threadinfo;
 
+    wait_grab_pointer( display );
+
     TRACE( "setting foreground window to %p\n", focus );
 
-    if (!is_net_supported( x11drv_atom(_NET_ACTIVE_WINDOW) ))
+    if (X11DRV_HasWindowManager( "steamcompmgr" ) || !is_net_supported( x11drv_atom(_NET_ACTIVE_WINDOW) ))
     {
         NtUserSetForegroundWindowInternal( focus );
 
@@ -737,7 +781,8 @@ static void handle_wm_protocols( HWND hwnd, XClientMessageEvent *event )
     }
     else if (protocol == x11drv_atom(WM_TAKE_FOCUS))
     {
-        HWND last_focus = x11drv_thread_data()->last_focus, foreground = NtUserGetForegroundWindow();
+        struct x11drv_thread_data *data = x11drv_thread_data();
+        HWND last_focus = data->last_focus, foreground = NtUserGetForegroundWindow();
 
         if (window_has_pending_wm_state( hwnd, -1 ) || (hwnd != foreground && !window_should_take_focus( foreground, event_time )))
         {
@@ -758,6 +803,12 @@ static void handle_wm_protocols( HWND hwnd, XClientMessageEvent *event )
             wine_server_call( req );
         }
         SERVER_END_REQ;
+
+        /* Steam sometimes calls XSetInputFocus with CurrentTime when it gets focused out, and the game gets
+         * focused in, this effectively sometimes steals focus away from us. Although there's no guarantee to
+         * win the race as it entirely depends on the request timings, using CurrentTime makes it more likely.
+         */
+        if (data->active_window && !strcmp( data->active_window, "Steam" )) event_time = CurrentTime;
 
         if (can_activate_window(hwnd))
         {
@@ -831,6 +882,7 @@ static BOOL X11DRV_FocusIn( HWND hwnd, XEvent *xev )
     HWND foreground = NtUserGetForegroundWindow();
     XFocusChangeEvent *event = &xev->xfocus;
     BOOL was_grabbed;
+    char const *sgi;
 
     if (event->detail == NotifyPointer) return FALSE;
     if (!hwnd) return FALSE;
@@ -849,6 +901,17 @@ static BOOL X11DRV_FocusIn( HWND hwnd, XEvent *xev )
     if (is_virtual_desktop() && hwnd == NtUserGetDesktopWindow()) reapply_cursor_clipping();
     if (hwnd == NtUserGetDesktopWindow()) return FALSE;
 
+    /* Focus was just restored but it can be right after super was
+     * pressed and gnome-shell needs a bit of time to respond and
+     * toggle the activity view. If we grab the cursor right away
+     * it will cancel it and super key will do nothing.
+     */
+    if (event->mode == NotifyUngrab && X11DRV_HasWindowManager( "Mutter" ))
+    {
+        LARGE_INTEGER timeout = {.QuadPart = 100 * -10000};
+        NtDelayExecution( FALSE, &timeout );
+    }
+
     x11drv_thread_data()->keymapnotify_hwnd = hwnd;
 
     /* when keyboard grab is released, re-apply the cursor clipping rect */
@@ -860,7 +923,19 @@ static BOOL X11DRV_FocusIn( HWND hwnd, XEvent *xev )
 
     xim_set_focus( hwnd, TRUE );
 
-    if (use_take_focus) return TRUE;
+    /* Bug 27087: Need for Speed™ Hot Pursuit Remastered (1328660) no input in fullscreen in Gamescope
+     *
+     * The bug also happens on Windows in fullscreen mode. It needs an Alt+Tab and then an user
+     * input for the game to handle further user inputs on Windows. On Proton with other window
+     * managers, the support of WM_TAKE_FOCUS allows the game to receive focus without user inputs
+     * so the bug doesn't appear. However, Gamescope doesn't support WM_TAKE_FOCUS so here we are.
+     * We could leave this alone to adhere to the bug for bug compatibility policy. But that would
+     * break the game and create a bad user experience. So set focus in this case to work around the
+     * game bug. The hack was previously applied for all games in experimental_10.0. However, it
+     * would cause bug 24831. So limit this hack to Need for Speed only */
+    sgi = getenv( "SteamGameId" );
+    if (use_take_focus && !(X11DRV_HasWindowManager( "steamcompmgr" ) && sgi && !strcmp( sgi, "1328660" )))
+        return TRUE;
 
     if (!can_activate_window(hwnd))
     {
@@ -870,7 +945,12 @@ static BOOL X11DRV_FocusIn( HWND hwnd, XEvent *xev )
         if (!hwnd) hwnd = x11drv_thread_data()->last_focus;
         if (hwnd && can_activate_window(hwnd)) set_focus( event->display, hwnd, CurrentTime );
     }
-    else NtUserSetForegroundWindowInternal( hwnd );
+    else
+    {
+        wait_grab_pointer( event->display );
+        NtUserSetForegroundWindowInternal( hwnd );
+    }
+
     return TRUE;
 }
 
@@ -892,7 +972,8 @@ static void focus_out( Display *display , HWND hwnd )
     /* don't reset the foreground window, if the window which is
        getting the focus is a Wine window */
 
-    if (!is_net_supported( x11drv_atom(_NET_ACTIVE_WINDOW) ) && !is_current_process_focused())
+    if ((X11DRV_HasWindowManager( "steamcompmgr" ) || !is_net_supported( x11drv_atom(_NET_ACTIVE_WINDOW) ))
+            && !is_current_process_focused())
     {
         /* Abey : 6-Oct-99. Check again if the focus out window is the
            Foreground window, because in most cases the messages sent
@@ -955,6 +1036,32 @@ static BOOL X11DRV_FocusOut( HWND hwnd, XEvent *xev )
     return TRUE;
 }
 
+void clear_emulated_fullscreen_padding( struct x11drv_win_data *data )
+{
+    RECT rect, visible;
+
+    visible = data->rects.visible;
+    OffsetRect( &visible, -data->rects.visible.left, -data->rects.visible.top );
+
+    rect = data->rects.window;
+    OffsetRect( &rect, -data->rects.visible.left, -data->rects.visible.top );
+    intersect_rect( &rect, &rect, &visible );
+
+    if (rect.left > 0 || rect.top > 0 || rect.right < visible.right || rect.bottom < visible.bottom)
+    {
+        UINT width = visible.right - rect.right, height = visible.bottom - rect.bottom;
+        GC gc;
+
+        TRACE("clearing for visible %s, rect %s.\n", wine_dbgstr_rect(&visible), wine_dbgstr_rect(&rect));
+        gc = XCreateGC( data->display, data->whole_window, 0, NULL );
+        XSetSubwindowMode( data->display, gc, IncludeInferiors );
+        if (visible.right && rect.top) XFillRectangle( data->display, data->whole_window, gc, 0, 0, visible.right, rect.top );
+        if (rect.left && visible.bottom) XFillRectangle( data->display, data->whole_window, gc, 0, 0, rect.left, visible.bottom );
+        if (width && visible.bottom) XFillRectangle( data->display, data->whole_window, gc, rect.right, 0, width, visible.bottom );
+        if (height && visible.right) XFillRectangle( data->display, data->whole_window, gc, 0, rect.bottom, visible.right, height );
+        XFreeGC( data->display, gc );
+    }
+}
 
 /***********************************************************************
  *           X11DRV_Expose
@@ -965,7 +1072,7 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
     RECT rect, abs_rect;
     POINT pos;
     struct x11drv_win_data *data;
-    UINT flags = RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN;
+    UINT flags = RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN;
 
     TRACE( "win %p (%lx) %d,%d %dx%d\n",
            hwnd, event->window, event->x, event->y, event->width, event->height );
@@ -978,6 +1085,8 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
     else pos = root_to_virtual_screen( event->x, event->y );
 
     if (!(data = get_win_data( hwnd ))) return FALSE;
+
+    clear_emulated_fullscreen_padding( data );
 
     rect.left   = pos.x;
     rect.top    = pos.y;
@@ -1005,7 +1114,7 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
 
     release_win_data( data );
 
-    NtUserExposeWindowSurface( hwnd, flags, &rect, NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI ) );
+    NtUserExposeWindowSurface( hwnd, flags, &rect, NtUserGetWinMonitorDpi( hwnd, MDT_WINE_RAW_DPI ) );
     return TRUE;
 }
 
@@ -1276,6 +1385,17 @@ static void handle_net_wm_state_notify( HWND hwnd, XPropertyEvent *event )
     NtUserPostMessage( hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
 }
 
+static void handle_monitor_notify( HWND hwnd, XPropertyEvent *event )
+{
+    struct x11drv_win_data *data;
+    long indices[4] = {0};
+
+    if (!(data = get_win_data( hwnd ))) return;
+    if (event->state == PropertyNewValue) get_window_monitors( event->display, event->window, indices );
+    window_monitors_notify( data, event->serial, indices );
+    release_win_data( data );
+}
+
 static void handle_wm_hints_notify( HWND hwnd, XPropertyEvent *event )
 {
     struct x11drv_win_data *data;
@@ -1333,10 +1453,30 @@ static void handle_net_supported_notify( XPropertyEvent *event )
 
 static void handle_net_active_window( XPropertyEvent *event )
 {
+    struct x11drv_thread_data *data = x11drv_thread_data();
     Window window = 0;
+
+    if (data->active_window)
+    {
+        XFree( data->active_window );
+        data->active_window = NULL;
+    }
 
     if (event->state == PropertyNewValue) window = get_net_active_window( event->display );
     net_active_window_notify( event->serial, window, event->time );
+}
+
+static void handle_net_supporting_wm_check_notify( XPropertyEvent *event )
+{
+    struct x11drv_thread_data *data = x11drv_thread_data();
+
+    if (data->window_manager)
+    {
+        XFree( data->window_manager );
+        data->window_manager = NULL;
+    }
+
+    if (event->state == PropertyNewValue) net_supporting_wm_check_init( data );
 }
 
 /***********************************************************************
@@ -1350,11 +1490,13 @@ static BOOL X11DRV_PropertyNotify( HWND hwnd, XEvent *xev )
     if (event->atom == x11drv_atom(WM_STATE)) handle_wm_state_notify( hwnd, event );
     if (event->atom == x11drv_atom(_XEMBED_INFO)) handle_xembed_info_notify( hwnd, event );
     if (event->atom == x11drv_atom(_NET_WM_STATE)) handle_net_wm_state_notify( hwnd, event );
+    if (event->atom == x11drv_atom(_NET_WM_FULLSCREEN_MONITORS)) handle_monitor_notify( hwnd, event );
     if (event->atom == x11drv_atom(WM_HINTS)) handle_wm_hints_notify( hwnd, event );
     if (event->atom == x11drv_atom(_MOTIF_WM_HINTS)) handle_mwm_hints_notify( hwnd, event );
     if (event->atom == x11drv_atom(WM_NORMAL_HINTS)) handle_wm_normal_hints_notify( hwnd, event );
     if (event->atom == x11drv_atom(_NET_SUPPORTED)) handle_net_supported_notify( event );
     if (event->atom == x11drv_atom(_NET_ACTIVE_WINDOW)) handle_net_active_window( event );
+    if (event->atom == x11drv_atom(_NET_SUPPORTING_WM_CHECK)) handle_net_supporting_wm_check_notify( event );
 
     return TRUE;
 }

@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "x11drv.h"
 #include "wine/debug.h"
 
@@ -32,6 +33,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 
 static struct x11drv_display_device_handler host_handler;
 static struct x11drv_settings_handler settings_handler;
+RECT gamescope_screen_rect;
 
 #define NEXT_DEVMODEW(mode) ((DEVMODEW *)((char *)((mode) + 1) + (mode)->dmDriverExtra))
 
@@ -258,6 +260,41 @@ LONG X11DRV_ChangeDisplaySettings( LPDEVMODEW displays, LPCWSTR primary_name, HW
     XUngrabServer( gdi_display );
     XFlush( gdi_display );
 
+    /* Bug 26880 hack for SDL3 games. Sleep 100ms to wait for the WM to handle display change events
+     *
+     * Work around for a SDL3 game bug that uses the native display mode instead of the specified
+     * display mode when restoring from focus loss. For example, an SDL3 game on a 1920x1080 monitor
+     * uses 1024x768 display mode. When the game gets minimized, say by Alt+Tab, it will set the
+     * display mode back to 1920x1080. When the game window gets restored, the window manager will
+     * resize the window to 1920x1080 because the window still has __NET_WM_STATE_FULLSCREEN set
+     * even though it's minimized. So a WM_WINDOWPOSCHANGE (1920x1080) is sent to the game window.
+     * The game processes the WM_WINDOWPOSCHANGE and changes to the previous 1024x768 display mode.
+     * So a WM_WINDOWPOSCHANGE (1024x768) will be sent later once the WM finishes processing the
+     * display change event. However, there might be a delay between the WM_WINDOWPOSCHANGE (1920x1080)
+     * and WM_WINDOWPOSCHANGE (1024x768). So if the game finishes WM_WINDOWPOSCHANGE (1920x1080) and
+     * it can't find more messages, then it will trigger a render update and use the current window
+     * size (1920x1080) to adjust the display mode, causing it to revert to the native display mode
+     * instead of the specified one. See SDL3 testwm.c main message loop for example.
+
+     * The root cause is the difference in the behavior of WM on Linux and Windows. Windows still
+     * uses the old window size when restoring a window, even though the display mode is changed.
+     * The presence of __NET_WM_STATE_FULLSCREEN on Linux makes the WM choose the current display
+     * size instead of the previous window size. I tried removing __NET_WM_STATE_FULLSCREEN for a
+     * window when it gets minimized. But it will trigger unexpected size changes because removing
+     * __NET_WM_STATE_FULLSCREEN causes WMs to restore the window to its previous size before
+     * fullscreen. Eventually, I decided to add a bit of delay here so that when this function
+     * returns, the WM has already processed the display change event and triggers a ConfigureNotify,
+     * so that the second WM_WINDOWPOSCHANGE (1024x768) is most likely in the message queue.
+     *
+     * 100ms seems enough when testing. The bug applied to other applications as well so it's not
+     * gated to SDL3.
+     */
+    {
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = (ULONGLONG)100 * -10000;
+        NtDelayExecution( FALSE, &timeout );
+    }
+
 done:
     free( modes );
     free( ids );
@@ -303,6 +340,67 @@ RECT get_host_primary_monitor_rect(void)
     if (adapters) host_handler.free_adapters(adapters);
     if (monitors) host_handler.free_monitors(monitors, monitor_count);
     return rect;
+}
+
+/* Get an array of host monitor rectangles in X11 root coordinates. Free the array when it's done */
+BOOL get_host_monitor_rects( RECT **ret_rects, int *ret_count )
+{
+    int gpu_count, adapter_count, monitor_count, rect_count = 0;
+    int gpu_idx, adapter_idx, monitor_idx, rect_idx;
+    struct x11drv_gpu *gpus = NULL;
+    struct x11drv_adapter *adapters = NULL;
+    struct gdi_monitor *monitors = NULL;
+    RECT *rects = NULL, *new_rects;
+    POINT left_top = {INT_MAX, INT_MAX};
+
+    if (!host_handler.get_gpus( &gpus, &gpu_count, FALSE )) goto failed;
+
+    for (gpu_idx = 0; gpu_idx < gpu_count; gpu_idx++)
+    {
+        if (!host_handler.get_adapters( gpus[gpu_idx].id, &adapters, &adapter_count )) goto failed;
+
+        for (adapter_idx = 0; adapter_idx < adapter_count; adapter_idx++)
+        {
+            if (!host_handler.get_monitors( adapters[adapter_idx].id, &monitors, &monitor_count )) goto failed;
+
+            new_rects = realloc( rects, (rect_count + monitor_count) * sizeof(*rects) );
+            if (!new_rects) goto failed;
+            rects = new_rects;
+
+            for (monitor_idx = 0; monitor_idx < monitor_count; monitor_idx++)
+            {
+                rects[rect_count++] = monitors[monitor_idx].rc_monitor;
+                left_top.x = min( left_top.x, monitors[monitor_idx].rc_monitor.left );
+                left_top.y = min( left_top.y, monitors[monitor_idx].rc_monitor.top );
+            }
+
+            host_handler.free_monitors( monitors, monitor_count );
+            monitors = NULL;
+        }
+
+        host_handler.free_adapters( adapters );
+        adapters = NULL;
+    }
+
+    host_handler.free_gpus( gpus, gpu_count );
+    gpus = NULL;
+
+    /* Convert from win32 virtual screen coordinates to X11 root coordinates */
+    for (rect_idx = 0; rect_idx < rect_count; rect_idx++)
+        OffsetRect( &rects[rect_idx], -left_top.x, -left_top.y );
+
+    *ret_rects = rects;
+    *ret_count = rect_count;
+    return TRUE;
+
+failed:
+    if (monitors) host_handler.free_monitors( monitors, monitor_count );
+    if (adapters) host_handler.free_adapters( adapters );
+    if (gpus) host_handler.free_gpus( gpus, gpu_count );
+    free( rects );
+    *ret_rects = NULL;
+    *ret_count = 0;
+    return FALSE;
 }
 
 RECT get_work_area(const RECT *monitor_rect)
@@ -392,9 +490,14 @@ UINT X11DRV_UpdateDisplayDevices( const struct gdi_device_manager *device_manage
     struct x11drv_gpu *gpus;
     INT gpu, adapter, monitor;
     struct x11drv_mode *modes;
+    const char *env;
+    BOOL hdr_enabled;
     UINT mode_count;
 
     TRACE( "via %s\n", debugstr_a(host_handler.name) );
+
+    hdr_enabled = (env = getenv("DXVK_HDR")) && *env == '1';
+    TRACE( "hdr_enabled %d.\n", hdr_enabled );
 
     /* Initialize GPUs */
     if (!host_handler.get_gpus( &gpus, &gpu_count, TRUE )) return STATUS_UNSUCCESSFUL;
@@ -425,7 +528,10 @@ UINT X11DRV_UpdateDisplayDevices( const struct gdi_device_manager *device_manage
 
             /* Initialize monitors */
             for (monitor = 0; monitor < monitor_count; monitor++)
+            {
+                monitors[monitor].hdr_enabled = hdr_enabled;
                 device_manager->add_monitor( &monitors[monitor], param );
+            }
 
             host_handler.free_monitors( monitors, monitor_count );
 
@@ -435,6 +541,13 @@ UINT X11DRV_UpdateDisplayDevices( const struct gdi_device_manager *device_manage
             if (!settings_handler.get_id( devname, is_primary, &settings_id )) break;
 
             settings_handler.get_current_mode( settings_id, &current_mode );
+            if (!gpu && X11DRV_HasWindowManager( "steamcompmgr" ))
+            {
+                gamescope_screen_rect.left = gamescope_screen_rect.top = 0;
+                gamescope_screen_rect.right = current_mode.dmPelsWidth;
+                gamescope_screen_rect.bottom = current_mode.dmPelsHeight;
+            }
+
             if (settings_handler.get_modes( settings_id, EDS_ROTATEDMODE, &modes, &mode_count ))
             {
                 strip_driver_extra( &modes->mode, mode_count );

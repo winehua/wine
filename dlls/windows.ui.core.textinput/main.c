@@ -160,15 +160,13 @@ static HRESULT WINAPI core_input_view_GetCoreInputViewOcclusions(ICoreInputView 
 static HRESULT WINAPI core_input_view_TryShowPrimaryView(ICoreInputView *iface, boolean *result)
 {
     FIXME("iface %p, boolean %p stub!\n", iface, result);
-    *result = TRUE;
-    return S_OK;
+    return E_NOTIMPL;
 }
 
 static HRESULT WINAPI core_input_view_TryHidePrimaryView(ICoreInputView *iface, boolean *result)
 {
     FIXME("iface %p, boolean %p stub!\n", iface, result);
-    *result = TRUE;
-    return S_OK;
+    return E_NOTIMPL;
 }
 
 static const struct ICoreInputViewVtbl core_input_view_vtbl =
@@ -306,8 +304,7 @@ static HRESULT WINAPI core_input_view4_add_PrimaryViewHiding(ICoreInputView4 *if
                                                              EventRegistrationToken *token)
 {
     FIXME("iface %p, handler %p, token %p stub!\n", iface, handler, token);
-    token->value = 0xdeadbeef;
-    return S_OK;
+    return E_NOTIMPL;
 }
 
 static HRESULT WINAPI core_input_view4_remove_PrimaryViewHiding(ICoreInputView4 *iface,
@@ -497,8 +494,6 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
 
     if (!wcscmp(name, RuntimeClass_Windows_UI_ViewManagement_Core_CoreInputView))
         IActivationFactory_QueryInterface(core_input_view_factory, &IID_IActivationFactory, (void **)factory);
-    else if (!wcscmp(name, RuntimeClass_Windows_UI_Text_Core_CoreTextServicesManager))
-        IActivationFactory_QueryInterface(core_text_services_manager_factory, &IID_IActivationFactory, (void **)factory);
 
     return *factory ? S_OK : CLASS_E_CLASSNOTAVAILABLE;
 }

@@ -26,6 +26,7 @@
 #include <assert.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "ntgdi_private.h"
 #include "ntuser_private.h"
 #include "wine/opengl_driver.h"
@@ -69,7 +70,7 @@ static unsigned int set_startup_info_flags( unsigned int mask, unsigned int flag
 
 void init_startup_info(void)
 {
-    RTL_USER_PROCESS_PARAMETERS *p = RtlGetCurrentPeb()->ProcessParameters;
+    RTL_USER_PROCESS_PARAMETERS *p = NtCurrentTeb()->Peb->ProcessParameters;
 
     startup_show_window = p->wShowWindow;
     set_startup_info_flags( ~0u, p->dwFlags );
@@ -410,10 +411,10 @@ BOOL is_client_surface_window( struct client_surface *surface, HWND hwnd )
  */
 HWND get_hwnd_message_parent(void)
 {
-    struct user_thread_info *thread_info = get_user_thread_info();
+    struct ntuser_thread_info *thread_info = NtUserGetThreadInfo();
 
     if (!thread_info->msg_window) get_desktop_window(); /* trigger creation */
-    return thread_info->msg_window;
+    return UlongToHandle( thread_info->msg_window );
 }
 
 /***********************************************************************
@@ -442,11 +443,11 @@ HWND get_full_window_handle( HWND hwnd )
  */
 BOOL is_desktop_window( HWND hwnd )
 {
-    struct user_thread_info *thread_info = get_user_thread_info();
+    struct ntuser_thread_info *thread_info = NtUserGetThreadInfo();
 
     if (!hwnd) return FALSE;
-    if (hwnd == thread_info->top_window) return TRUE;
-    if (hwnd == thread_info->msg_window) return TRUE;
+    if (hwnd == UlongToHandle( thread_info->top_window )) return TRUE;
+    if (hwnd == UlongToHandle( thread_info->msg_window )) return TRUE;
 
     if (!HIWORD(hwnd) || HIWORD(hwnd) == 0xffff)
     {
@@ -668,6 +669,17 @@ HWND WINAPI NtUserSetParent( HWND hwnd, HWND parent )
 
     set_window_pos( &winpos, new_screen_rect.left - old_screen_rect.left,
                     new_screen_rect.top - old_screen_rect.top );
+
+    {
+        WCHAR name[32];
+        UNICODE_STRING us = { 0, sizeof(name), name };
+
+        if (NtUserGetClassName( hwnd, FALSE, &us ) && ( !wcscmp( us.Buffer, u"SyberiaRenderWindowClass" ) || !wcscmp( us.Buffer, u"Post MortemRenderWindowClass" ) ))
+        {
+            ERR( "HACK: Hiding window.\n" );
+            was_visible = FALSE;
+        }
+    }
 
     if (was_visible) NtUserShowWindow( hwnd, SW_SHOW );
 
@@ -1113,23 +1125,26 @@ static HWND get_last_active_popup( HWND hwnd )
     return retval;
 }
 
-static BOOL get_window_extra( HWND hwnd, WND *win, UINT offset, UINT size, LONG_PTR *ret, BOOL internal )
+static LONG_PTR get_win_data( const void *ptr, UINT size )
 {
-    struct object_lock lock = OBJECT_LOCK_INIT;
-    const window_shm_t *window_shm = NULL;
-    BOOL valid = FALSE;
-    UINT status;
-
-    while ((status = get_shared_window( hwnd, &lock, &window_shm )) == STATUS_PENDING)
+    if (size == sizeof(WORD))
     {
-        valid = size <= win->cbWndExtra && offset <= win->cbWndExtra - size &&
-                (internal || offset >= window_shm->private_size);
-        if (valid) memcpy( ret, (char *)win->wExtra + offset, size );
+        WORD ret;
+        memcpy( &ret, ptr, sizeof(ret) );
+        return ret;
     }
-
-    if (status) RtlSetLastWin32Error( ERROR_INVALID_WINDOW_HANDLE );
-    else if (!valid) RtlSetLastWin32Error( ERROR_INVALID_INDEX );
-    return valid;
+    else if (size == sizeof(DWORD))
+    {
+        DWORD ret;
+        memcpy( &ret, ptr, sizeof(ret) );
+        return ret;
+    }
+    else
+    {
+        LONG_PTR ret;
+        memcpy( &ret, ptr, sizeof(ret) );
+        return ret;
+    }
 }
 
 /* helper for set_window_long */
@@ -1161,18 +1176,7 @@ BOOL is_zoomed( HWND hwnd )
     return (get_window_long( hwnd, GWL_STYLE ) & WS_MAXIMIZE) != 0;
 }
 
-UINT get_window_fnid( HWND hwnd )
-{
-    struct object_lock lock = OBJECT_LOCK_INIT;
-    const window_shm_t *window_shm = NULL;
-    UINT status, fnid = 0;
-
-    while ((status = get_shared_window( hwnd, &lock, &window_shm )) == STATUS_PENDING)
-        fnid = window_shm->fnid;
-    return status ? 0 : fnid;
-}
-
-static LONG_PTR get_window_long_size( HWND hwnd, INT offset, UINT size, BOOL ansi, BOOL internal )
+static LONG_PTR get_window_long_size( HWND hwnd, INT offset, UINT size, BOOL ansi )
 {
     LONG_PTR retval = 0;
     WND *win;
@@ -1235,7 +1239,14 @@ static LONG_PTR get_window_long_size( HWND hwnd, INT offset, UINT size, BOOL ans
 
     if (offset >= 0)
     {
-        if (!get_window_extra( hwnd, win, offset, size, &retval, internal )) retval = 0;
+        if (offset > (int)(win->cbWndExtra - size))
+        {
+            WARN("Invalid offset %d\n", offset );
+            release_win_ptr( win );
+            RtlSetLastWin32Error( ERROR_INVALID_INDEX );
+            return 0;
+        }
+        retval = get_win_data( (char *)win->wExtra + offset, size );
         release_win_ptr( win );
         return retval;
     }
@@ -1269,13 +1280,13 @@ static LONG_PTR get_window_long_size( HWND hwnd, INT offset, UINT size, BOOL ans
 /* see GetWindowLongW */
 DWORD get_window_long( HWND hwnd, INT offset )
 {
-    return get_window_long_size( hwnd, offset, sizeof(LONG), FALSE, FALSE );
+    return get_window_long_size( hwnd, offset, sizeof(LONG), FALSE );
 }
 
 /* see GetWindowLongPtr */
 ULONG_PTR get_window_long_ptr( HWND hwnd, INT offset, BOOL ansi )
 {
-    return get_window_long_size( hwnd, offset, sizeof(LONG_PTR), ansi, FALSE );
+    return get_window_long_size( hwnd, offset, sizeof(LONG_PTR), ansi );
 }
 
 /* see GetWindowWord */
@@ -1286,7 +1297,7 @@ static WORD get_window_word( HWND hwnd, INT offset )
         RtlSetLastWin32Error( ERROR_INVALID_INDEX );
         return 0;
     }
-    return get_window_long_size( hwnd, offset, sizeof(WORD), TRUE, FALSE );
+    return get_window_long_size( hwnd, offset, sizeof(WORD), TRUE );
 }
 
 UINT set_window_style_bits( HWND hwnd, UINT set_bits, UINT clear_bits )
@@ -1386,9 +1397,10 @@ static HWND set_window_owner( HWND hwnd, HWND owner )
 }
 
 /* Helper function for SetWindowLong(). */
-static LONG_PTR set_window_long_internal( HWND hwnd, INT offset, UINT size,
-                                          LONG_PTR newval, BOOL ansi, BOOL internal )
+LONG_PTR set_window_long( HWND hwnd, INT offset, UINT size, LONG_PTR newval, BOOL ansi )
 {
+    const char *sgi = getenv( "SteamGameId" );
+
     BOOL ok, made_visible = FALSE, layered = FALSE;
     LONG_PTR retval = 0;
     STYLESTRUCT style;
@@ -1444,6 +1456,10 @@ static LONG_PTR set_window_long_internal( HWND hwnd, INT offset, UINT size,
         if (win->dwStyle & WS_MINIMIZE) newval |= WS_MINIMIZE;
         break;
     case GWL_EXSTYLE:
+        /* FIXME: Layered windows don't work well right now, disable them */
+        if (sgi && !strcmp( sgi, "694280" )) newval &= ~WS_EX_LAYERED;
+        if (sgi && !strcmp( sgi, "312670" )) newval &= ~WS_EX_LAYERED;
+        if (sgi && !strcmp( sgi, "700600" )) newval &= ~WS_EX_LAYERED;
         style.styleOld = win->dwExStyle;
         style.styleNew = newval;
         release_win_ptr( win );
@@ -1486,12 +1502,14 @@ static LONG_PTR set_window_long_internal( HWND hwnd, INT offset, UINT size,
     case GWLP_USERDATA:
         break;
     default:
-        if (!get_window_extra( hwnd, win, offset, size, &retval, internal ))
+        if (offset < 0 || offset > (int)(win->cbWndExtra - size))
         {
+            WARN("Invalid offset %d\n", offset );
             release_win_ptr( win );
+            RtlSetLastWin32Error( ERROR_INVALID_INDEX );
             return 0;
         }
-        if (retval == newval)
+        else if (get_win_data( (char *)win->wExtra + offset, size ) == newval)
         {
             /* already set to the same value */
             release_win_ptr( win );
@@ -1565,39 +1583,6 @@ static LONG_PTR set_window_long_internal( HWND hwnd, INT offset, UINT size,
     }
 
     return retval;
-}
-
-LONG_PTR set_window_long( HWND hwnd, INT offset, UINT size, LONG_PTR newval, BOOL ansi )
-{
-    return set_window_long_internal( hwnd, offset, size, newval, ansi, FALSE );
-}
-
-/**********************************************************************
- *           NtUserSetWindowFNID (win32u.@)
- *
- * fnid parameter not compatible with Windows.
- */
-BOOL WINAPI NtUserSetWindowFNID( HWND hwnd, WORD fnid )
-{
-    BOOL ret;
-
-    TRACE( "%p %x\n", hwnd, fnid );
-
-    if (!(fnid & 0x8000) || (fnid & 0x7fff) >= NTUSER_NB_PROCS)
-    {
-        RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
-        return FALSE;
-    }
-    if (fnid == get_window_fnid( hwnd )) return TRUE;
-
-    SERVER_START_REQ( set_window_fnid )
-    {
-        req->handle = wine_server_user_handle( hwnd );
-        req->atom = get_builtin_class_atom( fnid & 0x7fff );
-        ret = !wine_server_call_err( req );
-    }
-    SERVER_END_REQ;
-    return ret;
 }
 
 /**********************************************************************
@@ -2070,6 +2055,7 @@ static BOOL get_surface_rect( const RECT *visible_rect, RECT *surface_rect )
     /* crop surfaces which are larger than the virtual screen rect, some applications create huge windows */
     if ((surface_rect->right - surface_rect->left > virtual_rect.right - virtual_rect.left ||
          surface_rect->bottom - surface_rect->top > virtual_rect.bottom - virtual_rect.top) &&
+        !force_present_to_surface( visible_rect ) &&
         !intersect_rect( surface_rect, surface_rect, &virtual_rect ))
         return FALSE;
     OffsetRect( surface_rect, -visible_rect->left, -visible_rect->top );
@@ -2111,6 +2097,30 @@ static BOOL get_default_window_surface( HWND hwnd, const RECT *surface_rect, str
     return TRUE;
 }
 
+static BOOL window_clip_client_surfaces( HWND hwnd )
+{
+    WND *win = get_win_ptr( hwnd );
+    RECT win_rect, client_rect;
+    BOOL ret;
+
+    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
+    ret = win->clip_clients;
+    win_rect = win->rects.window;
+    client_rect = win->rects.client;
+    release_win_ptr( win );
+
+#ifdef __OHOS__
+    /* The OHOS compositor has no server-side decorations. Keep a GDI window
+     * surface when there is a non-client area; the GL/Vulkan child surface is
+     * clipped to and composited over the client rect. */
+    if (ret && !EqualRect( &win_rect, &client_rect )) return FALSE;
+#endif
+
+    if (ret) return !force_present_to_surface( &win_rect );
+
+    return ret;
+}
+
 static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOOL create_layered,
                                                   struct window_rects *rects, RECT *surface_rect )
 {
@@ -2119,6 +2129,7 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     struct window_surface *new_surface;
     struct window_rects monitor_rects;
     UINT raw_dpi, style, ex_style;
+    DWORD layered_flags;
     RECT dummy;
     HRGN shape;
 
@@ -2159,7 +2170,13 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     if (IsRectEmpty( surface_rect )) needs_surface = FALSE;
     else if (create_layered || is_layered) needs_surface = TRUE;
 
-    if (needs_surface)
+    if (needs_surface && !is_layered && !create_layered && window_clip_client_surfaces( hwnd )
+        && !(!create_opaque && NtUserGetLayeredWindowAttributes( hwnd, NULL, NULL, &layered_flags ) && layered_flags & LWA_COLORKEY))
+    {
+        if (new_surface) window_surface_release( new_surface );
+        new_surface = NULL;
+    }
+    else if (needs_surface)
         create_window_surface( hwnd, create_layered, surface_rect, raw_dpi, &new_surface );
     else if (new_surface && new_surface != &dummy_surface)
     {
@@ -2268,7 +2285,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         }
         if (new_surface) req->paint_flags |= SET_WINPOS_PAINT_SURFACE;
         if (is_layered) req->paint_flags |= SET_WINPOS_LAYERED_WINDOW;
-        if (win->clip_clients) req->paint_flags |= SET_WINPOS_PIXEL_FORMAT;
+        else if (win->clip_clients) req->paint_flags |= SET_WINPOS_PIXEL_FORMAT;
 
         if ((ret = !wine_server_call( req )))
         {
@@ -2309,7 +2326,23 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
         if (win->dwStyle & WS_THICKFRAME) swp_flags |= WINE_SWP_RESIZABLE;
         if (is_child) monitor_rects = map_dpi_window_rects( *new_rects, dpi, raw_dpi );
-        else if (!IsRectEmpty( &win->present_rect ))
+        /* WineHua: 最小化窗口不做 present_rect 替换。
+         *
+         * 问题: 独占全屏呈现的游戏 (war3 等) 最小化后, 从任务栏还原会黑屏,
+         * 且点击窗口又自动最小化, 永远无法恢复。
+         *
+         * 机理: 本分支把呈报给驱动的 rect 替换为整个显示器矩形, 是全屏呈现
+         * 的正确行为; 但游戏被最小化后 present_rect 并不清除 (游戏仍在渲染),
+         * 于是最小化期间驱动拿到的仍是显示器矩形而非 -32000 哨兵位。
+         * winewayland 的「最小化→还原」握手 (window.c restoring_from_minimize)
+         * 依赖驱动侧 rect 停在哨兵位才向 Win32 发 SC_RESTORE; 条件恒不成立 →
+         * WS_MINIMIZE 永远清不掉 → wined3d 客户区缩成 1x1 不恢复 (黑屏),
+         * 且每次状态更新重发 xdg_toplevel_set_minimized (点击再最小化)。
+         *
+         * 解决: 最小化窗口没有呈现区域可言, 豁免 present_rect 替换, 让驱动
+         * 拿到真实 (哨兵) rect, 上游还原握手即可按原设计工作。还原后窗口
+         * 不再是 WS_MINIMIZE, 后续 SWP 自动恢复显示器矩形呈报, 无副作用。 */
+        else if (!IsRectEmpty( &win->present_rect ) && !(win->dwStyle & WS_MINIMIZE))
         {
             MONITORINFO monitor_info = monitor_info_from_rect( new_rects->window, dpi );
             struct window_rects rects = { monitor_info.rcMonitor, monitor_info.rcMonitor, monitor_info.rcMonitor };
@@ -2647,7 +2680,7 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
     apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, NULL );
     if (!surface) return FALSE;
 
-    if (!hdc_src || surface == &dummy_surface || NtUserWindowFromDC( hdc_src ) == hwnd)
+    if (!hdc_src || surface == &dummy_surface)
     {
         user_driver->pUpdateLayeredWindow( hwnd, source_alpha, flags );
         ret = TRUE;
@@ -4807,6 +4840,26 @@ static BOOL show_window( HWND hwnd, INT cmd )
         }
     }
 
+    /* HACK for Bug 26340 - RPGMaker Engine games minimize out of interactivity on gamescope.
+     *
+     * Revert this when https://github.com/ValveSoftware/gamescope/pull/2237 has been widely deployed.
+     * */
+    if (cmd == SW_MINIMIZE && user_driver->pHasWindowManager( "steamcompmgr" ))
+    {
+        const char *sgi = getenv( "SteamGameId" );
+        if (sgi && (
+            !strcmp( sgi, "2939770" )       /* Labyrinth Flowers */
+            || !strcmp( sgi, "3531980" )    /* Obscurite Magie 3: The Divine Stones */
+            || !strcmp( sgi, "2997780" )    /* Pixel Pixie */
+            || !strcmp( sgi, "3561800" )    /* Hero in an All-Forgiving Fantasy World RPG */
+            || !strcmp( sgi, "2992490" )    /* Epic Quest - Definitive Edition */
+            || !strcmp( sgi, "2138140" )    /* Didactic Jesus Game */
+            || !strcmp( sgi, "2208730" )    /* Raiders of Ruin */
+            || !strcmp( sgi, "782330" )     /* DOOM Eternal */
+            ))
+            goto done;
+    }
+
     switch(cmd)
     {
     case SW_HIDE:
@@ -5110,7 +5163,7 @@ BOOL WINAPI NtUserFlashWindowEx( FLASHWINFO *info )
         release_win_ptr( win );
 
         if (!info->dwFlags || info->dwFlags & FLASHW_CAPTION)
-            send_message( hwnd, WM_NCACTIVATE, wparam, 0 );
+            send_notify_message( hwnd, WM_NCACTIVATE, wparam, 0, 0 );
 
         user_driver->pFlashWindowEx( info );
         return wparam;
@@ -5569,19 +5622,20 @@ static WND *create_window_handle( HWND parent, HWND owner, UNICODE_STRING *name,
 
     if (!parent)  /* if parent is 0 we don't have a desktop window yet */
     {
-        struct user_thread_info *thread_info = get_user_thread_info();
+        struct ntuser_thread_info *thread_info = NtUserGetThreadInfo();
 
         if (is_desktop_class( name ))
         {
-            if (!thread_info->top_window) thread_info->top_window = full_parent ? full_parent : handle;
-            else assert( full_parent == thread_info->top_window );
+            if (!thread_info->top_window) thread_info->top_window = HandleToUlong( full_parent ? full_parent : handle );
+            else assert( full_parent == UlongToHandle( thread_info->top_window ));
             if (!thread_info->top_window) ERR_(win)( "failed to create desktop window\n" );
-            else user_driver->pSetDesktopWindow( thread_info->top_window );
+            else user_driver->pSetDesktopWindow( UlongToHandle( thread_info->top_window ));
             register_builtin_classes();
         }
         else  /* HWND_MESSAGE parent */
         {
-            if (!thread_info->msg_window && !full_parent) thread_info->msg_window = handle;
+            if (!thread_info->msg_window && !full_parent)
+                thread_info->msg_window = HandleToUlong( handle );
         }
     }
 
@@ -5618,7 +5672,7 @@ static void fix_cs_coordinates( CREATESTRUCTW *cs, INT *sw )
     }
     else  /* overlapped window */
     {
-        RTL_USER_PROCESS_PARAMETERS *params = RtlGetCurrentPeb()->ProcessParameters;
+        RTL_USER_PROCESS_PARAMETERS *params = NtCurrentTeb()->Peb->ProcessParameters;
         MONITORINFO mon_info;
 
         if (!is_default_coord( cs->x ) && !is_default_coord( cs->cx ) && !is_default_coord( cs->cy ))
@@ -5680,6 +5734,53 @@ static void map_dpi_create_struct( CREATESTRUCTW *cs, UINT dpi_to )
     cs->cy = rect.bottom - rect.top;
 }
 
+int disable_gamescope_max_size_hack(void)
+{
+    static int cached = -1;
+
+    if (cached == -1)
+    {
+        const char *s = getenv( "WINE_DISABLE_GAMESCOPE_MAX_SIZE_HACK" );
+
+        cached = s && *s != '0';
+    }
+
+    return cached;
+}
+
+static void style_fixup_workarounds( CREATESTRUCTW *cs, const UNICODE_STRING *class_name )
+{
+    static const WCHAR BlockClickMASKWndW[] = {'B','l','o','c','k','C','l','i','c','k','M','A','S','K','W','n','d'};
+    static const struct
+    {
+        const WCHAR *class_name;
+        const char *wm;
+        const char *game_id;
+        unsigned exstyle;
+    }
+    workarounds[] =
+    {
+        { BlockClickMASKWndW, "steamcompmgr", "3839850", WS_EX_NOACTIVATE },
+    };
+    const char *sgi = getenv( "SteamGameId" );
+    unsigned int i;
+
+    if (class_name->Buffer == (LPCWSTR)DESKTOP_CLASS_ATOM) return;
+
+    for (i = 0; i < ARRAY_SIZE(workarounds); ++i)
+    {
+        if ((!workarounds[i].wm || user_driver->pHasWindowManager( workarounds[i].wm ))
+            && (!workarounds[i].game_id || (sgi && !strcmp( sgi, workarounds[i].game_id )))
+            && (!workarounds[i].class_name ||
+                 (class_name->Length == wcslen( workarounds[i].class_name ) * sizeof(WCHAR)
+                 && !memcmp( class_name->Buffer, workarounds[i].class_name, class_name->Length ))))
+        {
+            FIXME( "HACK: adding %#x exstyle for %s.\n", workarounds[i].exstyle, debugstr_w( cs->lpszClass ));
+            cs->dwExStyle |= workarounds[i].exstyle;
+        }
+    }
+}
+
 /***********************************************************************
  *           NtUserCreateWindowEx (win32u.@)
  */
@@ -5716,6 +5817,8 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
     cs.y  = y;
     cs.cx = cx;
     cs.cy = cy;
+
+    style_fixup_workarounds( &cs, class_name );
 
     /* Find the parent window */
     if (parent == HWND_MESSAGE)
@@ -5868,8 +5971,18 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
     if ((cs.style & WS_THICKFRAME) || !(cs.style & (WS_POPUP | WS_CHILD)))
     {
         MINMAXINFO info = get_min_max_info( hwnd );
-        cx = max( min( cx, info.ptMaxTrackSize.x ), info.ptMinTrackSize.x );
-        cy = max( min( cy, info.ptMaxTrackSize.y ), info.ptMinTrackSize.y );
+
+        /* HACK: This code changes the window's size to fit the display. However,
+         * some games (Bayonetta, Dragon's Dogma) will then have the incorrect
+         * render size. So just let windows be too big to fit the display. */
+        if (disable_gamescope_max_size_hack() || !user_driver->pHasWindowManager( "steamcompmgr" ))
+        {
+            cx = min( cx, info.ptMaxTrackSize.x );
+            cy = min( cy, info.ptMaxTrackSize.y );
+        }
+
+        cx = max( cx, info.ptMinTrackSize.x );
+        cy = max( cy, info.ptMinTrackSize.y );
     }
 
     if (cx < 0) cx = 0;
@@ -6170,7 +6283,7 @@ ULONG_PTR WINAPI NtUserCallHwndParam( HWND hwnd, DWORD_PTR param, DWORD code )
         return get_window_info( hwnd, (WINDOWINFO *)param );
 
     case NtUserCallHwndParam_GetWindowLongA:
-        return get_window_long_size( hwnd, param, sizeof(LONG), TRUE, FALSE );
+        return get_window_long_size( hwnd, param, sizeof(LONG), TRUE );
 
     case NtUserCallHwndParam_GetWindowLongW:
         return get_window_long( hwnd, param );
@@ -6246,25 +6359,15 @@ ULONG_PTR WINAPI NtUserCallHwndParam( HWND hwnd, DWORD_PTR param, DWORD code )
     case NtUserCallHwndParam_GetWinMonitorDpi:
     {
         UINT raw_dpi, dpi = get_win_monitor_dpi( hwnd, &raw_dpi );
-        return param == MDT_EFFECTIVE_DPI ? dpi : raw_dpi;
+        if (param == MDT_EFFECTIVE_DPI) return dpi;
+        if (param == MDT_WINE_RAW_DPI) return raw_dpi;
+        return round_fractional_dpi( raw_dpi );
     }
 
     case NtUserCallHwndParam_SetRawWindowPos:
     {
         struct set_raw_window_pos_params *params = (void *)param;
         return set_raw_window_pos( hwnd, params->rect, params->flags, params->internal );
-    }
-
-    case NtUserCallHwndParam_GetPrivateData:
-    {
-        struct get_private_data_params *params = (void *)param;
-        return get_window_long_size( hwnd, params->offset, params->size, FALSE, TRUE );
-    }
-
-    case NtUserCallHwndParam_SetPrivateData:
-    {
-        struct set_private_data_params *params = (void *)param;
-        return set_window_long_internal( hwnd, params->offset, params->size, params->value, FALSE, TRUE );
     }
 
     default:

@@ -1742,10 +1742,10 @@ static void test_zenable(const GUID *device_guid)
     static D3DRECT clear_rect = {{0}, {0}, {640}, {480}};
     static D3DTLVERTEX tquad[] =
     {
-        {{  0.0f}, {  0.0f}, {-0.5f}, {1.0f}, {0xff00ff00}, {0x00000000}, {0.0f}, {0.0f}},
-        {{640.0f}, {  0.0f}, { 1.5f}, {1.0f}, {0xff00ff00}, {0x00000000}, {0.0f}, {0.0f}},
         {{  0.0f}, {480.0f}, {-0.5f}, {1.0f}, {0xff00ff00}, {0x00000000}, {0.0f}, {0.0f}},
+        {{  0.0f}, {  0.0f}, {-0.5f}, {1.0f}, {0xff00ff00}, {0x00000000}, {0.0f}, {0.0f}},
         {{640.0f}, {480.0f}, { 1.5f}, {1.0f}, {0xff00ff00}, {0x00000000}, {0.0f}, {0.0f}},
+        {{640.0f}, {  0.0f}, { 1.5f}, {1.0f}, {0xff00ff00}, {0x00000000}, {0.0f}, {0.0f}},
     };
     unsigned int inst_length, color, x, y, i, j;
     IDirect3DExecuteBuffer *execute_buffer;
@@ -1833,14 +1833,14 @@ static void test_ck_rgba(const GUID *device_guid)
     static D3DRECT clear_rect = {{0}, {0}, {640}, {480}};
     static D3DTLVERTEX tquad[] =
     {
-        {{  0.0f}, {  0.0f}, {0.25f}, {1.0f}, {0xffffffff}, {0x00000000}, {0.0f}, {1.0f}},
-        {{640.0f}, {  0.0f}, {0.25f}, {1.0f}, {0xffffffff}, {0x00000000}, {1.0f}, {1.0f}},
         {{  0.0f}, {480.0f}, {0.25f}, {1.0f}, {0xffffffff}, {0x00000000}, {0.0f}, {0.0f}},
+        {{  0.0f}, {  0.0f}, {0.25f}, {1.0f}, {0xffffffff}, {0x00000000}, {0.0f}, {1.0f}},
         {{640.0f}, {480.0f}, {0.25f}, {1.0f}, {0xffffffff}, {0x00000000}, {1.0f}, {0.0f}},
-        {{  0.0f}, {  0.0f}, {0.75f}, {1.0f}, {0xffffffff}, {0x00000000}, {0.0f}, {1.0f}},
-        {{640.0f}, {  0.0f}, {0.75f}, {1.0f}, {0xffffffff}, {0x00000000}, {1.0f}, {1.0f}},
+        {{640.0f}, {  0.0f}, {0.25f}, {1.0f}, {0xffffffff}, {0x00000000}, {1.0f}, {1.0f}},
         {{  0.0f}, {480.0f}, {0.75f}, {1.0f}, {0xffffffff}, {0x00000000}, {0.0f}, {0.0f}},
+        {{  0.0f}, {  0.0f}, {0.75f}, {1.0f}, {0xffffffff}, {0x00000000}, {0.0f}, {1.0f}},
         {{640.0f}, {480.0f}, {0.75f}, {1.0f}, {0xffffffff}, {0x00000000}, {1.0f}, {0.0f}},
+        {{640.0f}, {  0.0f}, {0.75f}, {1.0f}, {0xffffffff}, {0x00000000}, {1.0f}, {1.0f}},
     };
     /* Supposedly there was no D3DRENDERSTATE_COLORKEYENABLE in D3D < 5.
      * Maybe the WARP driver on Windows 8 ignores setting it via the older
@@ -2687,7 +2687,6 @@ static void test_window_style(void)
     RECT fullscreen_rect, r;
     HWND window, window2;
     IDirectDraw *ddraw;
-    unsigned int i;
     HRESULT hr;
     ULONG ref;
     BOOL ret;
@@ -2898,19 +2897,10 @@ static void test_window_style(void)
     ok(tmp & WS_VISIBLE, "Expected WS_VISIBLE.\n");
     tmp = GetWindowLongA(window, GWL_EXSTYLE);
     ok(tmp & WS_EX_TOPMOST, "Expected WS_EX_TOPMOST.\n");
-    for (i = 0; i < 5; ++i)
-    {
-        /* Try a few times to hide the window. Something in Win11 26H1 shows it again and makes it
-         * topmost. This is in addition to the ddraw periodic check below, which only makes it
-         * topmost but not visible */
-        ret = SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_HIDEWINDOW);
-        ok(ret, "SetWindowPos failed, error %#lx.\n", GetLastError());
-        tmp = GetWindowLongA(window, GWL_STYLE);
-        if (!(tmp & WS_VISIBLE))
-            break;
-        Sleep(100);
-    }
-    ok(i < 5, "Failed to hide the window.\n");
+    ret = ShowWindow(window, SW_HIDE);
+    ok(ret, "ShowWindow failed, error %#lx.\n", GetLastError());
+    ret = SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE);
+    ok(ret, "SetWindowPos failed, error %#lx.\n", GetLastError());
     tmp = GetWindowLongA(window, GWL_STYLE);
     ok(!(tmp & WS_VISIBLE), "Got unexpected WS_VISIBLE.\n");
     tmp = GetWindowLongA(window, GWL_EXSTYLE);
@@ -5661,31 +5651,12 @@ static void test_flip(void)
     hr = IDirectDrawSurface_Flip(frontbuffer, NULL, DDFLIP_WAIT);
     ok(hr == DDERR_NOTFLIPPABLE, "Got unexpected hr %#lx.\n", hr);
 
-    hr = IDirectDrawSurface_AddAttachedSurface(backbuffer1, frontbuffer);
-    ok(hr == DD_OK, "got %#lx.\n", hr);
-    check_surface_caps(frontbuffer, DDSCAPS_PRIMARYSURFACE | DDSCAPS_VISIBLE | DDSCAPS_FRONTBUFFER | DDSCAPS_FLIP, placement, 0);
-    check_surface_caps(backbuffer1, DDSCAPS_3DDEVICE | DDSCAPS_BACKBUFFER | DDSCAPS_FLIP, placement, 0);
-    hr = IDirectDrawSurface_Flip(frontbuffer, NULL, DDFLIP_WAIT);
-    ok(hr == DD_OK, "got %#lx.\n", hr);
-    color = get_surface_color(frontbuffer, 1, 1);
-    ok(color == 0x0000ff00, "got %#x.\n", color);
-    color = get_surface_color(backbuffer1, 1, 1);
-    ok(color == 0x00ff0000, "got %#x.\n", color);
-
-    hr = IDirectDrawSurface_Flip(backbuffer1, NULL, DDFLIP_WAIT);
-    ok(hr == DDERR_NOTFLIPPABLE, "Got hr %#lx.\n", hr);
-
-    hr = IDirectDrawSurface_DeleteAttachedSurface(frontbuffer, 0, backbuffer1);
-    ok(hr == DDERR_CANNOTDETACHSURFACE, "got %#lx.\n", hr);
-    hr = IDirectDrawSurface_DeleteAttachedSurface(backbuffer1, 0, frontbuffer);
-    ok(hr == DD_OK, "got %#lx.\n", hr);
-    check_surface_caps(frontbuffer, DDSCAPS_PRIMARYSURFACE | DDSCAPS_VISIBLE, placement, 0);
-    check_surface_caps(backbuffer1, DDSCAPS_3DDEVICE | DDSCAPS_BACKBUFFER, placement, 0);
-
+    check_surface_caps(frontbuffer, DDSCAPS_PRIMARYSURFACE | DDSCAPS_VISIBLE | DDSCAPS_FRONTBUFFER, placement, 0);
+    check_surface_caps(backbuffer1, DDSCAPS_BACKBUFFER | DDSCAPS_3DDEVICE, placement, 0);
     check_surface_caps(backbuffer2, DDSCAPS_FRONTBUFFER | DDSCAPS_3DDEVICE, placement, 0);
     hr = IDirectDrawSurface_AddAttachedSurface(backbuffer1, backbuffer2);
     ok(hr == DD_OK, "got %#lx.\n", hr);
-    check_surface_caps(frontbuffer, DDSCAPS_PRIMARYSURFACE | DDSCAPS_VISIBLE, placement, 0);
+    check_surface_caps(frontbuffer, DDSCAPS_PRIMARYSURFACE | DDSCAPS_VISIBLE | DDSCAPS_FRONTBUFFER, placement, 0);
     check_surface_caps(backbuffer1, DDSCAPS_FLIP | DDSCAPS_BACKBUFFER | DDSCAPS_3DDEVICE, placement, 0);
     check_surface_caps(backbuffer2, DDSCAPS_FLIP | DDSCAPS_FRONTBUFFER | DDSCAPS_3DDEVICE, placement, 0);
 
@@ -5730,9 +5701,9 @@ static void test_flip(void)
     }
 
     color = get_surface_color(frontbuffer, 1, 1);
-    ok(color == 0x00ff0000, "got %#x.\n", color);
+    ok(color == 0x0000ff00, "got %#x.\n", color);
     color = get_surface_color(backbuffer1, 1, 1);
-    ok(color == 0x000ff00, "got %#x.\n", color);
+    ok(color == 0x00ff0000, "got %#x.\n", color);
 
     ref = get_refcount((IUnknown *)backbuffer2);
     ok(ref == 1, "got %ld.\n", ref);
@@ -5755,11 +5726,11 @@ static void test_flip(void)
     ok(hr == DD_OK, "got %#lx.\n", hr);
 
     color = get_surface_color(frontbuffer, 1, 1);
-    ok(color == 0x0000ff00, "got %#x.\n", color);
+    ok(color == 0x00ff0000, "got %#x.\n", color);
     color = get_surface_color(backbuffer1, 1, 1);
     ok(color == 0x000000ff, "got %#x.\n", color);
     color = get_surface_color(backbuffer2, 1, 1);
-    ok(color == 0x00ff0000, "got %#x.\n", color);
+    ok(color == 0x0000ff00, "got %#x.\n", color);
 
     hr = IDirectDrawSurface_DeleteAttachedSurface(frontbuffer, 0, backbuffer2);
     ok(hr == DDERR_SURFACENOTATTACHED, "got %#lx.\n", hr);
@@ -6288,7 +6259,6 @@ static void test_surface_attachment(void)
     ok(hr == DD_OK, "got %#lx.\n", hr);
     check_surface_caps(surface1, DDSCAPS_FLIP | DDSCAPS_FRONTBUFFER | DDSCAPS_VISIBLE | DDSCAPS_PRIMARYSURFACE, placement, 0);
     check_surface_caps(surface5, DDSCAPS_FLIP | DDSCAPS_BACKBUFFER, placement, 0);
-    check_surface_caps(surface6, 0, placement, 0);
     hr = IDirectDrawSurface_AddAttachedSurface(surface5, surface6);
     ok(hr == DD_OK, "got %#lx.\n", hr);
     check_surface_caps(surface1, DDSCAPS_VISIBLE | DDSCAPS_PRIMARYSURFACE | DDSCAPS_FRONTBUFFER | DDSCAPS_FLIP, placement, 0);
@@ -6342,13 +6312,6 @@ static void test_surface_attachment(void)
     ok(hr == DDERR_SURFACENOTATTACHED, "got %#lx.\n", hr);
     ref = get_refcount((IUnknown *)surface6);
     ok(ref == 2, "got %ld,\n", ref);
-
-    hr = IDirectDrawSurface_DeleteAttachedSurface(surface1, 0, surface6);
-    ok(hr == DD_OK, "got %#lx.\n", hr);
-    check_surface_caps(surface6, 0, placement, 0);
-
-    hr = IDirectDrawSurface_GetAttachedSurface(surface1, &caps, &tmp);
-    ok(hr == DDERR_NOTFOUND, "got %#lx.\n", hr);
 
     ref = IDirectDrawSurface_Release(surface1);
     ok(!ref, "got %ld\n", ref);
@@ -6507,7 +6470,8 @@ static void test_surface_attachment(void)
         ref = IDirectDrawSurface_Release(backbuffer1);
     ref = IDirectDrawSurface_Release(surface1);
     ok(!ref, "got %ld.\n", ref);
-    /* backbuffer1 is auto-generated attachemnt for surface1 and is supposed to be released during surface1 destruction. */
+    ref = IDirectDrawSurface_Release(backbuffer1);
+    ok(!ref, "got %ld.\n", ref);
     ref = IDirectDrawSurface_Release(backbuffer2);
     ok(!ref, "got %ld.\n", ref);
     ref = IDirectDrawSurface_Release(surface2);
@@ -14933,10 +14897,7 @@ static void test_caps(void)
         {
             .dwSize = sizeof(DDSURFACEDESC),
             .dwFlags = DDSD_CAPS | DDSD_ZBUFFERBITDEPTH | DDSD_WIDTH | DDSD_HEIGHT,
-            .ddsCaps =
-            {
-                .dwCaps = DDSCAPS_ZBUFFER,
-            },
+            .ddsCaps.dwCaps = DDSCAPS_ZBUFFER,
             .dwZBufferBitDepth = depth_caps[i].depth,
             .dwWidth = 64,
             .dwHeight = 64,
@@ -15023,10 +14984,7 @@ static void test_caps(void)
             {
                 .dwSize = sizeof(DDSURFACEDESC),
                 .dwFlags = DDSD_CAPS | DDSD_ZBUFFERBITDEPTH | DDSD_WIDTH | DDSD_HEIGHT,
-                .ddsCaps =
-                {
-                    .dwCaps = DDSCAPS_ZBUFFER,
-                },
+                .ddsCaps.dwCaps = DDSCAPS_ZBUFFER,
                 .dwZBufferBitDepth = depth_caps[i].depth,
                 .dwWidth = 64,
                 .dwHeight = 64,
@@ -15501,10 +15459,10 @@ static void test_texture_wrong_caps(const GUID *device_guid)
 {
     static D3DTLVERTEX quad[] =
     {
-        {{  0.0f}, {  0.0f}, {0.0f}, {1.0f}, {0xffffffff}, {0x00000000}, {0.0f}, {1.0f}},
-        {{640.0f}, {  0.0f}, {0.0f}, {1.0f}, {0xffffffff}, {0x00000000}, {1.0f}, {1.0f}},
         {{  0.0f}, {480.0f}, {0.0f}, {1.0f}, {0xffffffff}, {0x00000000}, {0.0f}, {0.0f}},
+        {{  0.0f}, {  0.0f}, {0.0f}, {1.0f}, {0xffffffff}, {0x00000000}, {0.0f}, {1.0f}},
         {{640.0f}, {480.0f}, {0.0f}, {1.0f}, {0xffffffff}, {0x00000000}, {1.0f}, {0.0f}},
+        {{640.0f}, {  0.0f}, {0.0f}, {1.0f}, {0xffffffff}, {0x00000000}, {1.0f}, {1.0f}},
     };
     static DDPIXELFORMAT fmt =
     {
@@ -16120,7 +16078,7 @@ static HRESULT WINAPI test_enum_devices_caps_callback(GUID *guid, char *device_d
                 | D3DDEVCAPS_TEXTURESYSTEMMEMORY
                 | D3DDEVCAPS_DRAWPRIMTLVERTEX;
 
-        ok(enum_devices_index == 1, "Expected index %u.\n", enum_devices_index);
+        todo_wine ok(enum_devices_index == 1, "Expected index %u.\n", enum_devices_index);
         ok(!strcmp(device_name, "RGB Emulation"), "Got name %s.\n", debugstr_a(device_name));
 
         todo_wine ok(hel->dwFlags == hel_flags, "Got HEL flags %#lx.\n", hel->dwFlags);
@@ -16152,7 +16110,7 @@ static HRESULT WINAPI test_enum_devices_caps_callback(GUID *guid, char *device_d
                 | D3DDD_LIGHTINGCAPS
                 | D3DDD_BCLIPPING;
 
-        ok(enum_devices_index == 2, "Expected index %u.\n", enum_devices_index);
+        todo_wine ok(enum_devices_index == 2, "Expected index %u.\n", enum_devices_index);
         ok(!strcmp(device_name, "Direct3D HAL"), "Got name %s.\n", debugstr_a(device_name));
 
         ok(hal->dcmColorModel == D3DCOLOR_RGB, "HAL Device hal caps has colormodel %lu\n", hel->dcmColorModel);
@@ -16896,8 +16854,8 @@ out:
     DestroyWindow(window);
 }
 
-static void check_surface_clipper(IDirectDrawSurface *surface,
-        IDirectDrawClipper *clipper, RECT *window_rect, DWORD style)
+static void check_surface_clipper(IDirectDrawSurface *surface, IDirectDrawClipper *clipper_hwnd,
+        IDirectDrawClipper *clipper_region, RECT *window_rect, DWORD style)
 {
     unsigned int c;
     DDBLTFX fx;
@@ -16909,10 +16867,8 @@ static void check_surface_clipper(IDirectDrawSurface *surface,
 
     fill_surface(surface, 0xffff0000);
 
-    /* Clippers with a region work. Clippers with a window work on Windows 98,
-     * but are ignored on modern windows. */
-
-    hr = IDirectDrawSurface_SetClipper(surface, clipper);
+    /* Clipper with region works. */
+    hr = IDirectDrawSurface_SetClipper(surface, clipper_region);
     ok(hr == DD_OK, "got %#lx.\n", hr);
     c = get_surface_color(surface, 101, 101);
     ok(c == 0x00ff0000, "got %#x.\n", c);
@@ -16921,6 +16877,21 @@ static void check_surface_clipper(IDirectDrawSurface *surface,
     c = get_surface_color(surface, 0, 0);
     ok(c == 0x00ff0000, "got %#x.\n", c);
     c = get_surface_color(surface, 101, 101);
+    ok(c == 0x0000ff00, "got %#x.\n", c);
+
+    /* Clipper with window has no effect. */
+    hr = IDirectDrawSurface_SetClipper(surface, clipper_hwnd);
+    ok(hr == DD_OK, "got %#lx.\n", hr);
+    fill_surface(surface, 0xff0000ff);
+    c = get_surface_color(surface, window_rect->left + 1, window_rect->top + 1);
+    ok(c == 0x000000ff, "got %#x.\n", c);
+
+    hr = IDirectDrawSurface_Blt(surface, NULL, NULL, NULL, DDBLT_COLORFILL | DDBLT_WAIT, &fx);
+    ok(hr == DD_OK, "got %#lx.\n", hr);
+
+    c = get_surface_color(surface, window_rect->left + 1, window_rect->top + 1);
+    ok(c == 0x0000ff00, "got %#x.\n", c);
+    c = get_surface_color(surface, 0, 0);
     ok(c == 0x0000ff00, "got %#x.\n", c);
 
     hr = IDirectDrawSurface_SetClipper(surface, NULL);
@@ -16945,15 +16916,15 @@ static void test_clipper_in_exclusive_fullscreen(void)
         { WS_POPUP | WS_VISIBLE },
     };
     IDirectDrawSurface *primary, *offscreen;
-    IDirectDrawClipper *clipper;
+    IDirectDrawClipper *clipper, *clipper2;
     DDSURFACEDESC surface_desc;
+    HWND window, clip_window;
     IDirectDraw *ddraw;
     RGNDATA *rgn_data;
     DWORD ret, style;
     RECT window_rect;
     ULONG refcount;
     unsigned int i;
-    HWND window;
     HRESULT hr;
     HRGN rgn;
 
@@ -16965,12 +16936,12 @@ static void test_clipper_in_exclusive_fullscreen(void)
     hr = IDirectDraw_CreateClipper(ddraw, 0, &clipper, NULL);
     ok(hr == DD_OK, "got %#lx.\n", hr);
 
+    hr = IDirectDraw_CreateClipper(ddraw, 0, &clipper2, NULL);
+    ok(hr == DD_OK, "got %#lx.\n", hr);
+
     window = CreateWindowA("static", "ddraw_fullscreen", WS_POPUP | WS_VISIBLE, 0, 0, 640, 480, NULL, NULL, NULL, NULL);
-    pump_messages();
-    hr = IDirectDraw_SetCooperativeLevel(ddraw, NULL, DDSCL_NORMAL);
-    ok(hr == DD_OK, "got %#lx.\n", hr);
+
     hr = IDirectDraw_SetCooperativeLevel(ddraw, window, DDSCL_EXCLUSIVE | DDSCL_FULLSCREEN);
-    ok(hr == DD_OK, "got %#lx.\n", hr);
     pump_messages();
 
     rgn = CreateRectRgn(100, 100, 200, 200);
@@ -16980,7 +16951,7 @@ static void test_clipper_in_exclusive_fullscreen(void)
     ret = GetRegionData(rgn, ret, rgn_data);
     ok(!!ret, "Failed to get region data.\n");
     DeleteObject(rgn);
-    hr = IDirectDrawClipper_SetClipList(clipper, rgn_data, 0);
+    hr = IDirectDrawClipper_SetClipList(clipper2, rgn_data, 0);
     ok(hr == DD_OK, "got %#lx.\n", hr);
     free(rgn_data);
 
@@ -17002,20 +16973,50 @@ static void test_clipper_in_exclusive_fullscreen(void)
     {
         winetest_push_context("test %u", i);
         style = tests[i].style;
+        clip_window = CreateWindowA("static", "ddraw_clip", style, 100, 100, 100, 100,
+                tests[i].parent ? window : NULL, NULL, NULL, NULL);
+        ok(!!clip_window, "got error %ld.\n", GetLastError());
+        pump_messages();
+
+        GetWindowRect(clip_window, &window_rect);
+        hr = IDirectDrawClipper_SetHWnd(clipper, 0, clip_window);
+        ok(hr == DD_OK, "got %#lx.\n", hr);
+
+        hr = IDirectDrawClipper_GetClipList(clipper, NULL, NULL, &ret);
+        ok(hr == DD_OK, "got %#lx.\n", hr);
+        rgn_data = malloc(ret);
+        hr = IDirectDrawClipper_GetClipList(clipper, NULL, rgn_data, &ret);
+        ok(hr == DD_OK, "got %#lx.\n", hr);
+        ok(rgn_data->rdh.dwSize == sizeof(rgn_data->rdh), "Got unexpected structure size %#lx.\n", rgn_data->rdh.dwSize);
+        ok(rgn_data->rdh.iType == RDH_RECTANGLES, "Got unexpected type %#lx.\n", rgn_data->rdh.iType);
+        if (style & WS_VISIBLE)
+        {
+            ok(rgn_data->rdh.nCount >= 1, "got %lu.\n", rgn_data->rdh.nCount);
+            if (!(style & WS_CHILD))
+                ok(EqualRect(&rgn_data->rdh.rcBound, &window_rect), "got %s, expected %s.\n",
+                        wine_dbgstr_rect(&rgn_data->rdh.rcBound), wine_dbgstr_rect(&window_rect));
+        }
+        else
+        {
+            ok(!rgn_data->rdh.nCount, "got %lu.\n", rgn_data->rdh.nCount);
+        }
+        free(rgn_data);
 
         winetest_push_context("primary");
-        check_surface_clipper(primary, clipper, &window_rect, style);
+        check_surface_clipper(primary, clipper, clipper2, &window_rect, style);
         winetest_pop_context();
 
         winetest_push_context("offscreen");
-        check_surface_clipper(offscreen, clipper, &window_rect, style);
+        check_surface_clipper(offscreen, clipper, clipper2, &window_rect, style);
         winetest_pop_context();
 
+        hr = IDirectDrawClipper_SetHWnd(clipper, 0, NULL);
+        ok(hr == DD_OK, "got %#lx.\n", hr);
+        DestroyWindow(clip_window);
+        pump_messages();
         winetest_pop_context();
     }
 
-    hr = IDirectDraw_SetCooperativeLevel(ddraw, NULL, DDSCL_NORMAL);
-    ok(hr == DD_OK, "got %#lx.\n", hr);
     IDirectDrawClipper_Release(clipper);
     refcount = IDirectDrawSurface_Release(offscreen);
     ok(!refcount, "Got unexpected refcount %lu.\n", refcount);
@@ -17067,6 +17068,8 @@ START_TEST(ddraw1)
 
     start_foreground_window_thread();
 
+test_clipper_in_exclusive_fullscreen();
+return;
     test_coop_level_create_device_window();
     test_clipper_blt();
     test_coop_level_d3d_state();

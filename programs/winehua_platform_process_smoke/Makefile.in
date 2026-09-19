@@ -1,0 +1,7 @@
+MODULE    = winehua_platform_process_smoke.exe
+IMPORTS   = ws2_32
+
+EXTRADLLFLAGS = -mconsole
+
+SOURCES = \
+	main.c

@@ -47,6 +47,7 @@
 #include <unistd.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "initguid.h"
 #include "qcap_private.h"
 #include "winternl.h"

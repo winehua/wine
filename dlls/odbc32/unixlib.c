@@ -30,6 +30,7 @@
 #include <dlfcn.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winternl.h"
@@ -568,7 +569,7 @@ static WCHAR *get_driver_filename( const WCHAR *name )
         WCHAR buffer[1024];
         KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
 
-        if (wcsicmp( name, drivers.names[i] )) continue;
+        if (wcscmp( name, drivers.names[i] )) continue;
         if ((key_driver = open_key( key_odbcinst, drivers.names[i], wcslen(drivers.names[i]) * sizeof(WCHAR) )))
         {
             if (query_value( key_driver, driverW, sizeof(driverW), info, sizeof(buffer) ) && info->Type == REG_SZ &&
@@ -636,7 +637,6 @@ static void replicate_odbc_to_registry( BOOL is_user, SQLHENV env )
         KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
 
         dir = SQL_FETCH_NEXT;
-        if (!filename) continue;
         if (!query_value( key_sources, dsn, len_dsn * sizeof(WCHAR), info, sizeof(buffer) ) && desc[0])
         {
             set_value( key_sources, dsn, len_dsn * sizeof(WCHAR), REG_SZ, (const BYTE *)desc,

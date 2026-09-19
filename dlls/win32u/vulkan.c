@@ -24,11 +24,25 @@
 
 #include "config.h"
 
+#include <math.h>
 #include <dlfcn.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#ifndef MREMAP_DONTUNMAP
+#define MREMAP_DONTUNMAP 4
+#endif
+
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "win32u_private.h"
 #include "ntuser_private.h"
 
@@ -45,6 +59,107 @@ static struct vulkan_funcs vulkan_funcs;
 WINE_DECLARE_DEBUG_CHANNEL(fps);
 
 static const struct vulkan_driver_funcs *driver_funcs;
+static int fshack_enabled = -1;
+
+#define WINEHUA_VULKAN_SURFACE_TAG UINT64_C(0x5748530000000000)
+#define WINEHUA_VULKAN_SWAPCHAIN_TAG UINT64_C(0x5748430000000000)
+
+static BOOL winehua_vulkan_present_enabled(void)
+{
+    const char *value = getenv("WINEHUA_VULKAN_PRESENT");
+    if (value && value[0] && strcmp(value, "0")) return TRUE;
+    value = getenv("WINEHUA_PRESENT_BACKEND");
+    if (value && (!strcmp(value, "venus_broker_present") ||
+                  !strcmp(value, "venus_direct_present"))) return TRUE;
+
+    /* WineHua launches Windows children through the NCP/Box64 boundary.  A
+     * child created by an already-running wineserver may only retain the
+     * baseline graphics variables, while the per-launch present variable is
+     * not serialized by Wine's Windows environment.  On this product path a
+     * VirGL guest is necessarily paired with the private Venus presenter;
+     * use that stable marker as a final capability fallback.  This keeps the
+     * decision local to WineHua and does not claim native Host WSI support. */
+    value = getenv("WINEHUA_GRAPHICS_BACKEND");
+    if (value && !strcmp(value, "virgl"))
+    {
+        TRACE("WineHua: enabling private Vulkan present from VirGL runtime marker\n");
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL winehua_present_image_trace_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *value = getenv("WINEHUA_DXVK_TRACE_PRESENT_IMAGE");
+        enabled = value && value[0] == '1' && !value[1];
+    }
+    return enabled;
+}
+
+static BOOL winehua_private_surface_handle(VkSurfaceKHR handle)
+{
+    return ((uint64_t)handle & UINT64_C(0xffffffff00000000)) == WINEHUA_VULKAN_SURFACE_TAG;
+}
+
+/* WineHua P0-1 Window Identity Probe (2026-09-17) — diagnostics only.
+ *
+ * Prints one line in the format agreed with the architecture plan so the owner
+ * process (winewayland.drv) and the presenting process (here) can be compared
+ * field by field: HWND, Wine window tree, Wine pids, class/rect, token. */
+static void winehua_log_window_identity(const char *role, HWND hwnd, uint32_t wl_surface_id,
+                                        HANDLE token, uint32_t private_surface)
+{
+    WCHAR class_buf[128] = {0};
+    WCHAR title_buf[128] = {0};
+    UNICODE_STRING class_name = {0};
+    RECT rect = {0}, client = {0};
+    char class_ascii[128] = {0};
+    char title_ascii[128] = {0};
+    HWND hparent, hroot, hrootowner;
+    uint32_t window_win_pid, window_win_pid2, window_tid;
+    unsigned int i;
+
+    if (!hwnd) return;
+
+    class_name.Buffer = class_buf;
+    class_name.MaximumLength = sizeof(class_buf) - sizeof(WCHAR);
+    NtUserGetClassName( hwnd, FALSE, &class_name );
+    NtUserInternalGetWindowText( hwnd, title_buf, 127 );
+    NtUserGetWindowRect( hwnd, &rect, 0 );
+    NtUserGetClientRect( hwnd, &client, 0 );
+    hparent = NtUserGetParent( hwnd );
+    hroot = NtUserGetAncestor( hwnd, 2 /* GA_ROOT */ );
+    hrootowner = NtUserGetAncestor( hwnd, 3 /* GA_ROOTOWNER */ );
+    window_win_pid = (uint32_t)(ULONG_PTR)NtUserQueryWindow( hwnd, WindowProcess );
+    window_win_pid2 = (uint32_t)(ULONG_PTR)NtUserQueryWindow( hwnd, WindowProcess2 );
+    window_tid = (uint32_t)(ULONG_PTR)NtUserQueryWindow( hwnd, WindowThread );
+
+    for (i = 0; i < class_name.Length / sizeof(WCHAR) && i < sizeof(class_ascii) - 1; i++)
+        class_ascii[i] = (class_buf[i] >= 32 && class_buf[i] < 127) ? (char)class_buf[i] : '.';
+    for (i = 0; i < 127 && title_buf[i]; i++)
+        title_ascii[i] = (title_buf[i] >= 32 && title_buf[i] < 127) ? (char)title_buf[i] : '.';
+
+    fprintf( stderr,
+             "WineHuaWindowIdentity: role=%s hostPid=%u winPid=%u hwnd=0x%llx fullHwnd=0x%llx "
+             "windowWinPid=%u windowWinPid2=%u threadId=%u class=%s title=%s "
+             "rect=%d,%d,%dx%d client=%dx%d parent=0x%llx owner=0x%llx root=0x%llx rootOwner=0x%llx "
+             "style=0x%llx exStyle=0x%llx visible=%d wlSurfaceId=%u token=0x%llx privateSurface=%u\n",
+             role, (uint32_t)getpid(),
+             (uint32_t)(uintptr_t)NtCurrentTeb()->ClientId.UniqueProcess,
+             (unsigned long long)(uintptr_t)hwnd, (unsigned long long)(uintptr_t)hwnd,
+             window_win_pid, window_win_pid2, window_tid, class_ascii, title_ascii,
+             (int)rect.left, (int)rect.top, (int)(rect.right - rect.left), (int)(rect.bottom - rect.top),
+             (int)(client.right - client.left), (int)(client.bottom - client.top),
+             (unsigned long long)(uintptr_t)hparent, (unsigned long long)(uintptr_t)hrootowner,
+             (unsigned long long)(uintptr_t)hroot, (unsigned long long)(uintptr_t)hrootowner,
+             (unsigned long long)(ULONG_PTR)NtUserGetWindowLongPtrW( hwnd, -16 /* GWL_STYLE */ ),
+             (unsigned long long)(ULONG_PTR)NtUserGetWindowLongPtrW( hwnd, -20 /* GWL_EXSTYLE */ ),
+             NtUserIsWindowVisible( hwnd ) ? 1 : 0,
+             wl_surface_id, (unsigned long long)(ULONG_PTR)token, private_surface );
+}
 
 static const UINT EXTERNAL_MEMORY_WIN32_BITS = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
@@ -120,6 +235,10 @@ struct device_memory
     struct vulkan_device_memory obj;
     VkDeviceSize size;
     void *vm_map;
+    void *host_map;          /* 64-bit vkMapMemory pointer when WOW64 remapped */
+    BOOL wow64_alias;        /* vm_map shares pages with the Host Vulkan map */
+    BOOL wow64_copy;         /* vm_map is a CPU copy of host_map */
+    struct list wow64_entry;
 
     D3DKMT_HANDLE local;
     D3DKMT_HANDLE global;
@@ -142,6 +261,16 @@ struct surface
     struct vulkan_surface obj;
     struct client_surface *client;
     HWND hwnd;
+    BOOL winehua_private;
+    uint32_t winehua_surface_id;
+    /* WineHua window binding: when the HWND belongs to another process (the CEF
+     * layout: the GPU process presents into the browser process' window), the
+     * private present surface created here does not represent the window.  The
+     * owner publishes its window surface id as a window property (see
+     * winewayland.drv/wayland_surface.c:winehua_publish_window_surface); when we
+     * find it, present under (owner_pid, owner_surface_id) so the Host presenter
+     * and the compositor agree on the window identity without heuristics. */
+    uint32_t winehua_owner_pid;
 };
 
 static struct surface *surface_from_handle( VkSurfaceKHR handle )
@@ -150,17 +279,145 @@ static struct surface *surface_from_handle( VkSurfaceKHR handle )
     return CONTAINING_RECORD( obj, struct surface, obj );
 }
 
+/* Return whether integer scaling is on */
+static BOOL fs_hack_is_integer(void)
+{
+    static int is_int = -1;
+    if (is_int < 0)
+    {
+        const char *e = getenv( "WINE_FULLSCREEN_INTEGER_SCALING" );
+        is_int = e && strcmp( e, "0" );
+        TRACE( "is_integer_scaling: %s\n", is_int ? "TRUE" : "FALSE" );
+    }
+    return is_int;
+}
+
+struct fs_hack_image
+{
+    uint32_t cmd_queue_idx;
+    VkCommandBuffer cmd;
+    VkImage swapchain_image;
+    VkImage user_image;
+    VkSemaphore blit_finished;
+    VkImageView user_view, blit_view;
+    VkDescriptorSet descriptor_set;
+};
+
+static const char *debugstr_vkextent2d( const VkExtent2D *ext )
+{
+    if (!ext) return "(null)";
+    return wine_dbg_sprintf( "(%d,%d)", (int)ext->width, (int)ext->height );
+}
+
 struct swapchain
 {
     struct vulkan_swapchain obj;
     struct surface *surface;
     VkExtent2D extents;
+    struct vulkan_device *device;
+    BOOL winehua_private;
+    uint32_t image_count;
+    VkFormat format;
+    VkImage *images;
+    VkDeviceMemory *memories;
+    BOOL *acquired;
+    uint32_t next_image;
+    uint32_t serial;
+    VkCommandPool acquire_pool;
+    VkCommandBuffer acquire_command;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+
+    /* fs hack data below */
+    UINT fshack_dpi;
+    VkExtent2D host_extents;
+    VkCommandPool *cmd_pools; /* VkCommandPool[device->queue_count] */
+    VkDeviceMemory user_image_memory;
+    uint32_t n_images;
+    struct fs_hack_image *fs_hack_images; /* struct fs_hack_image[n_images] */
+    VkSampler sampler;
+    VkDescriptorPool descriptor_pool;
+    VkDescriptorSetLayout descriptor_set_layout;
+    VkPipelineLayout pipeline_layout;
+    VkPipeline pipeline;
 };
 
 static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
 {
     struct vulkan_swapchain *obj = vulkan_swapchain_from_handle( handle );
     return CONTAINING_RECORD( obj, struct swapchain, obj );
+}
+
+static BOOL get_surface_rect( HWND hwnd, RECT *rect, UINT dpi );
+
+typedef int (*winehua_present_fn)(VkQueue, VkImage, uint32_t, uint32_t, VkFormat,
+                                  VkImageLayout, uint32_t, uint32_t, uint32_t,
+                                  uint64_t *);
+
+static winehua_present_fn winehua_present;
+static pthread_once_t winehua_present_once = PTHREAD_ONCE_INIT;
+static struct list wow64_copy_maps = LIST_INIT( wow64_copy_maps );
+static pthread_mutex_t wow64_copy_mutex = PTHREAD_MUTEX_INITIALIZER;
+#ifdef _WIN64
+static void winehua_wow64_release_map( struct vulkan_device *device, struct device_memory *memory );
+static void winehua_wow64_flush_copies(void);
+#endif
+
+static void winehua_present_init(void)
+{
+    void *handle = dlopen("libvulkan_virtio.so", RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+    if (handle) winehua_present = (winehua_present_fn)dlsym(handle, "vn_winehua_present");
+    if (!winehua_present)
+        WARN("WineHua Vulkan private present entry is unavailable\n");
+}
+
+static int winehua_present_image(struct vulkan_queue *queue, VkImage image,
+                                 uint32_t width, uint32_t height, VkFormat format,
+                                 VkImageLayout layout, uint32_t surface_id,
+                                 uint32_t owner_pid, HWND hwnd, uint32_t serial,
+                                 uint64_t *deadline)
+{
+    pthread_once(&winehua_present_once, winehua_present_init);
+    if (!winehua_present)
+    {
+        WARN("WineHua Vulkan private present entry is unavailable\n");
+        return -ENOSYS;
+    }
+
+    /* Probe (2026-09-17): which process actually presents, and under which identity. */
+    {
+        static int present_probe_count;
+        if (present_probe_count < 3)
+        {
+            ++present_probe_count;
+            fprintf(stderr, "WineHuaPresentProbe: pid=%u surface_id=%u owner_pid=%u size=%ux%u\n",
+                    (uint32_t)getpid(), surface_id, owner_pid, width, height);
+            /* P0-1 window identity probe at present time (hostPid/winPid/windowWinPid/
+             * windowTid/hwnd/privateSurface) — matches the plan's field list. */
+            winehua_log_window_identity( "present", hwnd, surface_id, NULL, surface_id );
+        }
+    }
+
+    /* owner_pid == 0 means "this process owns the window" (GDI/D3D and DXVK
+     * same-process games), which is exactly the old behaviour. */
+    return winehua_present(queue->host.queue, image, width, height, format, layout,
+                           owner_pid ? owner_pid : (uint32_t)getpid(),
+                           surface_id, serial, deadline);
+}
+
+static uint32_t winehua_surface_extent(HWND hwnd, VkExtent2D *extent)
+{
+    RECT rect;
+    if (!get_surface_rect(hwnd, &rect, NtUserGetDpiForWindow(hwnd)) ||
+        rect.right <= rect.left || rect.bottom <= rect.top)
+    {
+        extent->width = 1;
+        extent->height = 1;
+        return 0;
+    }
+    extent->width = rect.right - rect.left;
+    extent->height = rect.bottom - rect.top;
+    return 1;
 }
 
 struct semaphore
@@ -285,7 +542,7 @@ static void init_shared_resource_path( const WCHAR *name, UNICODE_STRING *str )
     char buffer[MAX_PATH];
 
     snprintf( buffer, ARRAY_SIZE(buffer), "\\Sessions\\%u\\BaseNamedObjects\\",
-              RtlGetCurrentPeb()->SessionId );
+              NtCurrentTeb()->Peb->SessionId );
     str->MaximumLength = asciiz_to_unicode( str->Buffer, buffer );
     str->Length = str->MaximumLength - sizeof(WCHAR);
 
@@ -333,6 +590,14 @@ static const void *find_next_struct( const VkBaseInStructure *header, VkStructur
 {
     for (; header; header = header->pNext) if (header->sType == type) return header;
     return NULL;
+}
+
+static const void *pop_next_struct( VkBaseOutStructure **next, VkStructureType type )
+{
+    VkBaseOutStructure *ptr;
+    while (*next && (*next)->sType != type) next = &(*next)->pNext;
+    if ((ptr = *next)) *next = ptr->pNext;
+    return ptr;
 }
 
 static int vulkan_object_compare( const void *key, const struct rb_entry *entry )
@@ -540,6 +805,22 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
     extensions.has_VK_KHR_win32_keyed_mutex = extensions.has_VK_KHR_timeline_semaphore &&
                                               extensions.has_VK_KHR_external_semaphore_fd;
 
+    /* WineHua's private Venus swapchain is implemented by win32u rather than
+     * by the Host Vulkan WSI.  Advertise VK_KHR_swapchain to the application
+     * so DXVK can create its normal device, while convert_device_create_info
+     * below deliberately removes it from the Host vkCreateDevice extension
+     * list.  The win32u dispatch table still owns Create/Acquire/Present. */
+    if (winehua_vulkan_present_enabled())
+    {
+        extensions.has_VK_KHR_swapchain = 1;
+        TRACE("WineHua: synthesizing VK_KHR_swapchain for private present\n");
+    }
+
+    /* Keep the native driver-side copy in sync as well.  The first
+     * assignment above reflects only Host extensions; the private swapchain
+     * capability is synthesized after that enumeration. */
+    physical_device->extensions = extensions;
+
     /* filter out unsupported client device extensions */
 #define USE_VK_EXT(x) client_physical_device->extensions.has_ ## x = extensions.has_ ## x;
     ALL_VK_CLIENT_DEVICE_EXTS
@@ -591,11 +872,38 @@ failed:
     return res;
 }
 
+static BOOL add_instance_extension( const char *extension, size_t len, struct vulkan_instance_extensions *extensions )
+{
+#define USE_VK_EXT(x) \
+    if (len == sizeof(#x) - 1 && !strncmp( #x, extension, len ))    \
+    {                                                               \
+        if (!extensions->has_ ## x) TRACE( "Adding %s\n", #x );     \
+        return extensions->has_ ## x = 1;                           \
+    }
+    ALL_VK_INSTANCE_EXTS
+#undef USE_VK_EXT
+    WARN( "Extension %s is not supported.\n", debugstr_a(extension) );
+    return FALSE;
+}
+
+static void parse_instance_extensions( struct vulkan_instance_extensions *extensions, const char *str )
+{
+    const char *next;
+    for (next = str; *next; next++)
+    {
+        if (*next != ' ') continue;
+        add_instance_extension( str, next - str, extensions );
+        str = next + 1;
+    }
+    if (next > str) add_instance_extension( str, next - str, extensions );
+}
+
 static VkResult win32u_vkCreateInstance( const VkInstanceCreateInfo *client_create_info, const VkAllocationCallbacks *allocator,
                                          VkInstance *client_instance_ptr )
 {
     VkInstanceCreateInfo *create_info = (VkInstanceCreateInfo *)client_create_info; /* cast away const, chain has been copied in the thunks */
     VkInstance host_instance = VK_NULL_HANDLE, client_instance = *client_instance_ptr;
+    const VkCreateInfoWineInstanceCallback *callback_info;
     struct vulkan_physical_device *physical_devices;
     struct mempool pool = {0};
     struct instance *instance;
@@ -609,8 +917,21 @@ static VkResult win32u_vkCreateInstance( const VkInstanceCreateInfo *client_crea
     list_init( &instance->utils_messengers );
     list_init( &instance->report_callbacks );
 
+    if (instance->obj.extensions.has_VK_WINE_openxr_instance_extensions)
+    {
+        parse_instance_extensions( &instance->obj.extensions, getenv( "__WINE_OPENXR_VK_INSTANCE_EXTENSIONS" ) );
+        instance->obj.extensions.has_VK_WINE_openxr_instance_extensions = 0;
+    }
+
+    pthread_key_create(&instance->obj.transient_object_handle, free);
+
     if ((res = convert_instance_create_info( &pool, create_info, instance ))) goto failed;
-    if ((res = p_vkCreateInstance( create_info, NULL /* allocator */, &host_instance ))) goto failed;
+    if ((callback_info = pop_next_struct( (VkBaseOutStructure **)&create_info->pNext, VK_STRUCTURE_TYPE_CREATE_INFO_WINE_INSTANCE_CALLBACK )))
+    {
+        PFN_vkCreateInstanceCallbackWINE callback = (void *)(UINT_PTR)callback_info->native_create_callback;
+        if ((res = callback( create_info, allocator, &host_instance, p_vkGetInstanceProcAddr, (void *)(UINT_PTR)callback_info->context ))) goto failed;
+    }
+    else if ((res = p_vkCreateInstance( create_info, NULL /* allocator */, &host_instance ))) goto failed;
 
     vulkan_object_init_ptr( &instance->obj.obj, (UINT_PTR)host_instance, &client_instance->obj );
     instance->obj.p_insert_object = vulkan_instance_insert_object;
@@ -663,7 +984,35 @@ static void win32u_vkDestroyInstance( VkInstance client_instance, const VkAlloca
     if (instance->objects.compare) pthread_rwlock_destroy( &instance->objects_lock );
     free_debug_utils_messengers( &instance->utils_messengers );
     free_debug_report_callbacks( &instance->report_callbacks );
+    pthread_key_delete(instance->obj.transient_object_handle);
     free( instance );
+}
+
+static BOOL add_device_extension( const char *extension, size_t len, struct vulkan_device_extensions *extensions )
+{
+#define USE_VK_EXT(x) \
+    if (len == sizeof(#x) - 1 && !strncmp( #x, extension, len ))    \
+    {                                                               \
+        if (!extensions->has_ ## x) TRACE( "Adding %s\n", #x );     \
+        return extensions->has_ ## x = 1;                           \
+    }
+    ALL_VK_DEVICE_EXTS
+#undef USE_VK_EXT
+    WARN( "Extension %s is not supported.\n", debugstr_a(extension) );
+    return FALSE;
+}
+
+static void parse_device_extensions( struct vulkan_device_extensions *extensions, const char *str )
+{
+    const char *next;
+
+    for (next = str; *next; next++)
+    {
+        if (*next != ' ') continue;
+        add_device_extension( str, next - str, extensions );
+        str = next + 1;
+    }
+    if (next > str) add_device_extension( str, next - str, extensions );
 }
 
 static VkResult convert_device_create_info( struct vulkan_physical_device *physical_device, VkDeviceCreateInfo *info,
@@ -685,10 +1034,14 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
     }
 
     driver_funcs->p_map_device_extensions( &device->extensions );
+    if (winehua_vulkan_present_enabled())
+        device->extensions.has_VK_KHR_swapchain = 0;
     device->extensions.has_VK_KHR_win32_keyed_mutex = 0;
     device->extensions.has_VK_KHR_external_memory_win32 = 0;
     device->extensions.has_VK_KHR_external_fence_win32 = 0;
     device->extensions.has_VK_KHR_external_semaphore_win32 = 0;
+    device->extensions.has_VK_WINE_openvr_device_extensions = 0;
+    device->extensions.has_VK_WINE_openxr_device_extensions = 0;
 
     if (device->extensions.has_VK_EXT_external_memory_dma_buf)
         device->extensions.has_VK_KHR_external_memory_fd = 1;
@@ -767,9 +1120,11 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
     struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle( client_physical_device );
     struct vulkan_instance *instance = physical_device->instance;
     VkDevice host_device, client_device = *client_device_ptr;
+    const VkCreateInfoWineDeviceCallback *callback_info;
+    unsigned int queue_count, props_count, i;
     struct vulkan_device *device;
-    unsigned int queue_count, i;
     struct mempool pool = {0};
+    VkPhysicalDeviceFeatures features = {0};
     VkResult res;
 
     if (TRACE_ON(vulkan))
@@ -783,12 +1138,60 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
 
     /* We need to cache all queues within the device as each requires wrapping since queues are dispatchable objects. */
     for (queue_count = 0, i = 0; i < create_info->queueCreateInfoCount; i++) queue_count += create_info->pQueueCreateInfos[i].queueCount;
+    instance->p_vkGetPhysicalDeviceQueueFamilyProperties(physical_device->host.physical_device, &props_count, NULL);
 
-    if (!(device = calloc( 1, offsetof(struct vulkan_device, queues[queue_count]) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!(device = calloc( 1, sizeof(*device) + queue_count * sizeof(*device->queues) + props_count * sizeof(*device->queue_props) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
     device->extensions = client_device->extensions;
+    device->queues = (void *)(device + 1);
+    device->queue_props = (void *)(device->queues + queue_count);
+
+{
+        VkPhysicalDeviceFeatures2 *features2;
+
+        /* Enable shaderStorageImageWriteWithoutFormat for fshack
+         * This is available on all hardware and driver combinations we care about.
+         */
+        if (create_info->pEnabledFeatures)
+        {
+            features = *create_info->pEnabledFeatures;
+            features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+            create_info->pEnabledFeatures = &features;
+        }
+        if ((features2 = (void *)find_next_struct((const void *)create_info, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)))
+        {
+            features2->features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+        }
+        else if (!create_info->pEnabledFeatures)
+        {
+            features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+            create_info->pEnabledFeatures = &features;
+        }
+}
+
+    if (device->extensions.has_VK_WINE_openvr_device_extensions)
+    {
+        VkPhysicalDeviceProperties properties = {0};
+        const char *vr_exts;
+        char name[64];
+        instance->p_vkGetPhysicalDeviceProperties( physical_device->host.physical_device, &properties );
+        sprintf( name, "VK_WINE_OPENVR_DEVICE_EXTS_PCIID_%04x_%04x", properties.vendorID, (uint16_t)properties.deviceID );
+        if (!(vr_exts = getenv( name ))) vr_exts = getenv( "VK_WINE_OPENVR_DEVICE_EXTS" );
+        if (vr_exts) parse_device_extensions( &device->extensions, vr_exts );
+        device->extensions.has_VK_WINE_openvr_device_extensions = 0;
+    }
+    if (device->extensions.has_VK_WINE_openxr_device_extensions)
+    {
+        parse_device_extensions( &device->extensions, getenv( "__WINE_OPENXR_VK_DEVICE_EXTENSIONS" ) );
+        device->extensions.has_VK_WINE_openxr_device_extensions = 0;
+    }
 
     if ((res = convert_device_create_info( physical_device, create_info, &pool, device ))) goto failed;
-    if ((res = instance->p_vkCreateDevice( physical_device->host.physical_device, create_info, NULL /* allocator */, &host_device ))) goto failed;
+    if ((callback_info = pop_next_struct( (VkBaseOutStructure **)&create_info->pNext, VK_STRUCTURE_TYPE_CREATE_INFO_WINE_DEVICE_CALLBACK )))
+    {
+        PFN_vkCreateDeviceCallbackWINE callback = (void *)(UINT_PTR)callback_info->native_create_callback;
+        if ((res = callback( physical_device->host.physical_device, create_info, allocator, &host_device, p_vkGetDeviceProcAddr, (void *)(UINT_PTR)callback_info->context ))) goto failed;
+    }
+    else if ((res = instance->p_vkCreateDevice( physical_device->host.physical_device, create_info, NULL /* allocator */, &host_device ))) goto failed;
 
     vulkan_object_init_ptr( &device->obj, (UINT_PTR)host_device, &client_device->obj );
     device->physical_device = physical_device;
@@ -800,6 +1203,7 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
 #undef USE_VK_FUNC
 
     for (i = 0; i < create_info->queueCreateInfoCount; i++) init_device_queues( device, create_info->pQueueCreateInfos + i, client_device );
+    instance->p_vkGetPhysicalDeviceQueueFamilyProperties( physical_device->host.physical_device, &props_count, device->queue_props );
 
     TRACE( "Created device %p, host_device %p.\n", device, device->host.device );
     for (struct vulkan_queue *queue = device->queues; queue < device->queues + device->queue_count; queue++)
@@ -858,6 +1262,17 @@ static void win32u_vkGetDeviceQueue2( VkDevice client_device, const VkDeviceQueu
     info.pNext = NULL;
 
     *client_queue = device_find_queue( client_device, &info );
+}
+
+static void set_transient_client_handle(struct vulkan_instance *instance, uint64_t client_handle)
+{
+    uint64_t *handle = pthread_getspecific(instance->transient_object_handle);
+    if (!handle)
+    {
+        handle = malloc(sizeof(uint64_t));
+        pthread_setspecific(instance->transient_object_handle, handle);
+    }
+    *handle = client_handle;
 }
 
 static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryAllocateInfo *client_alloc_info,
@@ -980,6 +1395,7 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
         alloc_info->pNext = &fd_info;
     }
 
+    set_transient_client_handle(instance, (uintptr_t)&memory->obj.obj);
     if ((res = device->p_vkAllocateMemory( device->host.device, alloc_info, NULL, &host_device_memory ))) goto failed;
 
     if (export_info)
@@ -1037,6 +1453,11 @@ static void win32u_vkFreeMemory( VkDevice client_device, VkDeviceMemory client_m
     if (!client_memory) return;
     memory = device_memory_from_handle( client_memory );
 
+#ifdef _WIN64
+    if (memory->wow64_alias || memory->wow64_copy)
+        winehua_wow64_release_map( device, memory );
+    else
+#endif
     if (memory->vm_map && !physical_device->external_memory_align)
     {
         const VkMemoryUnmapInfoKHR info =
@@ -1113,6 +1534,305 @@ static VkResult win32u_vkGetMemoryWin32HandlePropertiesKHR( VkDevice client_devi
     return VK_SUCCESS;
 }
 
+#ifdef _WIN64
+static ULONG_PTR winehua_wow64_zero_bits(void)
+{
+    if (zero_bits) return zero_bits;
+    if (NtCurrentTeb()->WowTebOffset)
+    {
+        SYSTEM_BASIC_INFORMATION info;
+        if (!NtQuerySystemInformation( SystemEmulationBasicInformation, &info, sizeof(info), NULL ))
+            return (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
+        return 0x7fffffff;
+    }
+    return 0;
+}
+
+static void winehua_wow64_copy_register( struct device_memory *memory )
+{
+    list_init( &memory->wow64_entry );
+    pthread_mutex_lock( &wow64_copy_mutex );
+    list_add_tail( &wow64_copy_maps, &memory->wow64_entry );
+    pthread_mutex_unlock( &wow64_copy_mutex );
+}
+
+static void winehua_wow64_copy_unregister( struct device_memory *memory )
+{
+    if (!memory->wow64_copy) return;
+    pthread_mutex_lock( &wow64_copy_mutex );
+    list_remove( &memory->wow64_entry );
+    list_init( &memory->wow64_entry );
+    memory->wow64_copy = FALSE;
+    pthread_mutex_unlock( &wow64_copy_mutex );
+}
+
+static void winehua_wow64_flush_copies(void)
+{
+    struct device_memory *memory;
+
+    pthread_mutex_lock( &wow64_copy_mutex );
+    LIST_FOR_EACH_ENTRY( memory, &wow64_copy_maps, struct device_memory, wow64_entry )
+    {
+        if (memory->host_map && memory->vm_map && memory->size)
+            memcpy( memory->host_map, memory->vm_map, (size_t)memory->size );
+    }
+    pthread_mutex_unlock( &wow64_copy_mutex );
+}
+
+static BOOL winehua_find_vma( const void *ptr, uintptr_t *start, uintptr_t *end,
+                              unsigned long *offset, unsigned long *inode )
+{
+    FILE *fp;
+    char line[512];
+    uintptr_t addr = (uintptr_t)ptr;
+
+    if (!(fp = fopen( "/proc/self/maps", "r" ))) return FALSE;
+    while (fgets( line, sizeof(line), fp ))
+    {
+        uintptr_t s, e;
+        unsigned long off, ino;
+        unsigned int maj, min;
+        char perms[8];
+
+        if (sscanf( line, "%" SCNxPTR "-%" SCNxPTR " %7s %lx %x:%x %lu",
+                    &s, &e, perms, &off, &maj, &min, &ino ) < 7)
+            continue;
+        if (addr >= s && addr < e)
+        {
+            *start = s;
+            *end = e;
+            *offset = off;
+            *inode = ino;
+            fclose( fp );
+            return TRUE;
+        }
+    }
+    fclose( fp );
+    return FALSE;
+}
+
+static int winehua_open_inode_fd( unsigned long inode )
+{
+    DIR *dir;
+    struct dirent *de;
+
+    if (!(dir = opendir( "/proc/self/fd" ))) return -1;
+    while ((de = readdir( dir )))
+    {
+        struct stat st;
+        int fd, dupfd;
+
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        fd = atoi( de->d_name );
+        if (fd < 0 || fstat( fd, &st )) continue;
+        if (!S_ISREG( st.st_mode ) && !S_ISCHR( st.st_mode )) continue;
+        if ((unsigned long)st.st_ino != inode) continue;
+        dupfd = dup( fd );
+        closedir( dir );
+        return dupfd;
+    }
+    closedir( dir );
+    return -1;
+}
+
+static int winehua_open_vma_fd( uintptr_t start, uintptr_t end, unsigned long inode )
+{
+    char path[128];
+    int fd;
+
+    snprintf( path, sizeof(path), "/proc/self/map_files/%" PRIxPTR "-%" PRIxPTR, start, end );
+    if ((fd = open( path, O_RDWR )) >= 0) return fd;
+    return winehua_open_inode_fd( inode );
+}
+
+static BOOL winehua_wow64_ptr_mapped( const void *ptr )
+{
+    uintptr_t start, end;
+    unsigned long offset, inode;
+    return winehua_find_vma( ptr, &start, &end, &offset, &inode );
+}
+
+/* Harmony mremap(DONTUNMAP) may return success without sharing pages, or
+ * ignore DONTUNMAP and MOVE the VMA (leaving Venus holding a dangling
+ * 64-bit pointer).  Probe before trusting an "alias". */
+static BOOL winehua_wow64_alias_coherent( void *host, void *placed )
+{
+    volatile unsigned char *h = host;
+    volatile unsigned char *p = placed;
+    unsigned char orig, expect;
+
+    if (!winehua_wow64_ptr_mapped( host ) || !winehua_wow64_ptr_mapped( placed ))
+        return FALSE;
+
+    orig = *h;
+    expect = (unsigned char)(orig ^ 0xa5);
+    *p = expect;
+    __sync_synchronize();
+    if (*h != expect)
+    {
+        *p = orig;
+        return FALSE;
+    }
+    *h = orig;
+    __sync_synchronize();
+    if (*p != orig)
+    {
+        *p = orig;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void winehua_wow64_accept_map( struct device_memory *memory, void *placed, void *host,
+                                      BOOL alias, void **data, const char *how )
+{
+    memory->vm_map = placed;
+    memory->host_map = host;
+    memory->wow64_alias = alias;
+    memory->wow64_copy = !alias;
+    if (!alias) winehua_wow64_copy_register( memory );
+    *data = placed;
+    if (alias)
+        ERR( "WineHua: WOW64 aliased vkMapMemory %p -> %p via %s\n", host, placed, how );
+    else
+        ERR( "WineHua: WOW64 copying vkMapMemory %p -> %p (%s)\n", host, placed, how );
+}
+
+static BOOL winehua_wow64_alloc_placed( ULONG_PTR bits, SIZE_T *alloc_size, void **placed )
+{
+    *placed = NULL;
+    if (NtAllocateVirtualMemory( GetCurrentProcess(), placed, bits, alloc_size,
+                                 MEM_COMMIT, PAGE_READWRITE ))
+        return FALSE;
+    return TRUE;
+}
+
+static VkResult winehua_wow64_remap_map( struct device_memory *memory, void **data )
+{
+    ULONG_PTR bits = winehua_wow64_zero_bits();
+    SIZE_T alloc_size;
+    SIZE_T want_size;
+    void *placed = NULL;
+    void *host = *data;
+    uintptr_t start = 0, end = 0;
+    unsigned long offset = 0, inode = 0;
+    BOOL have_vma;
+    int fd;
+
+    if (!NtCurrentTeb()->WowTebOffset || !((UINT_PTR)host >> 32))
+        return VK_SUCCESS;
+    if (!bits)
+    {
+        ERR( "WineHua: WOW64 vkMapMemory %p does not fit 32-bit and zero_bits is unset\n", host );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+
+    want_size = (SIZE_T)memory->size;
+    alloc_size = want_size;
+    if (!winehua_wow64_alloc_placed( bits, &alloc_size, &placed ))
+    {
+        ERR( "WineHua: WOW64 NtAllocateVirtualMemory(%s) failed for vkMapMemory\n",
+             wine_dbgstr_longlong( memory->size ) );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+
+#ifdef MREMAP_DONTUNMAP
+    {
+        void *alias = mremap( host, alloc_size, alloc_size,
+                              MREMAP_MAYMOVE | MREMAP_DONTUNMAP | MREMAP_FIXED, placed );
+        if (alias != MAP_FAILED && alias == placed)
+        {
+            if (winehua_wow64_alias_coherent( host, placed ))
+            {
+                winehua_wow64_accept_map( memory, placed, host, TRUE, data, "mremap" );
+                return VK_SUCCESS;
+            }
+            ERR( "WineHua: WOW64 mremap not coherent host=%p dest=%p host_mapped=%d\n",
+                 host, placed, winehua_wow64_ptr_mapped( host ) );
+            if (!winehua_wow64_ptr_mapped( host ))
+            {
+                void *restored;
+                void *release;
+                SIZE_T z;
+
+                restored = mremap( placed, alloc_size, alloc_size,
+                                   MREMAP_MAYMOVE | MREMAP_FIXED, host );
+                if (restored != host)
+                {
+                    ERR( "WineHua: WOW64 cannot restore host map %p errno=%d\n", host, errno );
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+                z = 0;
+                release = placed;
+                NtFreeVirtualMemory( GetCurrentProcess(), &release, &z, MEM_RELEASE );
+                placed = NULL;
+                alloc_size = want_size;
+                if (!winehua_wow64_alloc_placed( bits, &alloc_size, &placed ))
+                {
+                    ERR( "WineHua: WOW64 NtAllocateVirtualMemory retry failed\n" );
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+            }
+        }
+        else
+            ERR( "WineHua: WOW64 mremap alias failed host=%p dest=%p errno=%d\n", host, placed, errno );
+    }
+#endif
+
+    have_vma = winehua_find_vma( host, &start, &end, &offset, &inode );
+    if (have_vma && (fd = winehua_open_vma_fd( start, end, inode )) >= 0)
+    {
+        off_t file_off = (off_t)( offset + ((uintptr_t)host - start) );
+        void *alias = mmap( placed, alloc_size, PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_FIXED, fd, file_off );
+        close( fd );
+        if (alias == placed)
+        {
+            if (winehua_wow64_alias_coherent( host, placed ))
+            {
+                winehua_wow64_accept_map( memory, placed, host, TRUE, data, "mmap fd" );
+                return VK_SUCCESS;
+            }
+            ERR( "WineHua: WOW64 mmap fd not coherent host=%p dest=%p off=0x%lx\n",
+                 host, placed, (unsigned long)file_off );
+        }
+        else
+            ERR( "WineHua: WOW64 mmap alias failed host=%p dest=%p errno=%d\n", host, placed, errno );
+    }
+    else
+        ERR( "WineHua: WOW64 could not open backing fd for map %p vma=%d\n", host, have_vma );
+
+    /* Last resort: CPU copy.  FlushMappedMemoryRanges bypasses win32u, so
+     * QueueSubmit copies the whole allocation.  Precise DXVK/Venus flushes
+     * may still race; prefer a coherent alias above. */
+    memcpy( placed, host, (size_t)(memory->size < (VkDeviceSize)alloc_size ? memory->size : (VkDeviceSize)alloc_size) );
+    winehua_wow64_accept_map( memory, placed, host, FALSE, data, "CPU fallback" );
+    return VK_SUCCESS;
+}
+
+static void winehua_wow64_release_map( struct vulkan_device *device, struct device_memory *memory )
+{
+    if (!memory->wow64_alias && !memory->wow64_copy) return;
+
+    if (memory->wow64_copy && memory->host_map && memory->vm_map && memory->size)
+        memcpy( memory->host_map, memory->vm_map, (size_t)memory->size );
+    winehua_wow64_copy_unregister( memory );
+
+    if (device && device->p_vkUnmapMemory && memory->obj.host.device_memory)
+        device->p_vkUnmapMemory( device->host.device, memory->obj.host.device_memory );
+
+    if (memory->vm_map)
+    {
+        SIZE_T alloc_size = 0;
+        NtFreeVirtualMemory( GetCurrentProcess(), &memory->vm_map, &alloc_size, MEM_RELEASE );
+    }
+    memory->vm_map = NULL;
+    memory->host_map = NULL;
+    memory->wow64_alias = FALSE;
+    memory->wow64_copy = FALSE;
+}
+#endif
+
 static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMapInfoKHR *map_info, void **data )
 {
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
@@ -1176,10 +1896,11 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
 #ifdef _WIN64
     if (NtCurrentTeb()->WowTebOffset && res == VK_SUCCESS && (UINT_PTR)*data >> 32)
     {
-        FIXME( "returned mapping %p does not fit 32-bit pointer\n", *data );
-        device->p_vkUnmapMemory( device->host.device, memory->obj.host.device_memory );
-        *data = NULL;
-        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        if ((res = winehua_wow64_remap_map( memory, data )) != VK_SUCCESS)
+        {
+            device->p_vkUnmapMemory( device->host.device, memory->obj.host.device_memory );
+            *data = NULL;
+        }
     }
 #endif
 
@@ -1208,6 +1929,16 @@ static VkResult win32u_vkUnmapMemory2KHR( VkDevice client_device, const VkMemory
     struct device_memory *memory = device_memory_from_handle( unmap_info->memory );
     VkMemoryUnmapInfoKHR info;
     VkResult res;
+
+    TRACE( "device %p, unmap_info %p\n", device, unmap_info );
+
+#ifdef _WIN64
+    if (memory->wow64_alias || memory->wow64_copy)
+    {
+        winehua_wow64_release_map( device, memory );
+        return VK_SUCCESS;
+    }
+#endif
 
     if (memory->vm_map && physical_device->external_memory_align) return VK_SUCCESS;
 
@@ -1511,6 +2242,16 @@ static VkResult win32u_vkGetPhysicalDeviceImageFormatProperties2KHR( VkPhysicalD
 static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, const VkWin32SurfaceCreateInfoKHR *create_info,
                                                 const VkAllocationCallbacks *allocator, VkSurfaceKHR *ret )
 {
+    /* Probe (2026-09-17): is the private (WineHua) surface path taken in this process? */
+    {
+        static int create_probe_count;
+        if (create_probe_count < 4)
+        {
+            ++create_probe_count;
+            fprintf(stderr, "WineHuaSurfaceProbe: enter pid=%u hwnd=%p\n",
+                    (uint32_t)getpid(), create_info ? create_info->hwnd : NULL);
+        }
+    }
     struct vulkan_instance *instance = vulkan_instance_from_handle( client_instance );
     VkSurfaceKHR host_surface;
     struct surface *surface;
@@ -1533,11 +2274,52 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
         surface->hwnd = dummy;
     }
 
-    if ((res = driver_funcs->p_vulkan_surface_create( surface->hwnd, instance, &host_surface, &surface->client )))
+    if ((res = driver_funcs->p_vulkan_surface_create( surface->hwnd, fshack_enabled, instance,
+                                                      &host_surface, &surface->client )))
     {
         if (dummy) NtUserDestroyWindow( dummy );
         free( surface );
         return res;
+    }
+    surface->winehua_private = winehua_private_surface_handle(host_surface);
+    if (surface->winehua_private)
+    {
+        surface->winehua_surface_id = (uint32_t)(uint64_t)host_surface;
+        /* WineHua window binding (cross-process present): if the window is owned
+         * by another process, key this present by that process' window surface
+         * id instead of our private present surface id.  The owner publishes it
+         * through a window property (wineserver-mediated, dies with the HWND). */
+        {
+            static const WCHAR prop[] = {'W','i','n','e','H','u','a','W','i','n','d','o','w',
+                                          'S','u','r','f','a','c','e','I','d',0};
+            HANDLE token = NtUserGetProp( surface->hwnd, prop );
+            uint32_t owner_pid =
+                (uint32_t)(ULONG_PTR)NtUserQueryWindow( surface->hwnd, WindowProcess );
+
+            if (token && owner_pid && owner_pid != (uint32_t)getpid())
+            {
+                surface->winehua_owner_pid = owner_pid;
+                surface->winehua_surface_id = (uint32_t)(ULONG_PTR)token;
+                fprintf(stderr, "WineHuaWindowBinding: hwnd=%p present_pid=%u "
+                        "owner_pid=%u owner_surface=%u private_surface=%u\n",
+                        surface->hwnd, (uint32_t)getpid(), owner_pid,
+                        surface->winehua_surface_id, (uint32_t)(uint64_t)host_surface);
+            }
+            else
+            {
+                /* Probe (2026-09-17): why the explicit binding did not engage. */
+                fprintf(stderr, "WineHuaWindowBindingProbe: hwnd=%p self=%u owner_pid=%u "
+                        "token=%llu private_surface=%u\n",
+                        surface->hwnd, (uint32_t)getpid(), owner_pid,
+                        (unsigned long long)(ULONG_PTR)token,
+                        (uint32_t)(uint64_t)host_surface);
+            }
+            /* P0-1 window identity probe (diagnostics only). */
+            winehua_log_window_identity( "present", surface->hwnd, 0, token,
+                                        (uint32_t)(uint64_t)host_surface );
+        }
+        /* Resolve the private ICD bridge before any queue present call. */
+        pthread_once(&winehua_present_once, winehua_present_init);
     }
     add_window_client_surface( surface->hwnd, surface->client );
     set_window_pixel_format( surface->hwnd, -1, TRUE );
@@ -1563,7 +2345,8 @@ static void win32u_vkDestroySurfaceKHR( VkInstance client_instance, VkSurfaceKHR
     TRACE( "instance %p, handle 0x%s, allocator %p\n", instance, wine_dbgstr_longlong( client_surface ), allocator );
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
 
-    instance->p_vkDestroySurfaceKHR( instance->host.instance, surface->obj.host.surface, NULL /* allocator */ );
+    if (!surface->winehua_private)
+        instance->p_vkDestroySurfaceKHR( instance->host.instance, surface->obj.host.surface, NULL /* allocator */ );
     client_surface_release( surface->client );
 
     instance->p_remove_object( instance, &surface->obj.obj );
@@ -1603,6 +2386,24 @@ static void adjust_surface_capabilities( struct vulkan_instance *instance, struc
     capabilities->currentExtent.height = client_rect.bottom - client_rect.top;
 }
 
+static void winehua_surface_capabilities(struct surface *surface, VkSurfaceCapabilitiesKHR *capabilities)
+{
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->minImageCount = 2;
+    capabilities->maxImageCount = 3;
+    winehua_surface_extent(surface->hwnd, &capabilities->currentExtent);
+    capabilities->minImageExtent = capabilities->currentExtent;
+    capabilities->maxImageExtent = capabilities->currentExtent;
+    capabilities->maxImageArrayLayers = 1;
+    capabilities->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    capabilities->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    capabilities->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    capabilities->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                        VK_IMAGE_USAGE_SAMPLED_BIT;
+}
+
 static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( VkPhysicalDevice client_physical_device, VkSurfaceKHR client_surface,
                                                                   VkSurfaceCapabilitiesKHR *capabilities )
 {
@@ -1611,6 +2412,11 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( VkPhysicalDevi
     struct vulkan_instance *instance = physical_device->instance;
     VkResult res;
 
+    if (surface->winehua_private)
+    {
+        winehua_surface_capabilities(surface, capabilities);
+        return VK_SUCCESS;
+    }
     if (!NtUserIsWindow( surface->hwnd )) return VK_ERROR_SURFACE_LOST_KHR;
     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device,
                                                        surface->obj.host.surface, capabilities );
@@ -1626,6 +2432,13 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilities2KHR( VkPhysicalDev
     VkPhysicalDeviceSurfaceInfo2KHR surface_info_host = *surface_info;
     struct vulkan_instance *instance = physical_device->instance;
     VkResult res;
+
+    if (surface->winehua_private)
+    {
+        memset(&capabilities->surfaceCapabilities, 0, sizeof(capabilities->surfaceCapabilities));
+        winehua_surface_capabilities(surface, &capabilities->surfaceCapabilities);
+        return VK_SUCCESS;
+    }
 
     if (!instance->p_vkGetPhysicalDeviceSurfaceCapabilities2KHR)
     {
@@ -1651,6 +2464,19 @@ static VkResult win32u_vkGetPhysicalDevicePresentRectanglesKHR( VkPhysicalDevice
     struct surface *surface = surface_from_handle( client_surface );
     struct vulkan_instance *instance = physical_device->instance;
 
+    if (surface->winehua_private)
+    {
+        if (!rects)
+        {
+            *rect_count = 1;
+            return VK_SUCCESS;
+        }
+        if (!*rect_count) return VK_INCOMPLETE;
+        winehua_surface_extent(surface->hwnd, &rects[0].extent);
+        rects[0].offset = (VkOffset2D){0, 0};
+        *rect_count = 1;
+        return VK_SUCCESS;
+    }
     if (!NtUserIsWindow( surface->hwnd ))
     {
         if (rects && !*rect_count) return VK_INCOMPLETE;
@@ -1673,6 +2499,18 @@ static void *find_vk_struct( void *s, VkStructureType t )
     }
 
     return NULL;
+}
+
+static void fixup_device_id_vulkan( UINT *vendor_id, UINT *device_id )
+{
+    struct pci_id id_real;
+    const struct pci_id *id = &id_real;
+
+    id_real.vendor = *vendor_id;
+    id_real.device = *device_id;
+    fixup_device_id( &id );
+    *vendor_id = id->vendor;
+    *device_id = id->device;
 }
 
 static void get_physical_device_properties2( struct vulkan_physical_device *physical_device, VkPhysicalDeviceProperties2 *properties2,
@@ -1721,6 +2559,8 @@ static void get_physical_device_properties2( struct vulkan_physical_device *phys
         vk11->deviceNodeMask = node_mask;
     }
 
+    fixup_device_id_vulkan( &properties2->properties.vendorID, &properties2->properties.deviceID );
+
     TRACE( "deviceName:%s deviceLUIDValid:%d LUID:%08x:%08x.\n",
            properties2->properties.deviceName, device_luid_valid, luid.HighPart, luid.LowPart );
 }
@@ -1761,6 +2601,24 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( VkPhysicalDevice cl
     struct surface *surface = surface_from_handle( client_surface );
     struct vulkan_instance *instance = physical_device->instance;
 
+    if (surface->winehua_private)
+    {
+        const VkSurfaceFormatKHR available[] = {
+            {VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+            {VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+        };
+        if (!formats)
+        {
+            *format_count = 2;
+            return VK_SUCCESS;
+        }
+        if (!*format_count) return VK_INCOMPLETE;
+        const uint32_t count = min(*format_count, 2u);
+        memcpy(formats, available, count * sizeof(*formats));
+        *format_count = count;
+        return count == 2 ? VK_SUCCESS : VK_INCOMPLETE;
+    }
+
     return instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
                                                                 surface->obj.host.surface, format_count, formats );
 }
@@ -1773,6 +2631,28 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice c
     VkPhysicalDeviceSurfaceInfo2KHR surface_info_host = *surface_info;
     struct vulkan_instance *instance = physical_device->instance;
     VkResult res;
+
+    if (surface->winehua_private)
+    {
+        uint32_t count = 0;
+        res = win32u_vkGetPhysicalDeviceSurfaceFormatsKHR(client_physical_device,
+                                                           surface_info->surface,
+                                                           &count, NULL);
+        if (!formats)
+        {
+            *format_count = count;
+            return res;
+        }
+        VkSurfaceFormatKHR available[2];
+        count = ARRAY_SIZE(available);
+        res = win32u_vkGetPhysicalDeviceSurfaceFormatsKHR(client_physical_device,
+                                                           surface_info->surface,
+                                                           &count, available);
+        const uint32_t copy_count = min(*format_count, count);
+        for (uint32_t i = 0; i < copy_count; ++i) formats[i].surfaceFormat = available[i];
+        *format_count = copy_count;
+        return copy_count == count ? res : VK_INCOMPLETE;
+    }
 
     if (!instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR)
     {
@@ -1799,6 +2679,51 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice c
                                                                  &surface_info_host, format_count, formats );
 }
 
+static VkResult win32u_vkGetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice client_physical_device,
+                                                                  VkSurfaceKHR client_surface,
+                                                                  uint32_t *mode_count,
+                                                                  VkPresentModeKHR *modes)
+{
+    struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle(client_physical_device);
+    struct surface *surface = surface_from_handle(client_surface);
+    struct vulkan_instance *instance = physical_device->instance;
+    if (surface->winehua_private)
+    {
+        const VkPresentModeKHR available[] = {
+            VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR,
+            VK_PRESENT_MODE_IMMEDIATE_KHR,
+        };
+        if (!modes)
+        {
+            *mode_count = ARRAY_SIZE(available);
+            return VK_SUCCESS;
+        }
+        const uint32_t count = min(*mode_count, (uint32_t)ARRAY_SIZE(available));
+        memcpy(modes, available, count * sizeof(*modes));
+        *mode_count = count;
+        return count == ARRAY_SIZE(available) ? VK_SUCCESS : VK_INCOMPLETE;
+    }
+    return instance->p_vkGetPhysicalDeviceSurfacePresentModesKHR(
+        physical_device->host.physical_device, surface->obj.host.surface, mode_count, modes);
+}
+
+static VkResult win32u_vkGetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice client_physical_device,
+                                                             uint32_t queue,
+                                                             VkSurfaceKHR client_surface,
+                                                             VkBool32 *supported)
+{
+    struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle(client_physical_device);
+    struct surface *surface = surface_from_handle(client_surface);
+    struct vulkan_instance *instance = physical_device->instance;
+    if (surface->winehua_private)
+    {
+        *supported = driver_funcs->p_get_physical_device_presentation_support(physical_device, queue);
+        return VK_SUCCESS;
+    }
+    return instance->p_vkGetPhysicalDeviceSurfaceSupportKHR(
+        physical_device->host.physical_device, queue, surface->obj.host.surface, supported);
+}
+
 static VkBool32 win32u_vkGetPhysicalDeviceWin32PresentationSupportKHR( VkPhysicalDevice client_physical_device, uint32_t queue )
 {
     struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle( client_physical_device );
@@ -1808,6 +2733,743 @@ static VkBool32 win32u_vkGetPhysicalDeviceWin32PresentationSupportKHR( VkPhysica
 static BOOL extents_equals( const VkExtent2D *extents, const RECT *rect )
 {
     return extents->width == rect->right - rect->left && extents->height == rect->bottom - rect->top;
+}
+
+static uint32_t winehua_find_memory_type(struct vulkan_physical_device *physical_device,
+                                         uint32_t type_bits, VkMemoryPropertyFlags preferred)
+{
+    uint32_t fallback = UINT32_MAX;
+    for (uint32_t i = 0; i < physical_device->memory_properties.memoryTypeCount; ++i)
+    {
+        if (!(type_bits & (1u << i))) continue;
+        if (fallback == UINT32_MAX) fallback = i;
+        if ((physical_device->memory_properties.memoryTypes[i].propertyFlags & preferred) == preferred)
+            return i;
+    }
+    return fallback;
+}
+
+static void winehua_swapchain_release_images(struct swapchain *swapchain)
+{
+    struct vulkan_device *device = swapchain->device;
+    if (!device) return;
+    /* Keep this small pool for device teardown.  Explicit destruction can
+     * block in the Harmony Venus driver after repeated acquire feedback. */
+    swapchain->acquire_pool = VK_NULL_HANDLE;
+    swapchain->acquire_command = VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < swapchain->image_count; ++i)
+    {
+        if (swapchain->images && swapchain->images[i])
+            device->p_vkDestroyImage(device->host.device, swapchain->images[i], NULL);
+        if (swapchain->memories && swapchain->memories[i])
+            device->p_vkFreeMemory(device->host.device, swapchain->memories[i], NULL);
+    }
+    free(swapchain->images);
+    free(swapchain->memories);
+    free(swapchain->acquired);
+    swapchain->images = NULL;
+    swapchain->memories = NULL;
+    swapchain->acquired = NULL;
+}
+
+static VkResult winehua_swapchain_create(struct vulkan_device *device,
+                                         struct surface *surface,
+                                         const VkSwapchainCreateInfoKHR *create_info,
+                                         struct swapchain *swapchain)
+{
+    const uint32_t image_count = min(max(create_info->minImageCount, 2u),
+                                     create_info->minImageCount && create_info->imageExtent.width ? 3u : 2u);
+    VkImageCreateInfo image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = create_info->imageFormat,
+        .extent = {max(create_info->imageExtent.width, 1u), max(create_info->imageExtent.height, 1u), 1},
+        .mipLevels = 1,
+        .arrayLayers = create_info->imageArrayLayers ? create_info->imageArrayLayers : 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        /* The private Host presenter normally only reads these images. Keep
+         * TRANSFER_DST available for the isolated VKD3D Maleoon compatibility
+         * profile, which copies the real D3D12 back buffer into the private
+         * swapchain image without changing the default DXVK path. */
+        .usage = create_info->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    swapchain->image_count = image_count;
+    swapchain->images = calloc(image_count, sizeof(*swapchain->images));
+    swapchain->memories = calloc(image_count, sizeof(*swapchain->memories));
+    swapchain->acquired = calloc(image_count, sizeof(*swapchain->acquired));
+    if (!swapchain->images || !swapchain->memories || !swapchain->acquired)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    swapchain->surface = surface;
+    swapchain->device = device;
+
+    for (uint32_t i = 0; i < image_count; ++i)
+    {
+        VkMemoryRequirements requirements;
+        VkMemoryAllocateInfo allocate_info;
+        VkResult result = device->p_vkCreateImage(device->host.device, &image_info, NULL, &swapchain->images[i]);
+        if (result != VK_SUCCESS) return result;
+        device->p_vkGetImageMemoryRequirements(device->host.device, swapchain->images[i], &requirements);
+        const uint32_t memory_type = winehua_find_memory_type(device->physical_device,
+                                                               requirements.memoryTypeBits,
+                                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (memory_type == UINT32_MAX) return VK_ERROR_FEATURE_NOT_PRESENT;
+        allocate_info = (VkMemoryAllocateInfo){
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = requirements.size,
+            .memoryTypeIndex = memory_type,
+        };
+        result = device->p_vkAllocateMemory(device->host.device, &allocate_info, NULL,
+                                            &swapchain->memories[i]);
+        if (result != VK_SUCCESS) return result;
+        result = device->p_vkBindImageMemory(device->host.device, swapchain->images[i],
+                                             swapchain->memories[i], 0);
+        if (result != VK_SUCCESS) return result;
+    }
+
+    {
+        VkCommandPoolCreateInfo pool_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .queueFamilyIndex = device->queues[0].info.queueFamilyIndex,
+        };
+        VkCommandBufferAllocateInfo allocation = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = VK_NULL_HANDLE,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        VkCommandBufferBeginInfo begin = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        };
+        VkResult result = device->p_vkCreateCommandPool(device->host.device, &pool_info, NULL,
+                                                        &swapchain->acquire_pool);
+        if (result != VK_SUCCESS) return result;
+        allocation.commandPool = swapchain->acquire_pool;
+        result = device->p_vkAllocateCommandBuffers(device->host.device, &allocation,
+                                                     &swapchain->acquire_command);
+        if (result != VK_SUCCESS) return result;
+        result = device->p_vkBeginCommandBuffer(swapchain->acquire_command, &begin);
+        if (result != VK_SUCCESS) return result;
+        result = device->p_vkEndCommandBuffer(swapchain->acquire_command);
+        if (result != VK_SUCCESS) return result;
+    }
+
+    swapchain->surface = surface;
+    swapchain->device = device;
+    swapchain->format = create_info->imageFormat;
+    swapchain->extents.width = image_info.extent.width;
+    swapchain->extents.height = image_info.extent.height;
+    swapchain->winehua_private = TRUE;
+    swapchain->serial = 0;
+    pthread_mutex_init(&swapchain->mutex, NULL);
+    pthread_cond_init(&swapchain->cond, NULL);
+    return VK_SUCCESS;
+}
+
+static void winehua_swapchain_destroy(struct swapchain *swapchain)
+{
+    if (!swapchain || !swapchain->winehua_private) return;
+    pthread_mutex_lock(&swapchain->mutex);
+    winehua_swapchain_release_images(swapchain);
+    pthread_cond_broadcast(&swapchain->cond);
+    pthread_mutex_unlock(&swapchain->mutex);
+    pthread_cond_destroy(&swapchain->cond);
+    pthread_mutex_destroy(&swapchain->mutex);
+}
+
+static VkResult winehua_swapchain_acquire(struct swapchain *swapchain, uint64_t timeout,
+                                          VkSemaphore semaphore, VkFence fence,
+                                          uint32_t *image_index)
+{
+    struct vulkan_device *device = swapchain->device;
+    struct semaphore *sem = semaphore ? semaphore_from_handle(semaphore) : NULL;
+    struct fence *f = fence ? fence_from_handle(fence) : NULL;
+    struct timespec deadline;
+    VkResult result = VK_SUCCESS;
+
+    pthread_mutex_lock(&swapchain->mutex);
+    for (;;)
+    {
+        for (uint32_t n = 0; n < swapchain->image_count; ++n)
+        {
+            const uint32_t i = (swapchain->next_image + n) % swapchain->image_count;
+            if (!swapchain->acquired[i])
+            {
+                swapchain->acquired[i] = TRUE;
+                swapchain->next_image = (i + 1) % swapchain->image_count;
+                *image_index = i;
+                goto acquired;
+            }
+        }
+        if (!timeout)
+        {
+            pthread_mutex_unlock(&swapchain->mutex);
+            return VK_TIMEOUT;
+        }
+        if (timeout != UINT64_MAX)
+        {
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += timeout / 1000000000ull;
+            deadline.tv_nsec += timeout % 1000000000ull;
+            if (deadline.tv_nsec >= 1000000000l) { ++deadline.tv_sec; deadline.tv_nsec -= 1000000000l; }
+            if (pthread_cond_timedwait(&swapchain->cond, &swapchain->mutex, &deadline) == ETIMEDOUT)
+            {
+                pthread_mutex_unlock(&swapchain->mutex);
+                return VK_TIMEOUT;
+            }
+        }
+        else pthread_cond_wait(&swapchain->cond, &swapchain->mutex);
+    }
+
+acquired:
+    pthread_mutex_unlock(&swapchain->mutex);
+    if (sem || f)
+    {
+        VkSemaphore host_sem = sem ? sem->obj.host.semaphore : VK_NULL_HANDLE;
+        VkFence host_fence = f ? f->obj.host.fence : VK_NULL_HANDLE;
+        VkSubmitInfo submit = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &swapchain->acquire_command,
+            .signalSemaphoreCount = host_sem ? 1u : 0u,
+            .pSignalSemaphores = host_sem ? &host_sem : NULL,
+        };
+        result = device->p_vkQueueSubmit(device->queues[0].host.queue, 1, &submit, host_fence);
+        if (result != VK_SUCCESS)
+        {
+            pthread_mutex_lock(&swapchain->mutex);
+            swapchain->acquired[*image_index] = FALSE;
+            pthread_cond_signal(&swapchain->cond);
+            pthread_mutex_unlock(&swapchain->mutex);
+        }
+    }
+    if (winehua_present_image_trace_enabled())
+        fprintf(stderr,
+                "WineHuaPresentImage: layer=wine event=acquire swapchain=0x%llx "
+                "index=%u image=0x%llx status=%d\n",
+                (unsigned long long)(uint64_t)swapchain->obj.client.swapchain,
+                *image_index,
+                (unsigned long long)(uintptr_t)swapchain->images[*image_index],
+                result);
+    return result;
+}
+
+/*
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D texSampler;
+layout(binding = 1) uniform writeonly image2D outImage;
+layout(push_constant) uniform pushConstants {
+    //both in real image coords
+    vec2 offset;
+    vec2 extents;
+} constants;
+
+void main()
+{
+    vec2 texcoord = (vec2(gl_GlobalInvocationID.xy) - constants.offset) / constants.extents;
+    vec4 c = texture(texSampler, texcoord);
+
+    // Convert linear -> srgb
+    bvec3 isLo = lessThanEqual(c.rgb, vec3(0.0031308f));
+    vec3 loPart = c.rgb * 12.92f;
+    vec3 hiPart = pow(c.rgb, vec3(5.0f / 12.0f)) * 1.055f - 0.055f;
+    c.rgb = mix(hiPart, loPart, isLo);
+
+    imageStore(outImage, ivec2(gl_GlobalInvocationID.xy), c);
+}
+
+*/
+const uint32_t blit_comp_spv[] =
+{
+    0x07230203, 0x00010000, 0x0008000a, 0x0000005e, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
+    0x00000038, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e,
+    0x00000000, 0x00000001, 0x0006000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000d,
+    0x00060010, 0x00000004, 0x00000011, 0x00000008, 0x00000008, 0x00000001, 0x00030003, 0x00000002,
+    0x000001cc, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00050005, 0x00000009, 0x63786574,
+    0x64726f6f, 0x00000000, 0x00080005, 0x0000000d, 0x475f6c67, 0x61626f6c, 0x766e496c, 0x7461636f,
+    0x496e6f69, 0x00000044, 0x00060005, 0x00000012, 0x68737570, 0x736e6f43, 0x746e6174, 0x00000073,
+    0x00050006, 0x00000012, 0x00000000, 0x7366666f, 0x00007465, 0x00050006, 0x00000012, 0x00000001,
+    0x65747865, 0x0073746e, 0x00050005, 0x00000014, 0x736e6f63, 0x746e6174, 0x00000073, 0x00030005,
+    0x00000021, 0x00000063, 0x00050005, 0x00000025, 0x53786574, 0x6c706d61, 0x00007265, 0x00040005,
+    0x0000002d, 0x6f4c7369, 0x00000000, 0x00040005, 0x00000035, 0x61506f6c, 0x00007472, 0x00040005,
+    0x0000003a, 0x61506968, 0x00007472, 0x00050005, 0x00000055, 0x4974756f, 0x6567616d, 0x00000000,
+    0x00040047, 0x0000000d, 0x0000000b, 0x0000001c, 0x00050048, 0x00000012, 0x00000000, 0x00000023,
+    0x00000000, 0x00050048, 0x00000012, 0x00000001, 0x00000023, 0x00000008, 0x00030047, 0x00000012,
+    0x00000002, 0x00040047, 0x00000025, 0x00000022, 0x00000000, 0x00040047, 0x00000025, 0x00000021,
+    0x00000000, 0x00040047, 0x00000055, 0x00000022, 0x00000000, 0x00040047, 0x00000055, 0x00000021,
+    0x00000001, 0x00030047, 0x00000055, 0x00000019, 0x00040047, 0x0000005d, 0x0000000b, 0x00000019,
+    0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020,
+    0x00040017, 0x00000007, 0x00000006, 0x00000002, 0x00040020, 0x00000008, 0x00000007, 0x00000007,
+    0x00040015, 0x0000000a, 0x00000020, 0x00000000, 0x00040017, 0x0000000b, 0x0000000a, 0x00000003,
+    0x00040020, 0x0000000c, 0x00000001, 0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000001,
+    0x00040017, 0x0000000e, 0x0000000a, 0x00000002, 0x0004001e, 0x00000012, 0x00000007, 0x00000007,
+    0x00040020, 0x00000013, 0x00000009, 0x00000012, 0x0004003b, 0x00000013, 0x00000014, 0x00000009,
+    0x00040015, 0x00000015, 0x00000020, 0x00000001, 0x0004002b, 0x00000015, 0x00000016, 0x00000000,
+    0x00040020, 0x00000017, 0x00000009, 0x00000007, 0x0004002b, 0x00000015, 0x0000001b, 0x00000001,
+    0x00040017, 0x0000001f, 0x00000006, 0x00000004, 0x00040020, 0x00000020, 0x00000007, 0x0000001f,
+    0x00090019, 0x00000022, 0x00000006, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001,
+    0x00000000, 0x0003001b, 0x00000023, 0x00000022, 0x00040020, 0x00000024, 0x00000000, 0x00000023,
+    0x0004003b, 0x00000024, 0x00000025, 0x00000000, 0x0004002b, 0x00000006, 0x00000028, 0x00000000,
+    0x00020014, 0x0000002a, 0x00040017, 0x0000002b, 0x0000002a, 0x00000003, 0x00040020, 0x0000002c,
+    0x00000007, 0x0000002b, 0x00040017, 0x0000002e, 0x00000006, 0x00000003, 0x0004002b, 0x00000006,
+    0x00000031, 0x3b4d2e1c, 0x0006002c, 0x0000002e, 0x00000032, 0x00000031, 0x00000031, 0x00000031,
+    0x00040020, 0x00000034, 0x00000007, 0x0000002e, 0x0004002b, 0x00000006, 0x00000038, 0x414eb852,
+    0x0004002b, 0x00000006, 0x0000003d, 0x3ed55555, 0x0006002c, 0x0000002e, 0x0000003e, 0x0000003d,
+    0x0000003d, 0x0000003d, 0x0004002b, 0x00000006, 0x00000040, 0x3f870a3d, 0x0004002b, 0x00000006,
+    0x00000042, 0x3d6147ae, 0x0004002b, 0x0000000a, 0x00000049, 0x00000000, 0x00040020, 0x0000004a,
+    0x00000007, 0x00000006, 0x0004002b, 0x0000000a, 0x0000004d, 0x00000001, 0x0004002b, 0x0000000a,
+    0x00000050, 0x00000002, 0x00090019, 0x00000053, 0x00000006, 0x00000001, 0x00000000, 0x00000000,
+    0x00000000, 0x00000002, 0x00000000, 0x00040020, 0x00000054, 0x00000000, 0x00000053, 0x0004003b,
+    0x00000054, 0x00000055, 0x00000000, 0x00040017, 0x00000059, 0x00000015, 0x00000002, 0x0004002b,
+    0x0000000a, 0x0000005c, 0x00000008, 0x0006002c, 0x0000000b, 0x0000005d, 0x0000005c, 0x0000005c,
+    0x0000004d, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
+    0x0004003b, 0x00000008, 0x00000009, 0x00000007, 0x0004003b, 0x00000020, 0x00000021, 0x00000007,
+    0x0004003b, 0x0000002c, 0x0000002d, 0x00000007, 0x0004003b, 0x00000034, 0x00000035, 0x00000007,
+    0x0004003b, 0x00000034, 0x0000003a, 0x00000007, 0x0004003d, 0x0000000b, 0x0000000f, 0x0000000d,
+    0x0007004f, 0x0000000e, 0x00000010, 0x0000000f, 0x0000000f, 0x00000000, 0x00000001, 0x00040070,
+    0x00000007, 0x00000011, 0x00000010, 0x00050041, 0x00000017, 0x00000018, 0x00000014, 0x00000016,
+    0x0004003d, 0x00000007, 0x00000019, 0x00000018, 0x00050083, 0x00000007, 0x0000001a, 0x00000011,
+    0x00000019, 0x00050041, 0x00000017, 0x0000001c, 0x00000014, 0x0000001b, 0x0004003d, 0x00000007,
+    0x0000001d, 0x0000001c, 0x00050088, 0x00000007, 0x0000001e, 0x0000001a, 0x0000001d, 0x0003003e,
+    0x00000009, 0x0000001e, 0x0004003d, 0x00000023, 0x00000026, 0x00000025, 0x0004003d, 0x00000007,
+    0x00000027, 0x00000009, 0x00070058, 0x0000001f, 0x00000029, 0x00000026, 0x00000027, 0x00000002,
+    0x00000028, 0x0003003e, 0x00000021, 0x00000029, 0x0004003d, 0x0000001f, 0x0000002f, 0x00000021,
+    0x0008004f, 0x0000002e, 0x00000030, 0x0000002f, 0x0000002f, 0x00000000, 0x00000001, 0x00000002,
+    0x000500bc, 0x0000002b, 0x00000033, 0x00000030, 0x00000032, 0x0003003e, 0x0000002d, 0x00000033,
+    0x0004003d, 0x0000001f, 0x00000036, 0x00000021, 0x0008004f, 0x0000002e, 0x00000037, 0x00000036,
+    0x00000036, 0x00000000, 0x00000001, 0x00000002, 0x0005008e, 0x0000002e, 0x00000039, 0x00000037,
+    0x00000038, 0x0003003e, 0x00000035, 0x00000039, 0x0004003d, 0x0000001f, 0x0000003b, 0x00000021,
+    0x0008004f, 0x0000002e, 0x0000003c, 0x0000003b, 0x0000003b, 0x00000000, 0x00000001, 0x00000002,
+    0x0007000c, 0x0000002e, 0x0000003f, 0x00000001, 0x0000001a, 0x0000003c, 0x0000003e, 0x0005008e,
+    0x0000002e, 0x00000041, 0x0000003f, 0x00000040, 0x00060050, 0x0000002e, 0x00000043, 0x00000042,
+    0x00000042, 0x00000042, 0x00050083, 0x0000002e, 0x00000044, 0x00000041, 0x00000043, 0x0003003e,
+    0x0000003a, 0x00000044, 0x0004003d, 0x0000002e, 0x00000045, 0x0000003a, 0x0004003d, 0x0000002e,
+    0x00000046, 0x00000035, 0x0004003d, 0x0000002b, 0x00000047, 0x0000002d, 0x000600a9, 0x0000002e,
+    0x00000048, 0x00000047, 0x00000046, 0x00000045, 0x00050041, 0x0000004a, 0x0000004b, 0x00000021,
+    0x00000049, 0x00050051, 0x00000006, 0x0000004c, 0x00000048, 0x00000000, 0x0003003e, 0x0000004b,
+    0x0000004c, 0x00050041, 0x0000004a, 0x0000004e, 0x00000021, 0x0000004d, 0x00050051, 0x00000006,
+    0x0000004f, 0x00000048, 0x00000001, 0x0003003e, 0x0000004e, 0x0000004f, 0x00050041, 0x0000004a,
+    0x00000051, 0x00000021, 0x00000050, 0x00050051, 0x00000006, 0x00000052, 0x00000048, 0x00000002,
+    0x0003003e, 0x00000051, 0x00000052, 0x0004003d, 0x00000053, 0x00000056, 0x00000055, 0x0004003d,
+    0x0000000b, 0x00000057, 0x0000000d, 0x0007004f, 0x0000000e, 0x00000058, 0x00000057, 0x00000057,
+    0x00000000, 0x00000001, 0x0004007c, 0x00000059, 0x0000005a, 0x00000058, 0x0004003d, 0x0000001f,
+    0x0000005b, 0x00000021, 0x00040063, 0x00000056, 0x0000005a, 0x0000005b, 0x000100fd, 0x00010038,
+};
+
+static VkResult create_pipeline( struct vulkan_device *device, struct swapchain *swapchain, VkShaderModule shaderModule )
+{
+    VkComputePipelineCreateInfo pipelineInfo = {0};
+    VkResult res;
+
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineInfo.stage.module = shaderModule;
+    pipelineInfo.stage.pName = "main";
+    pipelineInfo.layout = swapchain->pipeline_layout;
+    pipelineInfo.basePipelineHandle = VK_NULL_HANDLE;
+    pipelineInfo.basePipelineIndex = -1;
+
+    if ((res = device->p_vkCreateComputePipelines( device->host.device, VK_NULL_HANDLE, 1,
+                                                   &pipelineInfo, NULL, &swapchain->pipeline )))
+    {
+        ERR( "vkCreateComputePipelines: %d\n", res );
+        return res;
+    }
+
+    return VK_SUCCESS;
+}
+
+static VkResult create_descriptor_set( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_image *hack )
+{
+    VkDescriptorImageInfo userDescriptorImageInfo = {0}, realDescriptorImageInfo = {0};
+    VkDescriptorSetAllocateInfo descriptorAllocInfo = {0};
+    VkWriteDescriptorSet descriptorWrites[2] = {{0}, {0}};
+    VkResult res;
+
+    descriptorAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    descriptorAllocInfo.descriptorPool = swapchain->descriptor_pool;
+    descriptorAllocInfo.descriptorSetCount = 1;
+    descriptorAllocInfo.pSetLayouts = &swapchain->descriptor_set_layout;
+
+    if ((res = device->p_vkAllocateDescriptorSets( device->host.device, &descriptorAllocInfo, &hack->descriptor_set )))
+    {
+        ERR( "vkAllocateDescriptorSets: %d\n", res );
+        return res;
+    }
+
+    userDescriptorImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    userDescriptorImageInfo.imageView = hack->user_view;
+    userDescriptorImageInfo.sampler = swapchain->sampler;
+
+    realDescriptorImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    realDescriptorImageInfo.imageView = hack->blit_view;
+
+    descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrites[0].dstSet = hack->descriptor_set;
+    descriptorWrites[0].dstBinding = 0;
+    descriptorWrites[0].dstArrayElement = 0;
+    descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    descriptorWrites[0].descriptorCount = 1;
+    descriptorWrites[0].pImageInfo = &userDescriptorImageInfo;
+
+    descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrites[1].dstSet = hack->descriptor_set;
+    descriptorWrites[1].dstBinding = 1;
+    descriptorWrites[1].dstArrayElement = 0;
+    descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    descriptorWrites[1].descriptorCount = 1;
+    descriptorWrites[1].pImageInfo = &realDescriptorImageInfo;
+
+    device->p_vkUpdateDescriptorSets( device->host.device, 2, descriptorWrites, 0, NULL );
+    return VK_SUCCESS;
+}
+
+static VkResult init_blit_images( struct vulkan_device *device, struct swapchain *swapchain )
+{
+    VkResult res;
+    VkSamplerCreateInfo samplerInfo = {0};
+    VkDescriptorPoolSize poolSizes[2] = {{0}, {0}};
+    VkDescriptorPoolCreateInfo poolInfo = {0};
+    VkDescriptorSetLayoutBinding layoutBindings[2] = {{0}, {0}};
+    VkDescriptorSetLayoutCreateInfo descriptorLayoutInfo = {0};
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = {0};
+    VkPushConstantRange pushConstants;
+    VkShaderModuleCreateInfo shaderInfo = {0};
+    VkShaderModule shaderModule = 0;
+    VkImageViewCreateInfo viewInfo = {0};
+    uint32_t i;
+
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = samplerInfo.minFilter = fs_hack_is_integer() ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1;
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.mipLodBias = 0.0f;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+
+    if ((res = device->p_vkCreateSampler( device->host.device, &samplerInfo, NULL, &swapchain->sampler )))
+    {
+        WARN( "vkCreateSampler failed, res=%d\n", res );
+        return res;
+    }
+
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizes[0].descriptorCount = swapchain->n_images;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    poolSizes[1].descriptorCount = swapchain->n_images;
+
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.poolSizeCount = 2;
+    poolInfo.pPoolSizes = poolSizes;
+    poolInfo.maxSets = swapchain->n_images;
+
+    if ((res = device->p_vkCreateDescriptorPool( device->host.device, &poolInfo, NULL, &swapchain->descriptor_pool )))
+    {
+        ERR( "vkCreateDescriptorPool: %d\n", res );
+        goto fail;
+    }
+
+    layoutBindings[0].binding = 0;
+    layoutBindings[0].descriptorCount = 1;
+    layoutBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    layoutBindings[0].pImmutableSamplers = NULL;
+    layoutBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    layoutBindings[1].binding = 1;
+    layoutBindings[1].descriptorCount = 1;
+    layoutBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    layoutBindings[1].pImmutableSamplers = NULL;
+    layoutBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    descriptorLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    descriptorLayoutInfo.bindingCount = 2;
+    descriptorLayoutInfo.pBindings = layoutBindings;
+
+    if ((res = device->p_vkCreateDescriptorSetLayout( device->host.device, &descriptorLayoutInfo,
+                                                      NULL, &swapchain->descriptor_set_layout )))
+    {
+        ERR( "vkCreateDescriptorSetLayout: %d\n", res );
+        goto fail;
+    }
+
+    pushConstants.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstants.offset = 0;
+    pushConstants.size = 4 * sizeof(float); /* 2 * vec2 */
+
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &swapchain->descriptor_set_layout;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushConstants;
+
+    if ((res = device->p_vkCreatePipelineLayout( device->host.device, &pipelineLayoutInfo, NULL,
+                                                 &swapchain->pipeline_layout )))
+    {
+        ERR( "vkCreatePipelineLayout: %d\n", res );
+        goto fail;
+    }
+
+    shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    shaderInfo.codeSize = sizeof(blit_comp_spv);
+    shaderInfo.pCode = blit_comp_spv;
+
+    if ((res = device->p_vkCreateShaderModule( device->host.device, &shaderInfo, NULL, &shaderModule )))
+    {
+        ERR( "vkCreateShaderModule: %d\n", res );
+        goto fail;
+    }
+
+    if ((res = create_pipeline( device, swapchain, shaderModule ))) goto fail;
+
+    device->p_vkDestroyShaderModule( device->host.device, shaderModule, NULL );
+
+    for (i = 0; i < swapchain->n_images; ++i)
+    {
+        struct fs_hack_image *hack = &swapchain->fs_hack_images[i];
+
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = hack->swapchain_image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = VK_FORMAT_B8G8R8A8_UNORM;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+
+        if ((res = device->p_vkCreateImageView( device->host.device, &viewInfo, NULL, &hack->blit_view )))
+        {
+            ERR( "vkCreateImageView(blit): %d\n", res );
+            goto fail;
+        }
+
+        if ((res = create_descriptor_set( device, swapchain, hack ))) goto fail;
+    }
+
+    return VK_SUCCESS;
+
+fail:
+    for (i = 0; i < swapchain->n_images; ++i)
+    {
+        struct fs_hack_image *hack = &swapchain->fs_hack_images[i];
+
+        device->p_vkDestroyImageView( device->host.device, hack->blit_view, NULL );
+        hack->blit_view = VK_NULL_HANDLE;
+    }
+
+    device->p_vkDestroyShaderModule( device->host.device, shaderModule, NULL );
+
+    device->p_vkDestroyPipeline( device->host.device, swapchain->pipeline, NULL );
+    swapchain->pipeline = VK_NULL_HANDLE;
+
+    device->p_vkDestroyPipelineLayout( device->host.device, swapchain->pipeline_layout, NULL );
+    swapchain->pipeline_layout = VK_NULL_HANDLE;
+
+    device->p_vkDestroyDescriptorSetLayout( device->host.device, swapchain->descriptor_set_layout, NULL );
+    swapchain->descriptor_set_layout = VK_NULL_HANDLE;
+
+    device->p_vkDestroyDescriptorPool( device->host.device, swapchain->descriptor_pool, NULL );
+    swapchain->descriptor_pool = VK_NULL_HANDLE;
+
+    device->p_vkDestroySampler( device->host.device, swapchain->sampler, NULL );
+    swapchain->sampler = VK_NULL_HANDLE;
+
+    return res;
+}
+
+static void destroy_fs_hack_image( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_image *hack )
+{
+    device->p_vkDestroyImageView( device->host.device, hack->user_view, NULL );
+    device->p_vkDestroyImageView( device->host.device, hack->blit_view, NULL );
+    device->p_vkDestroyImage( device->host.device, hack->user_image, NULL );
+    if (hack->cmd) device->p_vkFreeCommandBuffers( device->host.device, swapchain->cmd_pools[hack->cmd_queue_idx], 1, &hack->cmd );
+    device->p_vkDestroySemaphore( device->host.device, hack->blit_finished, NULL );
+}
+
+static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapchain *swapchain,
+                                     const VkSwapchainCreateInfoKHR *createinfo )
+{
+    struct vulkan_physical_device *physical_device = device->physical_device;
+    struct vulkan_instance *instance = physical_device->instance;
+    VkResult res;
+    VkImage *real_images = NULL;
+    VkDeviceSize userMemTotal = 0, offs;
+    VkImageCreateInfo imageInfo = {0};
+    VkSemaphoreCreateInfo semaphoreInfo = {0};
+    VkMemoryRequirements userMemReq;
+    VkMemoryAllocateInfo allocInfo = {0};
+    VkPhysicalDeviceMemoryProperties memProperties;
+    VkImageViewCreateInfo viewInfo = {0};
+    uint32_t count, i = 0, user_memory_type = -1;
+
+    if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain, &count, NULL )))
+    {
+        WARN( "vkGetSwapchainImagesKHR failed, res=%d\n", res );
+        return res;
+    }
+
+    real_images = malloc( count * sizeof(VkImage) );
+    swapchain->cmd_pools = calloc( device->queue_count, sizeof(VkCommandPool) );
+    swapchain->fs_hack_images = calloc( count, sizeof(struct fs_hack_image) );
+    if (!real_images || !swapchain->cmd_pools || !swapchain->fs_hack_images) goto fail;
+
+    if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain, &count, real_images )))
+    {
+        WARN( "vkGetSwapchainImagesKHR failed, res=%d\n", res );
+        goto fail;
+    }
+
+    /* create user images */
+    for (i = 0; i < count; ++i)
+    {
+        struct fs_hack_image *hack = &swapchain->fs_hack_images[i];
+
+        hack->swapchain_image = real_images[i];
+
+        semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        if ((res = device->p_vkCreateSemaphore( device->host.device, &semaphoreInfo, NULL, &hack->blit_finished )))
+        {
+            WARN( "vkCreateSemaphore failed, res=%d\n", res );
+            goto fail;
+        }
+
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.extent.width = swapchain->extents.width;
+        imageInfo.extent.height = swapchain->extents.height;
+        imageInfo.extent.depth = 1;
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = createinfo->imageArrayLayers;
+        imageInfo.format = createinfo->imageFormat;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        imageInfo.usage = createinfo->imageUsage | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageInfo.sharingMode = createinfo->imageSharingMode;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.queueFamilyIndexCount = createinfo->queueFamilyIndexCount;
+        imageInfo.pQueueFamilyIndices = createinfo->pQueueFamilyIndices;
+
+        if (createinfo->flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR)
+            imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+        else if (createinfo->imageFormat != VK_FORMAT_B8G8R8A8_SRGB)
+            imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+
+        if ((res = device->p_vkCreateImage( device->host.device, &imageInfo, NULL, &hack->user_image )))
+        {
+            ERR( "vkCreateImage failed: %d\n", res );
+            goto fail;
+        }
+
+        device->p_vkGetImageMemoryRequirements( device->host.device, hack->user_image, &userMemReq );
+
+        offs = userMemTotal % userMemReq.alignment;
+        if (offs) userMemTotal += userMemReq.alignment - offs;
+
+        userMemTotal += userMemReq.size;
+
+        swapchain->n_images++;
+    }
+
+    /* allocate backing memory */
+    instance->p_vkGetPhysicalDeviceMemoryProperties( physical_device->host.physical_device, &memProperties );
+
+    for (i = 0; i < memProperties.memoryTypeCount; i++)
+    {
+        UINT flag = memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        if (flag == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        {
+            if (userMemReq.memoryTypeBits & (1 << i))
+            {
+                user_memory_type = i;
+                break;
+            }
+        }
+    }
+
+    if (user_memory_type == -1)
+    {
+        ERR( "unable to find suitable memory type\n" );
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto fail;
+    }
+
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = userMemTotal;
+    allocInfo.memoryTypeIndex = user_memory_type;
+
+    if ((res = device->p_vkAllocateMemory( device->host.device, &allocInfo, NULL, &swapchain->user_image_memory )))
+    {
+        ERR( "vkAllocateMemory: %d\n", res );
+        goto fail;
+    }
+
+    /* bind backing memory and create imageviews */
+    userMemTotal = 0;
+    for (i = 0; i < count; ++i)
+    {
+        device->p_vkGetImageMemoryRequirements( device->host.device, swapchain->fs_hack_images[i].user_image, &userMemReq );
+
+        offs = userMemTotal % userMemReq.alignment;
+        if (offs) userMemTotal += userMemReq.alignment - offs;
+
+        if ((res = device->p_vkBindImageMemory( device->host.device, swapchain->fs_hack_images[i].user_image,
+                                                swapchain->user_image_memory, userMemTotal )))
+        {
+            ERR( "vkBindImageMemory: %d\n", res );
+            goto fail;
+        }
+
+        userMemTotal += userMemReq.size;
+
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = swapchain->fs_hack_images[i].user_image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = VK_FORMAT_B8G8R8A8_SRGB;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+
+        if ((res = device->p_vkCreateImageView( device->host.device, &viewInfo, NULL,
+                                                &swapchain->fs_hack_images[i].user_view )))
+        {
+            ERR( "vkCreateImageView(user): %d\n", res );
+            goto fail;
+        }
+    }
+
+    free( real_images );
+
+    return VK_SUCCESS;
+
+fail:
+    for (i = 0; i < swapchain->n_images; ++i) destroy_fs_hack_image( device, swapchain, &swapchain->fs_hack_images[i] );
+    free( real_images );
+    free( swapchain->cmd_pools );
+    free( swapchain->fs_hack_images );
+    return res;
+}
+
+static BOOL surface_get_fshack_dpi( struct surface *surface )
+{
+    UINT dpi = NtUserGetDpiForWindow( surface->hwnd ), raw = NtUserGetWinMonitorDpi( surface->hwnd, MDT_RAW_DPI );
+    return fshack_enabled && dpi != raw ? raw : 0;
 }
 
 static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwapchainCreateInfoKHR *create_info,
@@ -1824,6 +3486,33 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     VkSwapchainKHR host_swapchain;
     RECT client_rect;
     VkResult res;
+
+    if (surface && surface->winehua_private)
+    {
+        if (!(swapchain = calloc(1, sizeof(*swapchain)))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        if ((res = winehua_swapchain_create(device, surface, create_info, swapchain)) != VK_SUCCESS)
+        {
+            winehua_swapchain_destroy(swapchain);
+            winehua_swapchain_release_images(swapchain);
+            free(swapchain);
+            return res;
+        }
+        vulkan_object_init(&swapchain->obj.obj,
+                           WINEHUA_VULKAN_SWAPCHAIN_TAG |
+                           ((uint64_t)(uintptr_t)swapchain & UINT64_C(0x00000000ffffffff)));
+        instance->p_insert_object(instance, &swapchain->obj.obj);
+        *ret = swapchain->obj.client.swapchain;
+        if (winehua_present_image_trace_enabled())
+        {
+            for (uint32_t i = 0; i < swapchain->image_count; ++i)
+                fprintf(stderr,
+                        "WineHuaPresentImage: layer=wine event=image-map "
+                        "swapchain=0x%llx index=%u image=0x%llx\n",
+                        (unsigned long long)(uint64_t)*ret, i,
+                        (unsigned long long)(uintptr_t)swapchain->images[i]);
+        }
+        return VK_SUCCESS;
+    }
 
     if (!NtUserIsWindow( surface->hwnd ))
     {
@@ -1845,7 +3534,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
      * display mode change emulation), MoltenVK's vkQueuePresentKHR returns VK_SUBOPTIMAL_KHR.
      * Create the swapchain with VkSwapchainPresentScalingCreateInfoEXT to avoid this.
      */
-    if (get_surface_rect( surface->hwnd, &client_rect, NtUserGetWinMonitorDpi( surface->hwnd, MDT_RAW_DPI ) ) &&
+    if (get_surface_rect( surface->hwnd, &client_rect, NtUserGetWinMonitorDpi( surface->hwnd, MDT_WINE_RAW_DPI ) ) &&
         !extents_equals( &create_info_host.imageExtent, &client_rect ) &&
         instance->extensions.has_VK_EXT_surface_maintenance1 &&
         physical_device->extensions.has_VK_KHR_swapchain_maintenance1)
@@ -1855,6 +3544,31 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     }
 
     if (!(swapchain = calloc( 1, sizeof(*swapchain) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    if ((swapchain->fshack_dpi = surface_get_fshack_dpi( surface )))
+    {
+        VkSurfaceCapabilitiesKHR caps = {0};
+
+        if ((res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device,
+                                                                          create_info_host.surface, &caps )))
+        {
+            TRACE( "vkGetPhysicalDeviceSurfaceCapabilities failed, res=%d\n", res );
+            free( swapchain );
+            return res;
+        }
+
+        if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT))
+            FIXME( "Swapchain does not support required VK_IMAGE_USAGE_STORAGE_BIT\n" );
+
+        swapchain->host_extents = capabilities.minImageExtent;
+        create_info_host.imageExtent = capabilities.minImageExtent;
+        create_info_host.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+        create_info_host.imageUsage = VK_IMAGE_USAGE_STORAGE_BIT;
+
+        if (create_info->imageFormat != VK_FORMAT_B8G8R8A8_UNORM && create_info->imageFormat != VK_FORMAT_B8G8R8A8_SRGB)
+            FIXME( "swapchain image format is not BGRA8 UNORM/SRGB. Things may go badly. %d\n",
+                   create_info_host.imageFormat );
+    }
 
     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
     {
@@ -1866,6 +3580,28 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     swapchain->surface = surface;
     swapchain->extents = create_info->imageExtent;
     instance->p_insert_object( instance, &swapchain->obj.obj );
+
+    if (swapchain->fshack_dpi)
+    {
+        if ((res = init_fs_hack_images( device, swapchain, create_info )))
+        {
+            ERR( "creating fs hack images failed: %d\n", res );
+            device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
+            free( swapchain );
+            return res;
+        }
+
+        if ((res = init_blit_images( device, swapchain )))
+        {
+            ERR( "creating blit images failed: %d\n", res );
+            device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
+            free( swapchain );
+            return res;
+        }
+
+        WARN( "Enabled fullscreen hack on swapchain %p, scalind from %s -> %s\n", swapchain,
+              debugstr_vkextent2d(&swapchain->extents), debugstr_vkextent2d(&swapchain->host_extents) );
+    }
 
     *ret = swapchain->obj.client.swapchain;
     return VK_SUCCESS;
@@ -1880,6 +3616,36 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
 
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
     if (!swapchain) return;
+
+    if (swapchain->winehua_private)
+    {
+        instance->p_remove_object(instance, &swapchain->obj.obj);
+        winehua_swapchain_destroy(swapchain);
+        free(swapchain);
+        return;
+    }
+
+    if (swapchain->fshack_dpi)
+    {
+        for (uint32_t i = 0; i < swapchain->n_images; ++i)
+        {
+            destroy_fs_hack_image( device, swapchain, &swapchain->fs_hack_images[i] );
+        }
+        for (uint32_t i = 0; i < device->queue_count; ++i)
+        {
+            if (!swapchain->cmd_pools[i]) continue;
+            device->p_vkDestroyCommandPool( device->host.device, swapchain->cmd_pools[i], NULL );
+        }
+
+        device->p_vkDestroyPipeline( device->host.device, swapchain->pipeline, NULL );
+        device->p_vkDestroyPipelineLayout( device->host.device, swapchain->pipeline_layout, NULL );
+        device->p_vkDestroyDescriptorSetLayout( device->host.device, swapchain->descriptor_set_layout, NULL );
+        device->p_vkDestroyDescriptorPool( device->host.device, swapchain->descriptor_pool, NULL );
+        device->p_vkDestroySampler( device->host.device, swapchain->sampler, NULL );
+        device->p_vkFreeMemory( device->host.device, swapchain->user_image_memory, NULL );
+        free( swapchain->cmd_pools );
+        free( swapchain->fs_hack_images );
+    }
 
     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
     instance->p_remove_object( instance, &swapchain->obj.obj );
@@ -1899,10 +3665,21 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     RECT client_rect;
     VkResult res;
 
+    if (swapchain->winehua_private)
+        return winehua_swapchain_acquire(swapchain, acquire_info->timeout,
+                                         acquire_info->semaphore, acquire_info->fence,
+                                         image_index);
+
     acquire_info_host.swapchain = swapchain->obj.host.swapchain;
     acquire_info_host.semaphore = semaphore ? semaphore->host.semaphore : 0;
     acquire_info_host.fence = fence ? fence->host.fence : 0;
     res = device->p_vkAcquireNextImage2KHR( device->host.device, &acquire_info_host, image_index );
+
+    if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
+    {
+        WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
+        return VK_SUBOPTIMAL_KHR;
+    }
 
     if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
@@ -1926,9 +3703,19 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     RECT client_rect;
     VkResult res;
 
+    if (swapchain->winehua_private)
+        return winehua_swapchain_acquire(swapchain, timeout, client_semaphore,
+                                         client_fence, image_index);
+
     res = device->p_vkAcquireNextImageKHR( device->host.device, swapchain->obj.host.swapchain, timeout,
                                               semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
                                               image_index );
+
+    if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
+    {
+        WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
+        return VK_SUBOPTIMAL_KHR;
+    }
 
     if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
@@ -1941,20 +3728,321 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     return res;
 }
 
+static VkResult winehua_queue_present(struct vulkan_queue *queue, VkPresentInfoKHR *present_info)
+{
+    struct vulkan_device *device = queue->device;
+    VkSemaphore stack_semaphores[16];
+    VkSemaphore *host_semaphores = stack_semaphores;
+    VkResult result = VK_SUCCESS;
+
+    for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+    {
+        struct swapchain *swapchain = swapchain_from_handle(present_info->pSwapchains[i]);
+        if (!swapchain || !swapchain->winehua_private) return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if (present_info->waitSemaphoreCount > ARRAY_SIZE(stack_semaphores) &&
+        !(host_semaphores = malloc(present_info->waitSemaphoreCount * sizeof(*host_semaphores))))
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    for (uint32_t i = 0; i < present_info->waitSemaphoreCount; ++i)
+    {
+        struct semaphore *semaphore = semaphore_from_handle(present_info->pWaitSemaphores[i]);
+        host_semaphores[i] = semaphore->obj.host.semaphore;
+    }
+    if (present_info->waitSemaphoreCount)
+    {
+        VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkSubmitInfo wait_submit = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = present_info->waitSemaphoreCount,
+            .pWaitSemaphores = host_semaphores,
+            .pWaitDstStageMask = &wait_stage,
+        };
+        result = device->p_vkQueueSubmit(queue->host.queue, 1, &wait_submit, VK_NULL_HANDLE);
+        if (result != VK_SUCCESS) goto done;
+    }
+
+    for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+    {
+        struct swapchain *swapchain = swapchain_from_handle(present_info->pSwapchains[i]);
+        const uint32_t image_index = present_info->pImageIndices[i];
+        int present_result;
+        uint64_t deadline = 0;
+        if (image_index >= swapchain->image_count)
+        {
+            present_result = -EINVAL;
+        }
+        else
+        {
+            const uint32_t serial = ++swapchain->serial;
+            client_surface_update(swapchain->surface->client);
+            present_result = winehua_present_image(queue, swapchain->images[image_index],
+                                                   swapchain->extents.width, swapchain->extents.height,
+                                                   swapchain->format, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                                                   swapchain->surface->winehua_surface_id,
+                                                   swapchain->surface->winehua_owner_pid,
+                                                   swapchain->surface->hwnd,
+                                                   serial, &deadline);
+            if (winehua_present_image_trace_enabled())
+                fprintf(stderr,
+                        "WineHuaPresentImage: layer=wine event=present "
+                        "swapchain=0x%llx serial=%u index=%u image=0x%llx "
+                        "result=%d deadline=%llu\n",
+                        (unsigned long long)(uint64_t)present_info->pSwapchains[i],
+                        serial, image_index,
+                        (unsigned long long)(uintptr_t)swapchain->images[image_index],
+                        present_result, (unsigned long long)deadline);
+            client_surface_present(swapchain->surface->client);
+            pthread_mutex_lock(&swapchain->mutex);
+            swapchain->acquired[image_index] = FALSE;
+            pthread_cond_signal(&swapchain->cond);
+            pthread_mutex_unlock(&swapchain->mutex);
+        }
+        VkResult swapchain_result = present_result == 0 || present_result == 1
+            ? VK_SUCCESS : present_result == -EAGAIN ? VK_SUBOPTIMAL_KHR
+            : present_result == -ENOSYS ? VK_ERROR_EXTENSION_NOT_PRESENT
+            : VK_ERROR_DEVICE_LOST;
+        if (present_info->pResults) present_info->pResults[i] = swapchain_result;
+        if (result == VK_SUCCESS && swapchain_result != VK_SUCCESS) result = swapchain_result;
+    }
+
+done:
+    if (host_semaphores != stack_semaphores) free(host_semaphores);
+    return result;
+}
+
+static VkResult win32u_vkGetSwapchainImagesKHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
+                                                uint32_t *count, VkImage *images )
+{
+    struct vulkan_device *device = vulkan_device_from_handle( client_device );
+    struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
+    uint32_t i;
+
+    if (swapchain->winehua_private)
+    {
+        if (!images)
+        {
+            *count = swapchain->image_count;
+            return VK_SUCCESS;
+        }
+        else
+        {
+            const uint32_t copy_count = min(*count, swapchain->image_count);
+            memcpy(images, swapchain->images, copy_count * sizeof(*images));
+            *count = copy_count;
+            return copy_count == swapchain->image_count ? VK_SUCCESS : VK_INCOMPLETE;
+        }
+    }
+
+    if (images && swapchain->fshack_dpi)
+    {
+        if (*count > swapchain->n_images) *count = swapchain->n_images;
+        for (i = 0; i < *count; ++i) images[i] = swapchain->fs_hack_images[i].user_image;
+        return *count == swapchain->n_images ? VK_SUCCESS : VK_INCOMPLETE;
+    }
+
+    return device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain, count, images );
+}
+
+static VkCommandBuffer create_hack_cmd( struct vulkan_queue *queue, struct swapchain *swapchain, uint32_t queue_idx )
+{
+    VkCommandBufferAllocateInfo allocInfo = {0};
+    VkCommandBuffer cmd;
+    VkResult res;
+
+    if (!swapchain->cmd_pools[queue_idx])
+    {
+        VkCommandPoolCreateInfo poolInfo = {0};
+
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        poolInfo.queueFamilyIndex = queue_idx;
+
+        if ((res = queue->device->p_vkCreateCommandPool( queue->device->host.device, &poolInfo, NULL,
+                                                         &swapchain->cmd_pools[queue_idx] )))
+        {
+            ERR( "vkCreateCommandPool failed, res=%d\n", res );
+            return NULL;
+        }
+    }
+
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = swapchain->cmd_pools[queue_idx];
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    if ((res = queue->device->p_vkAllocateCommandBuffers( queue->device->host.device, &allocInfo, &cmd )))
+    {
+        ERR( "vkAllocateCommandBuffers failed, res=%d\n", res );
+        return NULL;
+    }
+
+    return cmd;
+}
+
+static VkResult record_compute_cmd( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_image *hack )
+{
+    VkResult res;
+    VkImageMemoryBarrier barriers[3] = {{0}};
+    VkCommandBufferBeginInfo beginInfo = {0};
+    float constants[4];
+
+    TRACE( "recording compute command\n" );
+
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+
+    device->p_vkBeginCommandBuffer( hack->cmd, &beginInfo );
+
+    /* for the cs we run... */
+    /* transition user image from PRESENT_SRC to SHADER_READ */
+    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].image = hack->user_image;
+    barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barriers[0].subresourceRange.baseMipLevel = 0;
+    barriers[0].subresourceRange.levelCount = 1;
+    barriers[0].subresourceRange.baseArrayLayer = 0;
+    barriers[0].subresourceRange.layerCount = 1;
+    barriers[0].srcAccessMask = 0;
+    barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    /* storage image... */
+    /* transition swapchain image from whatever to GENERAL */
+    barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[1].image = hack->swapchain_image;
+    barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barriers[1].subresourceRange.baseMipLevel = 0;
+    barriers[1].subresourceRange.levelCount = 1;
+    barriers[1].subresourceRange.baseArrayLayer = 0;
+    barriers[1].subresourceRange.layerCount = 1;
+    barriers[1].srcAccessMask = 0;
+    barriers[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+
+    device->p_vkCmdPipelineBarrier( hack->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                    0, 0, NULL, 0, NULL, 2, barriers );
+
+    /* perform blit shader */
+    device->p_vkCmdBindPipeline( hack->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, swapchain->pipeline );
+
+    device->p_vkCmdBindDescriptorSets( hack->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                       swapchain->pipeline_layout, 0, 1, &hack->descriptor_set, 0, NULL );
+
+    /* vec2: blit dst offset in real coords */
+    constants[0] = 0;
+    constants[1] = 0;
+
+    /* offset by 0.5f because sampling is relative to pixel center */
+    constants[0] -= 0.5f * swapchain->host_extents.width / swapchain->extents.width;
+    constants[1] -= 0.5f * swapchain->host_extents.height / swapchain->extents.height;
+
+    /* vec2: blit dst extents in real coords */
+    constants[2] = swapchain->host_extents.width;
+    constants[3] = swapchain->host_extents.height;
+    device->p_vkCmdPushConstants( hack->cmd, swapchain->pipeline_layout,
+                                  VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants );
+
+    /* local sizes in shader are 8 */
+    device->p_vkCmdDispatch( hack->cmd, ceil( swapchain->host_extents.width / 8. ),
+                             ceil( swapchain->host_extents.height / 8. ), 1 );
+
+    /* transition user image from SHADER_READ back to PRESENT_SRC */
+    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].image = hack->user_image;
+    barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barriers[0].subresourceRange.baseMipLevel = 0;
+    barriers[0].subresourceRange.levelCount = 1;
+    barriers[0].subresourceRange.baseArrayLayer = 0;
+    barriers[0].subresourceRange.layerCount = 1;
+    barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barriers[0].dstAccessMask = 0;
+
+    /* transition swapchain image from GENERAL to PRESENT_SRC */
+    barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[1].image = hack->swapchain_image;
+    barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barriers[1].subresourceRange.baseMipLevel = 0;
+    barriers[1].subresourceRange.levelCount = 1;
+    barriers[1].subresourceRange.baseArrayLayer = 0;
+    barriers[1].subresourceRange.layerCount = 1;
+    barriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barriers[1].dstAccessMask = 0;
+
+    device->p_vkCmdPipelineBarrier( hack->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                    0, 0, NULL, 0, NULL, 2, barriers );
+
+    if ((res = device->p_vkEndCommandBuffer( hack->cmd )))
+    {
+        ERR( "vkEndCommandBuffer: %d\n", res );
+        return res;
+    }
+
+    return VK_SUCCESS;
+}
+
 static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *client_present_info )
 {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
     VkPresentInfoKHR *present_info = (VkPresentInfoKHR *)client_present_info; /* cast away const, it has been copied in the thunks */
     struct vulkan_queue *queue = vulkan_queue_from_handle( client_queue );
-    VkSwapchainKHR swapchains_buffer[16], *swapchains = swapchains_buffer;
     struct vulkan_device *device = queue->device;
+    VkResult res = VK_ERROR_OUT_OF_HOST_MEMORY;
     const VkSwapchainKHR *client_swapchains;
-    VkResult res;
+    VkSwapchainKHR *swapchains;
+    VkCommandBuffer *blit_cmds;
+    struct mempool pool = {0};
+    uint32_t blit_count = 0;
+    VkSemaphore blit_sema;
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
 
-    if (present_info->swapchainCount > ARRAY_SIZE(swapchains_buffer) &&
-        !(swapchains = malloc( present_info->swapchainCount * sizeof(*swapchains) )))
-        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (present_info->swapchainCount &&
+        swapchain_from_handle(present_info->pSwapchains[0])->winehua_private)
+        return winehua_queue_present(queue, present_info);
+
+    if (!(swapchains = mem_alloc( &pool, present_info->swapchainCount * sizeof(*swapchains) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!(blit_cmds = mem_alloc( &pool, present_info->swapchainCount * sizeof(blit_cmds) ))) goto failed;
+
+    for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+    {
+        struct swapchain *swapchain = swapchain_from_handle( present_info->pSwapchains[i] );
+        struct fs_hack_image *hack = &swapchain->fs_hack_images[present_info->pImageIndices[i]];
+
+        if (!swapchain->fshack_dpi) continue;
+        blit_sema = hack->blit_finished;
+
+        if (!hack->cmd || hack->cmd_queue_idx != queue->info.queueFamilyIndex)
+        {
+            if (hack->cmd) device->p_vkFreeCommandBuffers( queue->device->host.device, swapchain->cmd_pools[hack->cmd_queue_idx], 1, &hack->cmd );
+            if (!(queue->device->queue_props[queue->info.queueFamilyIndex].queueFlags & VK_QUEUE_COMPUTE_BIT)) goto failed; /* TODO */
+
+            if (!(hack->cmd = create_hack_cmd( queue, swapchain, queue->info.queueFamilyIndex )) || record_compute_cmd( queue->device, swapchain, hack ))
+            {
+                device->p_vkFreeCommandBuffers( queue->device->host.device, swapchain->cmd_pools[hack->cmd_queue_idx], 1, &hack->cmd );
+                hack->cmd = NULL;
+                goto failed;
+            }
+
+            hack->cmd_queue_idx = queue->info.queueFamilyIndex;
+        }
+
+        blit_cmds[blit_count++] = hack->cmd;
+    }
 
     for (uint32_t i = 0; i < present_info->waitSemaphoreCount; i++)
     {
@@ -1979,7 +4067,31 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         client_surface_update( surface->client );
     }
 
+    if (blit_count)
+    {
+        VkSubmitInfo submit_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        VkPipelineStageFlags *stages;
+
+        if (!(stages = mem_alloc( &pool, sizeof(VkPipelineStageFlags) * present_info->waitSemaphoreCount ))) goto failed;
+        for (uint32_t i = 0; i < present_info->waitSemaphoreCount; ++i) stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+
+        /* blit user image to real image */
+        submit_info.waitSemaphoreCount = present_info->waitSemaphoreCount;
+        submit_info.pWaitSemaphores = present_info->pWaitSemaphores;
+        submit_info.pWaitDstStageMask = stages;
+        submit_info.commandBufferCount = blit_count;
+        submit_info.pCommandBuffers = blit_cmds;
+        submit_info.signalSemaphoreCount = 1;
+        submit_info.pSignalSemaphores = &blit_sema;
+        device->p_vkQueueSubmit( queue->host.queue, 1, &submit_info, VK_NULL_HANDLE );
+
+        present_info->waitSemaphoreCount = 1;
+        present_info->pWaitSemaphores = &blit_sema;
+    }
+
+    pthread_mutex_lock( &lock );
     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+    pthread_mutex_unlock( &lock );
 
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
@@ -2008,8 +4120,6 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         }
     }
 
-    if (swapchains != swapchains_buffer) free( swapchains );
-
     if (TRACE_ON( fps ))
     {
         static unsigned long frames, frames_total;
@@ -2031,6 +4141,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         }
     }
 
+failed:
+    mem_free( &pool );
     return res;
 }
 
@@ -2151,6 +4263,10 @@ static VkResult win32u_vkQueueSubmit( VkQueue client_queue, uint32_t count, cons
 
     TRACE( "queue %p, count %u, submits %p, fence %p\n", queue, count, submits, fence );
 
+#ifdef _WIN64
+    winehua_wow64_flush_copies();
+#endif
+
     if (!(timelines = mem_alloc( &pool, count * sizeof(*timelines) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
     memset( timelines, 0, count * sizeof(*timelines) );
 
@@ -2193,9 +4309,21 @@ static VkResult win32u_vkQueueSubmit( VkQueue client_queue, uint32_t count, cons
             switch ((*next)->sType)
             {
             case VK_STRUCTURE_TYPE_D3D12_FENCE_SUBMIT_INFO_KHR:
-                FIXME( "VK_STRUCTURE_TYPE_D3D12_FENCE_SUBMIT_INFO_KHR not implemented!\n" );
+            {
+                VkD3D12FenceSubmitInfoKHR *info = (VkD3D12FenceSubmitInfoKHR *)*next;
+
+                if (timeline->sType == VK_STRUCTURE_TYPE_D3D12_FENCE_SUBMIT_INFO_KHR)
+                    ERR( "Duplicated d3d12 fence submit info.\n" );
+                else if (timeline->sType)
+                    FIXME( "Both d3d12 fence and timeline submit info.\n" );
+                timeline->sType = info->sType;
+                timeline->waitSemaphoreValueCount = info->waitSemaphoreValuesCount;
+                timeline->pWaitSemaphoreValues = info->pWaitSemaphoreValues;
+                timeline->signalSemaphoreValueCount = info->signalSemaphoreValuesCount;
+                timeline->pSignalSemaphoreValues = info->pSignalSemaphoreValues;
                 *next = (*next)->pNext; next = &prev;
                 break;
+            }
             case VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO:
                 device_group = (VkDeviceGroupSubmitInfo *)*next;
                 break;
@@ -2205,7 +4333,11 @@ static VkResult win32u_vkQueueSubmit( VkQueue client_queue, uint32_t count, cons
             case VK_STRUCTURE_TYPE_PERFORMANCE_QUERY_SUBMIT_INFO_KHR: break;
             case VK_STRUCTURE_TYPE_PROTECTED_SUBMIT_INFO: break;
             case VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO:
-                if (timeline->sType) ERR( "Duplicated timeline semaphore submit info!\n" );
+                if (timeline->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO)
+                    ERR( "Duplicated timeline semaphore submit info.\n" );
+                else if (timeline->sType)
+                    FIXME( "Both d3d12 fence and timeline submit info.\n" );
+
                 *timeline = *(VkTimelineSemaphoreSubmitInfo *)*next;
                 *next = (*next)->pNext; next = &prev; /* remove it from the chain, we'll add it back below */
                 break;
@@ -2300,6 +4432,10 @@ static VkResult queue_submit( struct vulkan_queue *queue, uint32_t count, const 
     struct mempool pool = {0};
     VkResult res;
 
+#ifdef _WIN64
+    winehua_wow64_flush_copies();
+#endif
+
     for (uint32_t i = 0; i < count; i++)
     {
         VkSubmitInfo2 *submit = (VkSubmitInfo2 *)submits + i; /* cast away const, chain has been copied in the thunks */
@@ -2307,7 +4443,7 @@ static VkResult queue_submit( struct vulkan_queue *queue, uint32_t count, const 
 
         for (uint32_t j = 0; j < submit->commandBufferInfoCount; j++)
         {
-            VkCommandBufferSubmitInfo *command_buffer_infos = (VkCommandBufferSubmitInfo *)submit->pCommandBufferInfos; /* cast away const, chain has been copied in the thunks */
+            VkCommandBufferSubmitInfoKHR *command_buffer_infos = (VkCommandBufferSubmitInfoKHR *)submit->pCommandBufferInfos; /* cast away const, chain has been copied in the thunks */
             struct vulkan_command_buffer *command_buffer = vulkan_command_buffer_from_handle( command_buffer_infos[j].commandBuffer );
             command_buffer_infos[j].commandBuffer = command_buffer->host.command_buffer;
             if (command_buffer_infos->pNext) FIXME( "Unhandled struct chain\n" );
@@ -2547,6 +4683,7 @@ static VkResult win32u_vkImportSemaphoreWin32HandleKHR( VkDevice client_device, 
     VkImportSemaphoreFdInfoKHR fd_info = {.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR};
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
     struct semaphore *semaphore = semaphore_from_handle( handle_info->semaphore );
+    struct vulkan_instance *instance = device->physical_device->instance;
     D3DKMT_HANDLE local, global = 0;
     VkResult res = VK_SUCCESS;
     HANDLE shared = NULL;
@@ -2579,7 +4716,35 @@ static VkResult win32u_vkImportSemaphoreWin32HandleKHR( VkDevice client_device, 
     }
 
     if ((fd_info.fd = d3dkmt_object_get_fd( local )) < 0) res = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-    else
+    if (!res && handle_info->handleType == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+    {
+        /* Recreate semaphore to make sure it has timeline type. */
+        VkSemaphoreTypeCreateInfo type_info =
+        {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+        };
+        VkSemaphoreCreateInfo create_info =
+        {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            .pNext = &type_info,
+        };
+        VkSemaphore new_semaphore;
+
+        if ((res = device->p_vkCreateSemaphore( device->host.device, &create_info, NULL, &new_semaphore )))
+        {
+            ERR( "Failed to create timeline semaphore, vr %d.\n", res );
+        }
+        else
+        {
+            instance->p_remove_object( instance, &semaphore->obj.obj );
+            device->p_vkDestroySemaphore( device->host.device, semaphore->obj.host.semaphore, NULL );
+            semaphore->obj.host.semaphore = new_semaphore;
+            instance->p_insert_object( instance, &semaphore->obj.obj );
+        }
+    }
+
+    if (!res)
     {
         fd_info.handleType = get_host_external_semaphore_type();
         fd_info.semaphore = semaphore->obj.host.semaphore;
@@ -2910,8 +5075,12 @@ static struct vulkan_funcs vulkan_funcs =
     .p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR = win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR,
     .p_vkGetPhysicalDeviceSurfaceFormats2KHR = win32u_vkGetPhysicalDeviceSurfaceFormats2KHR,
     .p_vkGetPhysicalDeviceSurfaceFormatsKHR = win32u_vkGetPhysicalDeviceSurfaceFormatsKHR,
+    .p_vkGetPhysicalDeviceSurfacePresentModesKHR = win32u_vkGetPhysicalDeviceSurfacePresentModesKHR,
+    .p_vkGetPhysicalDeviceSurfaceSupportKHR = win32u_vkGetPhysicalDeviceSurfaceSupportKHR,
     .p_vkGetPhysicalDeviceWin32PresentationSupportKHR = win32u_vkGetPhysicalDeviceWin32PresentationSupportKHR,
+    .p_vkGetSwapchainImagesKHR = win32u_vkGetSwapchainImagesKHR,
     .p_vkGetSemaphoreWin32HandleKHR = win32u_vkGetSemaphoreWin32HandleKHR,
+    .p_vkGetSwapchainImagesKHR = win32u_vkGetSwapchainImagesKHR,
     .p_vkImportFenceWin32HandleKHR = win32u_vkImportFenceWin32HandleKHR,
     .p_vkImportSemaphoreWin32HandleKHR = win32u_vkImportSemaphoreWin32HandleKHR,
     .p_vkMapMemory = win32u_vkMapMemory,
@@ -2924,8 +5093,8 @@ static struct vulkan_funcs vulkan_funcs =
     .p_vkUnmapMemory2KHR = win32u_vkUnmapMemory2KHR,
 };
 
-static VkResult nulldrv_vulkan_surface_create( HWND hwnd, const struct vulkan_instance *instance, VkSurfaceKHR *surface,
-                                               struct client_surface **client )
+static VkResult nulldrv_vulkan_surface_create( HWND hwnd, BOOL raw, const struct vulkan_instance *instance,
+                                               VkSurfaceKHR *surface, struct client_surface **client )
 {
     VkHeadlessSurfaceCreateInfoEXT create_info = {.sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT};
     VkResult res;
@@ -2959,6 +5128,8 @@ static void nulldrv_map_device_extensions( struct vulkan_device_extensions *exte
     if (extensions->has_VK_KHR_external_semaphore_fd) extensions->has_VK_KHR_external_semaphore_win32 = 1;
     if (extensions->has_VK_KHR_external_fence_win32) extensions->has_VK_KHR_external_fence_fd = 1;
     if (extensions->has_VK_KHR_external_fence_fd) extensions->has_VK_KHR_external_fence_win32 = 1;
+    extensions->has_VK_WINE_openvr_device_extensions = 1;
+    extensions->has_VK_WINE_openxr_device_extensions = 1;
 }
 
 static const struct vulkan_driver_funcs nulldrv_funcs =
@@ -2989,11 +5160,11 @@ static void vulkan_driver_load(void)
     pthread_once( &init_once, vulkan_driver_init );
 }
 
-static VkResult lazydrv_vulkan_surface_create( HWND hwnd, const struct vulkan_instance *instance, VkSurfaceKHR *surface,
-                                               struct client_surface **client )
+static VkResult lazydrv_vulkan_surface_create( HWND hwnd, BOOL raw, const struct vulkan_instance *instance,
+                                               VkSurfaceKHR *surface, struct client_surface **client )
 {
     vulkan_driver_load();
-    return driver_funcs->p_vulkan_surface_create( hwnd, instance, surface, client );
+    return driver_funcs->p_vulkan_surface_create( hwnd, raw, instance, surface, client );
 }
 
 static VkBool32 lazydrv_get_physical_device_presentation_support( struct vulkan_physical_device *physical_device, uint32_t queue )
@@ -3028,6 +5199,9 @@ static void vulkan_init_once(void)
     VkExtensionProperties *properties = NULL;
     uint32_t count = 0;
     VkResult res;
+
+    const char *env = getenv( "WINE_DISABLE_FULLSCREEN_HACK" );
+    fshack_enabled = !env || !atoi( env );
 
 #ifdef SONAME_LIBVULKAN
     vulkan_handle = dlopen( SONAME_LIBVULKAN, RTLD_NOW );

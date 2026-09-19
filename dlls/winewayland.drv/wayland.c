@@ -141,7 +141,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         }
         pthread_mutex_lock(&seat->mutex);
         seat->wl_seat = wl_registry_bind(registry, id, &wl_seat_interface,
-                                         version < 8 ? version : 8);
+                                         version < 5 ? version : 5);
         seat->global_id = id;
         wl_seat_add_listener(seat->wl_seat, &seat_listener, NULL);
         pthread_mutex_unlock(&seat->mutex);
@@ -199,11 +199,6 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         process_wayland.wp_cursor_shape_manager_v1 =
             wl_registry_bind(registry, id, &wp_cursor_shape_manager_v1_interface,
                              version < 2 ? version : 2);
-    }
-    else if (strcmp(interface, "wp_pointer_warp_v1") == 0)
-    {
-        process_wayland.wp_pointer_warp_v1 =
-            wl_registry_bind(registry, id, &wp_pointer_warp_v1_interface, 1);
     }
 }
 

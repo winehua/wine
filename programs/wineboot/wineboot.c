@@ -62,11 +62,13 @@
 #include <unistd.h>
 
 #include <ntstatus.h>
+#define WIN32_NO_STATUS
 #include <windows.h>
 #include <ws2tcpip.h>
 #include <winternl.h>
 #include <ddk/wdm.h>
 #include <sddl.h>
+#include <ntsecapi.h>
 #include <wine/svcctl.h>
 #include <wine/list.h>
 #include <wine/asm.h>
@@ -79,6 +81,7 @@
 #include <setupapi.h>
 #include <wininet.h>
 #include <newdev.h>
+#include <wincrypt.h>
 #include "resource.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wineboot);
@@ -287,7 +290,13 @@ static UINT64 read_tsc_frequency(void)
     }
     while (error > 500 && --retries);
 
-    if (!retries) WARN( "TSC frequency calibration failed, unstable TSC?\n" );
+    if (!retries)
+    {
+        FIXME( "TSC frequency calibration failed, unstable TSC?");
+        FIXME( "time0 %I64u ns, time1 %I64u ns\n", time0 * 100, time1 * 100 );
+        FIXME( "tsc2 - tsc0 %I64u, tsc3 - tsc1 %I64u\n", tsc2 - tsc0, tsc3 - tsc1 );
+        FIXME( "freq0 %I64u Hz, freq2 %I64u Hz, error %I64u ppm\n", freq0, freq1, error );
+    }
     else
     {
         freq = (freq0 + freq1) / 2;
@@ -299,10 +308,18 @@ static UINT64 read_tsc_frequency(void)
 
 #elif defined(__aarch64__)
 
+#define FEX_TSC_SCALE_MAXIMUM 1000000000
+
 static UINT64 read_tsc_frequency(void)
 {
     UINT64 tsc_frequency;
     __asm__ volatile( "mrs %[Res], CNTFRQ_EL0" : [Res] "=r" (tsc_frequency) );
+
+    /* FEX hack in order to support games relying on this to read the x86 TSC
+     * frequency which FEX scales as below, assumes SmallTSCScale is enabled. */
+    while (tsc_frequency < FEX_TSC_SCALE_MAXIMUM)
+            tsc_frequency <<= 1;
+
     return tsc_frequency;
 }
 
@@ -835,7 +852,7 @@ static void create_computer_name_keys(void)
     hints.ai_flags = AI_CANONNAME;
     if (getaddrinfo( buffer, NULL, &hints, &res ) != 0)
         res = NULL;
-    else if (res->ai_canonname && strcasecmp( res->ai_canonname, "localhost" ) != 0)
+    else if (strcasecmp( res->ai_canonname, "localhost" ) != 0)
         name = res->ai_canonname;
     dot = strchr( name, '.' );
     if (dot) *dot++ = 0;
@@ -865,6 +882,14 @@ static void create_computer_name_keys(void)
 
 static void create_volatile_environment_registry_key(void)
 {
+    static const WCHAR *preserve[] =
+    {
+        L"DXVK_ENABLE_NVAPI",
+        L"DXVK_NVAPI_ALLOW_OTHER_DRIVERS",
+        L"DXVK_NVAPI_DRIVER_VERSION",
+    };
+    const WCHAR *str;
+    unsigned int i;
     WCHAR path[MAX_PATH];
     WCHAR computername[MAX_COMPUTERNAME_LENGTH + 1 + 2];
     DWORD size;
@@ -909,26 +934,12 @@ static void create_volatile_environment_registry_key(void)
     }
 
     set_reg_value( hkey, L"SESSIONNAME", L"Console" );
-    RegCloseKey( hkey );
-}
 
-static void create_sqmclient_registry_key(void)
-{
-    HKEY hkey;
-    LONG r;
-    UUID uuid;
-    RPC_WSTR uuid_str;
-
-    r = RegCreateKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\SQMClient", 0, NULL, 0,
-                         KEY_ALL_ACCESS, NULL, &hkey, NULL );
-    if (r) return;
-
-    r = RegQueryValueExW( hkey, L"MachineId", NULL, NULL, NULL, NULL );
-    if (r == ERROR_FILE_NOT_FOUND && UuidCreate( &uuid ) == S_OK && UuidToStringW( &uuid, &uuid_str ) == RPC_S_OK)
+    for (i = 0; i < ARRAY_SIZE(preserve); ++i)
     {
-        set_reg_value( hkey, L"MachineId", uuid_str );
-        RpcStringFreeW( &uuid_str );
+        if ((str = _wgetenv( preserve[i] ))) set_reg_value( hkey, preserve[i], str );
     }
+
     RegCloseKey( hkey );
 }
 
@@ -1451,7 +1462,7 @@ static BOOL start_services_process(void)
     HANDLE wait_handles[2];
 
     if (!CreateProcessW(L"C:\\windows\\system32\\services.exe", NULL,
-                        NULL, NULL, TRUE, DETACHED_PROCESS, NULL, L"C:\\windows\\system32", &si, &pi))
+                        NULL, NULL, TRUE, DETACHED_PROCESS, NULL, NULL, &si, &pi))
     {
         WINE_ERR("Couldn't start services.exe: error %lu\n", GetLastError());
         return FALSE;
@@ -1475,64 +1486,6 @@ static BOOL start_services_process(void)
     CloseHandle(pi.hProcess);
     CloseHandle(wait_handles[0]);
     return TRUE;
-}
-
-static void set_wait_dialog_text( HWND hwnd, HWND text, const WCHAR *string )
-{
-    RECT win_rect, old_rect, new_rect;
-    HDC hdc = GetDC( text );
-
-    GetClientRect( text, &old_rect );
-    new_rect = old_rect;
-    SelectObject( hdc, (HFONT)SendMessageW( text, WM_GETFONT, 0, 0 ));
-    DrawTextW( hdc, string, -1, &new_rect, DT_CALCRECT | DT_EDITCONTROL | DT_WORDBREAK | DT_NOPREFIX );
-    ReleaseDC( text, hdc );
-    if (new_rect.bottom > old_rect.bottom)
-    {
-        GetWindowRect( hwnd, &win_rect );
-        win_rect.bottom += new_rect.bottom - old_rect.bottom;
-        SetWindowPos( hwnd, 0, 0, 0, win_rect.right - win_rect.left, win_rect.bottom - win_rect.top,
-                      SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER );
-        SetWindowPos( text, 0, 0, 0, new_rect.right, new_rect.bottom,
-                      SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER );
-    }
-    SendMessageW( text, WM_SETTEXT, 0, (LPARAM)string );
-}
-
-static INT_PTR CALLBACK wait_dlgproc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
-{
-    switch (msg)
-    {
-    case WM_INITDIALOG:
-        {
-            DWORD len, icon_size;
-            RECT rect;
-            WCHAR *buffer, text[1024];
-            const WCHAR *name = (WCHAR *)lp;
-            HICON icon;
-
-            GetClientRect( GetDlgItem( hwnd, IDC_WAITICON ), &rect );
-            icon_size = min( rect.right, rect.bottom );
-            icon = LoadImageW( 0, (LPCWSTR)IDI_WINLOGO, IMAGE_ICON, icon_size, icon_size, LR_SHARED );
-            SendDlgItemMessageW( hwnd, IDC_WAITICON, STM_SETICON, (WPARAM)icon, 0 );
-            SendDlgItemMessageW( hwnd, IDC_WAITTEXT, WM_GETTEXT, 1024, (LPARAM)text );
-            len = lstrlenW(text) + lstrlenW(name) + 1;
-            buffer = malloc( len * sizeof(WCHAR) );
-            swprintf( buffer, len, text, name );
-            set_wait_dialog_text( hwnd, GetDlgItem( hwnd, IDC_WAITTEXT ), buffer );
-            free( buffer );
-        }
-        break;
-    }
-    return 0;
-}
-
-static HWND show_wait_window(void)
-{
-    HWND hwnd = CreateDialogParamW( GetModuleHandleW(0), MAKEINTRESOURCEW(IDD_WAITDLG), 0,
-                                    wait_dlgproc, (LPARAM)prettyprint_configdir() );
-    ShowWindow( hwnd, SW_SHOWNORMAL );
-    return hwnd;
 }
 
 static HANDLE start_rundll32( const WCHAR *inf_path, const WCHAR *install, WORD machine )
@@ -1641,7 +1594,12 @@ static void update_user_profile(void)
                              KEY_ALL_ACCESS, NULL, &profile_hkey, NULL))
         {
             DWORD flags = 0;
-            if (SHGetSpecialFolderPathW(NULL, profile, CSIDL_PROFILE, TRUE))
+            /* The legacy helper is a delayed shell32 import.  On the OHOS
+             * first-prefix path Box64 can resolve that entry to Wine's
+             * unimplemented thunk even though the equivalent modern helper
+             * is available and is already used by create_volatile_environment_registry_key(). */
+            if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PROFILE | CSIDL_FLAG_CREATE,
+                                            NULL, SHGFP_TYPE_CURRENT, profile)))
                 set_reg_value(profile_hkey, L"ProfileImagePath", profile);
             RegSetValueExW( profile_hkey, L"Flags", 0, REG_DWORD, (const BYTE *)&flags, sizeof(flags) );
             RegCloseKey(profile_hkey);
@@ -1653,6 +1611,55 @@ static void update_user_profile(void)
     LocalFree(sid);
 }
 
+static void update_win_version(void)
+{
+    static const WCHAR win10_buildW[] = L"19045";
+    static const WCHAR win10_ntW[] = L"6.3";
+
+    HKEY cv_h;
+    DWORD type, sz;
+    WCHAR current_version[256];
+
+    if(RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows NT\\CurrentVersion",
+                0, KEY_ALL_ACCESS, &cv_h) == ERROR_SUCCESS){
+        /* get the current windows version */
+        sz = sizeof(current_version);
+        if(RegQueryValueExW(cv_h, L"CurrentVersion", NULL, &type, (BYTE *)current_version, &sz) == ERROR_SUCCESS &&
+                type == REG_SZ){
+            if(!wcscmp(current_version, L"6.3") || !wcscmp(current_version, L"10.0")){
+                RegSetValueExW(cv_h, L"CurrentVersion", 0, REG_SZ, (const BYTE *)win10_ntW, sizeof(win10_ntW));
+                RegSetValueExW(cv_h, L"CurrentBuild", 0, REG_SZ, (const BYTE *)win10_buildW, sizeof(win10_buildW));
+                RegSetValueExW(cv_h, L"CurrentBuildNumber", 0, REG_SZ, (const BYTE *)win10_buildW, sizeof(win10_buildW));
+            }
+        }
+        RegCloseKey(cv_h);
+    }
+
+    if(RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Wow6432Node\\Microsoft\\Windows NT\\CurrentVersion",
+                0, KEY_ALL_ACCESS, &cv_h) == ERROR_SUCCESS){
+        /* get the current windows version */
+        sz = sizeof(current_version);
+        if(RegQueryValueExW(cv_h, L"CurrentVersion", NULL, &type, (BYTE *)current_version, &sz) == ERROR_SUCCESS &&
+                type == REG_SZ){
+            if(!wcscmp(current_version, L"6.3") || !wcscmp(current_version, L"10.0")){
+                RegSetValueExW(cv_h, L"CurrentVersion", 0, REG_SZ, (const BYTE *)win10_ntW, sizeof(win10_ntW));
+                RegSetValueExW(cv_h, L"CurrentBuild", 0, REG_SZ, (const BYTE *)win10_buildW, sizeof(win10_buildW));
+                RegSetValueExW(cv_h, L"CurrentBuildNumber", 0, REG_SZ, (const BYTE *)win10_buildW, sizeof(win10_buildW));
+            }
+        }
+        RegCloseKey(cv_h);
+    }
+}
+
+static void update_root_certs(void)
+{
+    HCERTSTORE store;
+
+    store = CertOpenStore( CERT_STORE_PROV_SYSTEM_REGISTRY_W, 0, 0, CERT_STORE_OPEN_EXISTING_FLAG
+                           | CERT_STORE_READONLY_FLAG | CERT_SYSTEM_STORE_LOCAL_MACHINE, L"Root");
+    CertCloseStore( store, 0 );
+}
+
 /* execute rundll32 on the wine.inf file if necessary */
 static void update_wineprefix( BOOL force )
 {
@@ -1661,18 +1668,13 @@ static void update_wineprefix( BOOL force )
     int fd;
     struct stat st;
 
-    MESSAGE("OHOS-WB: update_wineprefix force=%d config_dir=%s inf_path=%s\n",
-        force, debugstr_w(config_dir), debugstr_w(inf_path));
-
     if (!inf_path)
     {
-        MESSAGE("OHOS-WB: wine.inf not found!\n");
         WINE_MESSAGE( "wine: failed to update %s, wine.inf not found\n", debugstr_w( config_dir ));
         return;
     }
     if ((fd = _wopen( inf_path, O_RDONLY )) == -1)
     {
-        MESSAGE("OHOS-WB: cannot open wine.inf: %s\n", strerror(errno));
         WINE_MESSAGE( "wine: failed to update %s with %s: %s\n",
                       debugstr_w(config_dir), debugstr_w(inf_path), strerror(errno) );
         goto done;
@@ -1685,10 +1687,8 @@ static void update_wineprefix( BOOL force )
         HANDLE process;
         DWORD count = 0;
 
-        MESSAGE("OHOS-WB: starting rundll32 PreInstall...\n");
         if ((process = start_rundll32( inf_path, L"PreInstall", IMAGE_FILE_MACHINE_TARGET_HOST )))
         {
-            HWND hwnd = show_wait_window();
             for (;;)
             {
                 if (process)
@@ -1709,16 +1709,13 @@ static void update_wineprefix( BOOL force )
                     process = start_rundll32( inf_path, L"Wow64Install", machines[count].Machine );
                 count++;
             }
-            DestroyWindow( hwnd );
-            MESSAGE("OHOS-WB: rundll32 loop complete\n");
-        } else {
-            MESSAGE("OHOS-WB: start_rundll32 PreInstall FAILED\n");
         }
-        MESSAGE("OHOS-WB: calling install_root_pnp_devices...\n");
         install_root_pnp_devices();
         update_user_profile();
-        MESSAGE("OHOS-WB: pnp + user_profile done\n");
+        update_win_version();
+        update_root_certs();
 
+        TRACE( "wine: configuration in %s has been updated.\n", debugstr_w(prettyprint_configdir()) );
     }
 
 done:
@@ -1818,6 +1815,52 @@ static void usage( int status )
     exit( status );
 }
 
+static void create_digitalproductid(void)
+{
+    BYTE digital_product_id[0xa4];
+    char product_id[256];
+    LSTATUS status;
+    unsigned int i;
+    DWORD size;
+    DWORD type;
+    HKEY key;
+
+    if ((status = RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows NT\\CurrentVersion",
+                       0, KEY_ALL_ACCESS, &key )))
+        return;
+    size = sizeof(product_id);
+    status = RegQueryValueExA( key, "ProductId", NULL, &type, (BYTE *)product_id, &size );
+    if (status) goto done;
+    if (!size) goto done;
+    if (product_id[size - 1])
+    {
+        if (size == sizeof(product_id)) goto done;
+        product_id[size++] = 0;
+    }
+
+    if (!RegQueryValueExA( key, "DigitalProductId", NULL, &type, NULL, &size ) && size == sizeof(digital_product_id))
+    {
+        if (RegQueryValueExA( key, "DigitalProductId", NULL, &type, digital_product_id, &size ))
+            goto done;
+        for (i = 0; i < size; ++i)
+            if (digital_product_id[i]) break;
+        if (i < size) goto done;
+    }
+
+    memset( digital_product_id, 0, sizeof(digital_product_id) );
+    *(DWORD *)digital_product_id = sizeof(digital_product_id);
+    digital_product_id[4] = 3;
+    strcpy( (char *)digital_product_id + 8, product_id );
+    *(DWORD *)(digital_product_id + 0x20) = 0x0cec;
+    *(DWORD *)(digital_product_id + 0x34) = 0x0cec;
+    strcpy( (char *)digital_product_id + 0x24, "[TH] X19-99481" );
+    digital_product_id[0x42] = 8;
+    RtlGenRandom( digital_product_id + 0x38, 0x18 );
+    RegSetValueExA( key, "DigitalProductId", 0, REG_BINARY, digital_product_id, sizeof(digital_product_id) );
+done:
+    RegCloseKey( key );
+}
+
 int __cdecl main( int argc, char *argv[] )
 {
     /* First, set the current directory to SystemRoot */
@@ -1830,7 +1873,6 @@ int __cdecl main( int argc, char *argv[] )
     BOOL is_wow64;
 
     end_session = force = init = kill = restart = shutdown = update = FALSE;
-    MESSAGE("OHOS-WB: MAIN entry argc=%d argv[0]=%s\n", argc, argv[0] ? argv[0] : "(null)");
     GetWindowsDirectoryW( windowsdir, MAX_PATH );
     if( !SetCurrentDirectoryW( windowsdir ) )
         WINE_ERR("Cannot set the dir to %s (%ld)\n", wine_dbgstr_w(windowsdir), GetLastError() );
@@ -1914,44 +1956,28 @@ int __cdecl main( int argc, char *argv[] )
     NtCreateEvent( &event, EVENT_ALL_ACCESS, &attr, NotificationEvent, 0 );
 
     ResetEvent( event );  /* in case this is a restart */
-    MESSAGE("OHOS-WB: event created, proceeding with init...\n");
 
     create_user_shared_data();
-    MESSAGE("OHOS-WB: create_user_shared_data done\n");
     create_hardware_registry_keys();
-    MESSAGE("OHOS-WB: create_hardware_registry_keys done\n");
     create_dynamic_registry_keys();
-    MESSAGE("OHOS-WB: create_dynamic_registry_keys done\n");
     create_computer_name_keys();
-    MESSAGE("OHOS-WB: create_computer_name_keys done\n");
     wininit();
-    MESSAGE("OHOS-WB: wininit done\n");
     pendingRename();
-    MESSAGE("OHOS-WB: pendingRename done\n");
 
     ProcessWindowsFileProtection();
-    MESSAGE("OHOS-WB: ProcessWindowsFileProtection done\n");
     ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunServicesOnce", TRUE, FALSE );
-    MESSAGE("OHOS-WB: ProcessRunKeys RunServicesOnce done\n");
 
     if (init || (kill && !restart))
     {
         ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunServices", FALSE, FALSE );
-        MESSAGE("OHOS-WB: ProcessRunKeys RunServices done\n");
         start_services_process();
-        MESSAGE("OHOS-WB: start_services_process done\n");
     }
-    MESSAGE("OHOS-WB: INIT=%d UPD=%d about to update_wineprefix(update=%d)\n", init, update, update);
-    if (init || update) {
-        MESSAGE("OHOS-WB: calling update_wineprefix...\n");
-        update_wineprefix( update );
-        MESSAGE("OHOS-WB: update_wineprefix done\n");
-    }
+    if (init || update) update_wineprefix( update );
 
+    create_digitalproductid();
     create_volatile_environment_registry_key();
     create_known_dlls();
     initialize_internet();
-    create_sqmclient_registry_key();
 
     ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunOnce", TRUE, TRUE );
 
@@ -1963,7 +1989,6 @@ int __cdecl main( int argc, char *argv[] )
     }
 
     WINE_TRACE("Operation done\n");
-    MESSAGE("OHOS-WB: all init done, signaling event and exiting\n");
 
     SetEvent( event );
     return 0;

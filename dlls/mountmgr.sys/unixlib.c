@@ -37,10 +37,6 @@
 #ifdef HAVE_SYS_STATVFS_H
 # include <sys/statvfs.h>
 #endif
-#ifdef __APPLE__
-# include <CoreFoundation/CoreFoundation.h>
-# include <sys/param.h>
-#endif
 #include <unistd.h>
 
 #include "unixlib.h"
@@ -292,11 +288,9 @@ static NTSTATUS get_dosdev_symlink( void *args )
     ret = readlink( path, params->dest, params->size );
     free( path );
 #ifdef __OHOS__
-    /* OHOS: symlink() not available in NAPI sandbox. For known drive
-     * letters, return hardcoded default mount points, but ONLY if the
-     * target directory actually exists (avoids creating phantom drives).
-     * c: → $WINEPREFIX/drive_c, z: → /
-     * :: (block device) variants are skipped (no real device). */
+    /* OHOS: symlink unavailable, fall back to default drive mapping.
+     * z: → /storage/Users/currentUser, c-y: → $WINEPREFIX/drive_X
+     * (only if dir exists). */
     if (ret == -1)
     {
         const char *dev = params->dev;
@@ -305,9 +299,8 @@ static NTSTATUS get_dosdev_symlink( void *args )
             struct stat st;
             if (dev[0] == 'z')
             {
-                const char *home = getenv( "HOME" );
-                if (!home) home = "/storage/Users/currentUser";
-                lstrcpynA( params->dest, home, params->size );
+                const char *z_target = "/storage/Users/currentUser";
+                lstrcpynA( params->dest, z_target, params->size );
                 if (params->size > 0) params->dest[params->size - 1] = 0;
                 return STATUS_SUCCESS;
             }
@@ -355,35 +348,6 @@ static NTSTATUS set_dosdev_symlink( void *args )
     return status;
 }
 
-#ifdef __APPLE__
-static LONGLONG get_free_bytes_for_important_data(int fd)
-{
-    CFURLRef url = NULL;
-    CFNumberRef num = NULL;
-    char *path = NULL;
-    LONGLONG space = -1;
-
-    if (!(path = malloc( MAXPATHLEN ))) goto done;
-    if (fcntl( fd, F_GETPATH, path ) == -1) goto done;
-    if (!(url = CFURLCreateFromFileSystemRepresentation( NULL, (UInt8 *)path, strlen( path ), false ))) goto done;
-    if (!CFURLCopyResourcePropertyForKey( url, kCFURLVolumeAvailableCapacityForImportantUsageKey, &num, NULL )) goto done;
-    CFNumberGetValue( num, kCFNumberLongLongType, &space );
-    if (space == 0)
-    {
-        /* It's unlikely that a writeable disk has exactly 0 free bytes. This
-         * probably means the disk is read-only, or is not APFS. Fall back to
-         * statfs. */
-        space = -1;
-    }
-
-done:
-    free( path );
-    if (url) CFRelease( url );
-    if (num) CFRelease( num );
-    return space;
-}
-#endif
-
 static NTSTATUS get_volume_size_info( void *args )
 {
     const struct get_volume_size_info_params *params = args;
@@ -399,10 +363,6 @@ static NTSTATUS get_volume_size_info( void *args )
     struct statvfs stfs;
 #else
     struct statfs stfs;
-#endif
-
-#ifdef __APPLE__
-    LONGLONG important_free_bytes;
 #endif
 
     if (!unix_mount) return STATUS_NO_SUCH_DEVICE;
@@ -442,12 +402,6 @@ static NTSTATUS get_volume_size_info( void *args )
     }
     bsize = stfs.f_bsize;
 #endif
-
-#ifdef __APPLE__
-    important_free_bytes = get_free_bytes_for_important_data( fd );
-    if (important_free_bytes != -1) stfs.f_bavail = stfs.f_bfree = important_free_bytes / bsize;
-#endif
-
     if (bsize == 2048)  /* assume CD-ROM */
     {
         info->bytes_per_sector = 2048;

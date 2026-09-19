@@ -30,6 +30,7 @@
 #include <limits.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winnls.h"
@@ -473,7 +474,7 @@ static BOOL alloc_console( BOOL headless )
     if (headless) wcscat( cmd, L" --headless" );
     Wow64DisableWow64FsRedirection( &redir );
     ret = CreateProcessW( conhost_path, cmd, NULL, NULL, TRUE, DETACHED_PROCESS | EXTENDED_STARTUPINFO_PRESENT,
-                          NULL, system_dir, &console_si.StartupInfo, &pi );
+                          NULL, NULL, &console_si.StartupInfo, &pi );
     Wow64RevertWow64FsRedirection( redir );
 
     if (!ret || !create_console_connection( console)) goto error;
@@ -1076,6 +1077,14 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetConsoleScreenBufferInfoEx( HANDLE handle,
     info->wPopupAttributes      = condrv_info.popup_attr;
     info->bFullscreenSupported  = FALSE;
     memcpy( info->ColorTable, condrv_info.color_map, sizeof(info->ColorTable) );
+    return TRUE;
+}
+
+
+BOOL WINAPI DECLSPEC_HOTPATCH GetConsoleSelectionInfo(CONSOLE_SELECTION_INFO *info)
+{
+    FIXME("stub (%p)\n", info);
+    info->dwFlags = CONSOLE_NO_SELECTION;
     return TRUE;
 }
 
@@ -2253,7 +2262,7 @@ static HANDLE create_pseudo_console( COORD size, HANDLE input, HANDLE output, HA
     }
     Wow64DisableWow64FsRedirection( &redir );
     res = CreateProcessW( conhost_path, cmd, NULL, NULL, TRUE, DETACHED_PROCESS | EXTENDED_STARTUPINFO_PRESENT,
-                          NULL, system_dir, &si.StartupInfo, &pi );
+                          NULL, NULL, &si.StartupInfo, &pi );
     HeapFree( GetProcessHeap(), 0, si.lpAttributeList );
     Wow64RevertWow64FsRedirection( redir );
     NtClose( server );
@@ -2339,8 +2348,8 @@ void WINAPI ClosePseudoConsole( HPCON handle )
  */
 HRESULT WINAPI ResizePseudoConsole( HPCON handle, COORD size )
 {
-    FIXME( "%p (%u,%u) stub, faking success\n", handle, size.X, size.Y );
-    return S_OK;
+    FIXME( "%p (%u,%u)\n", handle, size.X, size.Y );
+    return E_NOTIMPL;
 }
 
 static BOOL is_tty_handle( HANDLE handle )

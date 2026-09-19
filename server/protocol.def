@@ -993,6 +993,12 @@ struct obj_locator
 #define WH_WINEVENT      (WH_MAXHOOK + 1)
 #define NB_HOOKS         (WH_WINEVENT - WH_MINHOOK + 1)
 
+struct directory_file_entry
+{
+    data_size_t name_len;
+    /* VARARG(name,unicode_str,name_len); */
+};
+
 struct shared_cursor
 {
     int                  x;                /* cursor position */
@@ -1038,28 +1044,17 @@ typedef volatile struct
     unsigned __int64     keystate_serial;  /* keystate update counter at last sync */
 } input_shm_t;
 
-struct class_info
+typedef volatile struct
 {
     atom_t               atom;               /* class atom */
     unsigned int         style;              /* class style */
     unsigned int         cls_extra;          /* number of class extra bytes */
     unsigned int         win_extra;          /* number of window extra bytes */
-    user_handle_t        cursor;             /* default cursor */
-    user_handle_t        background;         /* default background */
-    user_handle_t        icon;               /* default icon */
-    user_handle_t        icon_small;         /* default cursor (small) */
     mod_handle_t         instance;           /* module instance */
-    client_ptr_t         wndproc;            /* class window proc */
-    client_ptr_t         menu_name;          /* pointer to menu name in client address space */
-};
-
-typedef volatile struct
-{
     data_size_t          name_offset;        /* offset in WCHAR of the unversioned class name, constant */
     data_size_t          name_len;           /* len in bytes of the class name, constant */
     WCHAR                name[MAX_ATOM_LEN]; /* class name, constant */
     unsigned short       __pad;
-    struct class_info    info;               /* class info (GCLP_*) */
     char                 extra[];            /* extra bytes storage */
 } class_shm_t;
 
@@ -1067,8 +1062,6 @@ typedef volatile struct
 {
     struct obj_locator   class;            /* object locator for the window class shared object */
     unsigned int         dpi_context;      /* DPI awareness context */
-    unsigned int         fnid;             /* builtin class FNID, or 0 */
-    data_size_t          private_size;     /* length of private extra bytes range */
 } window_shm_t;
 
 typedef volatile union
@@ -1134,7 +1127,6 @@ typedef volatile struct
     unsigned int access;       /* wanted access rights */
     unsigned int flags;        /* thread creation flags */
     int          request_fd;   /* fd for request pipe */
-    int          is_system;    /* system thread (kernel mode only) */
     VARARG(objattr,object_attributes); /* object attributes */
 @REPLY
     thread_id_t  tid;          /* thread id */
@@ -1152,10 +1144,18 @@ typedef volatile struct
 @END
 
 
+struct cpu_topology_override
+{
+    unsigned int cpu_count;
+    unsigned char host_cpu_id[64];
+};
+
+
 /* Signal the end of the process initialization */
 @REQ(init_process_done)
     client_ptr_t teb;          /* TEB of new thread (in process address space) */
     client_ptr_t peb;          /* PEB of new process (in process address space) */
+    client_ptr_t ldt_copy;     /* address of LDT copy (in process address space) */
 @REPLY
     int          suspend;      /* is process suspended? */
 @END
@@ -1168,7 +1168,7 @@ typedef volatile struct
     int          debug_level;  /* new debug level */
     int          reply_fd;     /* fd for reply pipe */
     int          wait_fd;      /* fd for blocking calls pipe */
-    unsigned int page_size;    /* client page size */
+    VARARG(cpu_override,cpu_topology_override); /* Overridden CPUs to host CPUs mapping. */
 @REPLY
     process_id_t pid;          /* process id of the new thread's process */
     thread_id_t  tid;          /* thread id of the new thread */
@@ -1340,9 +1340,11 @@ typedef volatile struct
 
 /* Suspend a thread */
 @REQ(suspend_thread)
-    obj_handle_t handle;       /* thread handle */
+    obj_handle_t handle;        /* thread handle */
+    obj_handle_t waited_handle; /* handle waited on */
 @REPLY
-    int          count;        /* new suspend count */
+    int          count;         /* new suspend count */
+    obj_handle_t wait_handle;   /* handle to wait on */
 @END
 
 
@@ -1838,10 +1840,8 @@ enum server_fd_type
     unsigned int flags;         /* SEC_* flags */
     obj_handle_t shared_file;   /* shared mapping file handle */
     data_size_t  name_len;      /* length of file name  */
-    data_size_t  ver_len;       /* length of version resource  */
     data_size_t  total;         /* total required buffer size in bytes */
     VARARG(image,pe_image_info);/* image info for SEC_IMAGE mappings */
-    VARARG(version,version_res,ver_len);/* version resource for SEC_IMAGE mappings */
     VARARG(name,unicode_str,name_len);  /* filename for SEC_IMAGE mappings */
     VARARG(exp_name,string);    /* exported name for SEC_IMAGE mappings */
 @END
@@ -2084,6 +2084,18 @@ struct process_info
 /* Flush a registry key */
 @REQ(flush_key)
     obj_handle_t hkey;         /* handle to the key */
+@REPLY
+    abstime_t   timestamp_counter; /* branch last change timestamp counter */
+    data_size_t total;             /* total length needed for data */
+    int         branch_count;      /* number of registry branches to flush */
+    VARARG(data,bytes);            /* registry data */
+@END
+
+
+/* Clear KEY_DIRTY after key flush */
+@REQ(flush_key_done)
+    abstime_t    timestamp_counter; /* timestamp counter returned from flush_key */
+    int          branch;            /* saved registry branch id */
 @END
 
 
@@ -2164,11 +2176,19 @@ struct process_info
 @END
 
 
-/* Save a registry branch to a file */
+/* Return full registry branch non-volatile data for saving */
 @REQ(save_registry)
-    obj_handle_t hkey;         /* key to save */
-    obj_handle_t file;         /* file to save to */
+    obj_handle_t hkey;  /* key to save */
+@REPLY
+    data_size_t  total; /* total length needed for data */
+    VARARG(data,bytes); /* registry data */
 @END
+enum prefix_type
+{
+    PREFIX_UNKNOWN,
+    PREFIX_32BIT,
+    PREFIX_64BIT,
+};
 
 
 /* Add a registry key change notification */
@@ -2394,7 +2414,7 @@ enum message_type
 @REQ(send_hardware_message)
     user_handle_t   win;       /* window handle */
     union hw_input  input;     /* input data */
-    unsigned int    flags;     /* flags (see below) */
+    unsigned int    flags;     /* flags (see ntuser.h) */
     VARARG(report,bytes);      /* HID report data */
 @REPLY
     int             wait;      /* do we need to wait for a reply? */
@@ -2403,7 +2423,16 @@ enum message_type
     int             new_x;     /* new cursor position */
     int             new_y;
 @END
-#define SEND_HWMSG_INJECTED    0x01
+
+
+/* Control generating of mouse events from pointer events. */
+@REQ(track_mouse_from_pointer)
+    user_handle_t   win;        /* window handle */
+    unsigned int    msg;        /* message code */
+    unsigned int    pointer_id; /* pointer id */
+@REPLY
+    int             cursor_pos_updated; /* cursor position updated */
+@END
 
 
 /* Get a message from the current queue */
@@ -2692,13 +2721,6 @@ enum message_type
     lparam_t       new_info;      /* new window info value */
 @REPLY
     lparam_t       old_info;      /* previous window info value */
-@END
-
-
-/* Set the window builtin class FNID */
-@REQ(set_window_fnid)
-    user_handle_t  handle;        /* handle to the window */
-    atom_t         atom;          /* class atom */
 @END
 
 
@@ -3072,6 +3094,7 @@ enum coords_relative
     obj_handle_t handle;          /* handle to the object */
     unsigned int flags;           /* information to set/get */
     unsigned int obj_flags;       /* new object flags */
+    timeout_t    close_timeout;   /* desktop close timeout */
 @REPLY
     int          is_desktop;      /* is object a desktop? */
     unsigned int old_obj_flags;   /* old object flags */
@@ -3079,6 +3102,7 @@ enum coords_relative
 @END
 #define SET_USER_OBJECT_SET_FLAGS       1
 #define SET_USER_OBJECT_GET_FULL_NAME   2
+#define SET_USER_OBJECT_SET_CLOSE_TIMEOUT 4
 
 
 /* Register a hotkey */
@@ -3288,10 +3312,12 @@ enum caret_state
 @REQ(create_class)
     int            local;          /* is it a local class? */
     atom_t         atom;           /* class atom */
-    unsigned int   fnid;           /* FNID for builtin classes, or 0 */
+    unsigned int   style;          /* class style */
+    mod_handle_t   instance;       /* module instance */
     client_ptr_t   client_ptr;     /* pointer to class in client address space */
+    short int      cls_extra;      /* number of extra class bytes */
+    short int      win_extra;      /* number of window extra bytes */
     data_size_t    name_offset;    /* base class name offset for specified atom */
-    VARARG(info,class_info);       /* class info */
     VARARG(name,unicode_str);      /* class name */
 @REPLY
     struct obj_locator locator;    /* locator for the shared class object */
@@ -3306,8 +3332,6 @@ enum caret_state
     VARARG(name,unicode_str);      /* class name */
 @REPLY
     client_ptr_t   client_ptr;     /* pointer to class in client address space */
-    user_handle_t  background;     /* class default background */
-    client_ptr_t   menu_name;      /* pointer to menu name in client address space */
 @END
 
 
@@ -3593,11 +3617,13 @@ enum caret_state
 
 struct handle_info
 {
+    client_ptr_t object;
     process_id_t owner;
     obj_handle_t handle;
     unsigned int access;
     unsigned int attributes;
     unsigned int type;
+    unsigned int __pad;
 };
 
 /* Return a list of all opened handles */
@@ -3680,6 +3706,13 @@ struct handle_info
     VARARG(entries,directory_entries);
 @END
 
+@REQ(query_directory_file)
+    obj_handle_t   handle;
+    unsigned int   restart_scan;
+@REPLY
+    data_size_t    total_len;          /* total length needed for strings */
+    VARARG(entries,directory_file_entries);
+@END
 
 /* Create a symbolic link object */
 @REQ(create_symlink)
@@ -3842,6 +3875,7 @@ struct handle_info
 /* Make the current process a system process */
 @REQ(make_process_system)
     obj_handle_t handle;          /* handle to the process */
+    timeout_t    desktop_close_timeout; /* set timeout for desktop close */
 @REPLY
     obj_handle_t event;           /* event signaled when all user processes have exited */
 @END
@@ -4197,6 +4231,7 @@ enum inproc_sync_type
 @REPLY
     int           type;         /* inproc sync type */
     unsigned int access;        /* handle access rights */
+    unsigned int fsync_shm_idx;
 @END
 
 
@@ -4204,6 +4239,7 @@ enum inproc_sync_type
 @REQ(get_inproc_alert_fd)
 @REPLY
     obj_handle_t handle;        /* alert fd is in flight with this handle */
+    unsigned int fsync_shm_idx;
 @END
 
 
@@ -4296,4 +4332,24 @@ enum inproc_sync_type
     unsigned __int64    fence_value;    /* semaphore fence value */
     data_size_t         runtime_size;   /* size of client runtime data */
     VARARG(runtime,bytes);              /* client runtime data */
+@END
+
+/* fsync definitions */
+#define FSYNC_SHM_PAGE_SIZE 0x10000
+#define FSYNC_USED_BY_SERVER 0x7eadfeef
+
+enum fsync_type
+{
+    FSYNC_SEMAPHORE = 1,
+    FSYNC_AUTO_EVENT,
+    FSYNC_MANUAL_EVENT,
+    FSYNC_MUTEX,
+    FSYNC_AUTO_SERVER,
+    FSYNC_MANUAL_SERVER,
+    FSYNC_QUEUE,
+};
+
+@REQ(fsync_free_shm_idx)
+    unsigned int shm_idx;
+@REPLY
 @END

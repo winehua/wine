@@ -41,7 +41,6 @@ extern BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle );
 extern HICON alloc_cursoricon_handle( BOOL is_icon );
 extern ULONG_PTR get_icon_param( HICON handle );
 extern ULONG_PTR set_icon_param( HICON handle, const struct free_icon_params *params );
-extern HICON create_small_icon( HICON handle );
 
 /* dce.c */
 extern struct window_surface dummy_surface;
@@ -55,12 +54,9 @@ extern void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct
                                       const RECT *old_visible_rect, const RECT *valid_rects );
 extern void register_window_surface( struct window_surface *old,
                                      struct window_surface *new );
+extern void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info );
 
-extern void window_surface_lock( struct window_surface *surface );
-extern void window_surface_unlock( struct window_surface *surface );
-extern void window_surface_flush( struct window_surface *surface );
-extern void window_surface_set_clip( struct window_surface *surface, HRGN clip_region );
-extern void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask );
+extern int force_present_to_surface( const RECT *win_rect );
 
 /* defwnd.c */
 extern BOOL adjust_window_rect( RECT *rect, DWORD style, BOOL menu, DWORD ex_style, UINT dpi );
@@ -92,9 +88,9 @@ extern BOOL register_imm_window( HWND hwnd );
 extern void unregister_imm_window( HWND hwnd );
 
 /* input.c */
+extern BOOL enable_mouse_in_pointer;
 extern BOOL grab_pointer;
 extern BOOL grab_fullscreen;
-extern BOOL is_mouse_in_pointer_enabled( HWND hwnd );
 extern HWND get_active_window(void);
 extern HWND get_capture(void);
 extern HWND get_focus(void);
@@ -111,6 +107,9 @@ extern void update_current_mouse_window( HWND hwnd, INT hittest, POINT pos );
 extern BOOL process_wine_clipcursor( HWND hwnd, UINT flags, BOOL reset );
 extern BOOL clip_fullscreen_window( HWND hwnd, BOOL reset );
 extern USHORT map_scan_to_kbd_vkey( USHORT scan, HKL layout );
+void update_mouse_state_from_pointer( HWND hwnd, UINT msg, unsigned int pointer_id );
+extern BOOL register_touch_window( HWND hwnd, UINT flags );
+extern BOOL unregister_touch_window( HWND hwnd );
 
 /* menu.c */
 extern UINT draw_nc_menu_bar( HDC hdc, RECT *rect, HWND hwnd );
@@ -147,10 +146,12 @@ extern BOOL process_rawinput_message( MSG *msg, UINT hw_id, const struct hardwar
 
 /* scroll.c */
 extern void draw_nc_scrollbar( HWND hwnd, HDC hdc, BOOL draw_horizontal, BOOL draw_vertical );
+extern BOOL get_scroll_bar_info( HWND hwnd, LONG id, SCROLLBARINFO *info );
 extern BOOL get_scroll_info( HWND hwnd, INT bar, SCROLLINFO *info );
 extern void handle_scroll_event( HWND hwnd, INT bar, UINT msg, POINT pt );
 extern LRESULT scroll_bar_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
                                        BOOL ansi );
+extern int set_scroll_info( HWND hwnd, INT bar, const SCROLLINFO *info, BOOL redraw );
 extern void set_standard_scroll_painted( HWND hwnd, int bar, BOOL painted );
 extern void track_scroll_bar( HWND hwnd, int scrollbar, POINT pt );
 
@@ -164,6 +165,7 @@ extern HBITMAP get_display_bitmap(void);
 extern INT get_display_depth( UNICODE_STRING *name );
 extern RECT get_display_rect( const WCHAR *display );
 extern UINT get_win_monitor_dpi( HWND hwnd, UINT *raw_dpi );
+extern UINT round_fractional_dpi( UINT dpi );
 extern RECT get_primary_monitor_rect( UINT dpi );
 extern DWORD get_process_layout(void);
 extern COLORREF get_sys_color( int index );
@@ -198,6 +200,11 @@ extern void user_unlock(void);
 extern void user_check_not_lock(void);
 extern BOOL get_gpu_uuid_from_luid( const LUID *luid, GUID *uuid );
 extern BOOL get_gpu_info_from_uuid( const GUID *uuid, LUID *luid, UINT32 *node_mask, char *name );
+extern BOOL get_float_gamma_ramp( float *ramp, LONG *serial );
+extern BOOL get_global_gamma_ramp( void *data );
+extern BOOL set_global_gamma_ramp( void *data );
+
+extern void fixup_device_id( const struct pci_id **pci_id );
 
 /* d3dkmtc. */
 
@@ -292,7 +299,6 @@ extern BOOL is_zoomed( HWND hwnd );
 extern BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal );
 extern int get_window_pixel_format( HWND hwnd );
 extern DWORD get_window_long( HWND hwnd, INT offset );
-extern UINT get_window_fnid( HWND hwnd );
 extern ULONG_PTR get_window_long_ptr( HWND hwnd, INT offset, BOOL ansi );
 extern BOOL get_window_rect( HWND hwnd, RECT *rect, UINT dpi );
 enum coords_relative;
@@ -421,7 +427,7 @@ static inline UINT unicodez_to_ascii( char *dst, const WCHAR *src )
 
 static inline BOOL is_win9x(void)
 {
-    return RtlGetCurrentPeb()->OSPlatformId == VER_PLATFORM_WIN32s;
+    return NtCurrentTeb()->Peb->OSPlatformId == VER_PLATFORM_WIN32s;
 }
 
 static inline const char *debugstr_us( const UNICODE_STRING *us )
@@ -447,5 +453,7 @@ static inline BOOL intersect_rect( RECT *dst, const RECT *src1, const RECT *src2
     dst->bottom = min( src1->bottom, src2->bottom );
     return !IsRectEmpty( dst );
 }
+
+int disable_gamescope_max_size_hack(void);
 
 #endif /* __WINE_WIN32U_PRIVATE */

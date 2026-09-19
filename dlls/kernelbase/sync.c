@@ -23,6 +23,7 @@
 #include <stdio.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "wincon.h"
@@ -38,6 +39,8 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
+
+#include "winehua_ipc_trace.h"
 
 static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
 
@@ -341,7 +344,11 @@ DWORD WINAPI DECLSPEC_HOTPATCH SignalObjectAndWait( HANDLE signal, HANDLE wait,
                                                     DWORD timeout, BOOL alertable )
 {
     NTSTATUS status;
+#ifdef __i386__
+    DECLSPEC_ALIGN(4) LARGE_INTEGER time;
+#else
     LARGE_INTEGER time;
+#endif
 
     TRACE( "%p %p %ld %d\n", signal, wait, timeout, alertable );
 
@@ -414,6 +421,8 @@ DWORD WINAPI DECLSPEC_HOTPATCH WaitForSingleObjectEx( HANDLE handle, DWORD timeo
         SetLastError( RtlNtStatusToDosError(status) );
         status = WAIT_FAILED;
     }
+    winehua_ipc_trace_handle( "WaitForSingleObjectEx", handle, "timeout=%lu result=0x%lx",
+                              (unsigned long)timeout, (unsigned long)status );
     return status;
 }
 
@@ -567,10 +576,15 @@ HANDLE WINAPI DECLSPEC_HOTPATCH CreateEventW( SECURITY_ATTRIBUTES *sa, BOOL manu
                                               BOOL initial_state, LPCWSTR name )
 {
     DWORD flags = 0;
+    HANDLE ret;
 
     if (manual_reset) flags |= CREATE_EVENT_MANUAL_RESET;
     if (initial_state) flags |= CREATE_EVENT_INITIAL_SET;
-    return CreateEventExW( sa, name, flags, EVENT_ALL_ACCESS );
+    ret = CreateEventExW( sa, name, flags, EVENT_ALL_ACCESS );
+    if (ret) winehua_ipc_remember( ret );
+    winehua_ipc_trace( "CreateEventW", name, "handle=%p manual=%d initial=%d",
+                       ret, (int)manual_reset, (int)initial_state );
+    return ret;
 }
 
 
@@ -625,6 +639,11 @@ HANDLE WINAPI DECLSPEC_HOTPATCH CreateEventExW( SECURITY_ATTRIBUTES *sa, LPCWSTR
         SetLastError( ERROR_ALREADY_EXISTS );
     else
         SetLastError( RtlNtStatusToDosError(status) );
+    /* WineHua TEMP-DIAG(IPC-TRACE): CreateEventW 只是转发到这里, 事件对象实际创建点在此。 */
+    if (ret) winehua_ipc_remember( ret );
+    winehua_ipc_trace( "CreateEventExW", name, "handle=%p flags=0x%lx access=0x%lx status=0x%lx exists=%d",
+                       ret, (unsigned long)flags, (unsigned long)access,
+                       (unsigned long)status, status == STATUS_OBJECT_NAME_EXISTS );
     return ret;
 }
 
@@ -660,7 +679,13 @@ HANDLE WINAPI DECLSPEC_HOTPATCH OpenEventW( DWORD access, BOOL inherit, LPCWSTR 
 
     if (!get_open_object_attributes( &attr, &nameW, inherit, name )) return 0;
 
-    if (!set_ntstatus( NtOpenEvent( &ret, access, &attr ))) return 0;
+    if (!set_ntstatus( NtOpenEvent( &ret, access, &attr )))
+    {
+        winehua_ipc_trace( "OpenEventW", name, "access=0x%lx result=FAILED", (unsigned long)access );
+        return 0;
+    }
+    winehua_ipc_remember( ret );
+    winehua_ipc_trace( "OpenEventW", name, "access=0x%lx handle=%p", (unsigned long)access, ret );
     return ret;
 }
 
@@ -678,7 +703,9 @@ BOOL WINAPI DECLSPEC_HOTPATCH PulseEvent( HANDLE handle )
  */
 BOOL WINAPI DECLSPEC_HOTPATCH SetEvent( HANDLE handle )
 {
-    return set_ntstatus( NtSetEvent( handle, NULL ));
+    BOOL ret = set_ntstatus( NtSetEvent( handle, NULL ));
+    winehua_ipc_trace_handle( "SetEvent", handle, "result=%d", (int)ret );
+    return ret;
 }
 
 
@@ -687,7 +714,9 @@ BOOL WINAPI DECLSPEC_HOTPATCH SetEvent( HANDLE handle )
  */
 BOOL WINAPI DECLSPEC_HOTPATCH ResetEvent( HANDLE handle )
 {
-    return set_ntstatus( NtResetEvent( handle, NULL ));
+    BOOL ret = set_ntstatus( NtResetEvent( handle, NULL ));
+    winehua_ipc_trace_handle( "ResetEvent", handle, "result=%d", (int)ret );
+    return ret;
 }
 
 
@@ -765,7 +794,7 @@ HANDLE WINAPI DECLSPEC_HOTPATCH OpenMutexW( DWORD access, BOOL inherit, LPCWSTR 
 {
     HANDLE ret;
     UNICODE_STRING nameW;
-    OBJECT_ATTRIBUTES attr;
+    DECLSPEC_ALIGN(32) OBJECT_ATTRIBUTES attr;
 
     if (!is_version_nt()) access = MUTEX_ALL_ACCESS;
 
@@ -1089,6 +1118,11 @@ HANDLE WINAPI DECLSPEC_HOTPATCH CreateFileMappingW( HANDLE file, LPSECURITY_ATTR
         SetLastError( ERROR_ALREADY_EXISTS );
     else
         SetLastError( RtlNtStatusToDosError(status) );
+    if (ret) winehua_ipc_remember( ret );
+    winehua_ipc_trace( "CreateFileMappingW", name,
+                       "handle=%p size=%llu protect=0x%lx status=0x%lx exists=%d",
+                       ret, (unsigned long long)size.QuadPart, (unsigned long)protect,
+                       (unsigned long)status, status == STATUS_OBJECT_NAME_EXISTS );
     return ret;
 }
 
@@ -1151,6 +1185,9 @@ HANDLE WINAPI DECLSPEC_HOTPATCH OpenFileMappingW( DWORD access, BOOL inherit, LP
     }
 
     if (!set_ntstatus( NtOpenSection( &ret, access, &attr ))) return 0;
+    winehua_ipc_remember( ret );
+    winehua_ipc_trace( "OpenFileMappingW", name, "access=0x%lx handle=%p",
+                       (unsigned long)access, ret );
     return ret;
 }
 

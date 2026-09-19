@@ -56,6 +56,7 @@
 #undef _CDECL
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winnls.h"
@@ -87,7 +88,6 @@ struct coreaudio_stream
     DWORD flags;
     AUDCLNT_SHAREMODE share;
     HANDLE event;
-    HANDLE timer_thread;
 
     BOOL playing, please_quit;
     REFERENCE_TIME period;
@@ -198,6 +198,27 @@ static BOOL device_has_channels(AudioDeviceID device, EDataFlow flow)
     }
     free(buffers);
     return ret;
+}
+
+static NTSTATUS unix_process_attach(void *args)
+{
+#ifdef _WIN64
+    if (NtCurrentTeb()->WowTebOffset)
+    {
+        SYSTEM_BASIC_INFORMATION info;
+
+        NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL);
+        zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
+    }
+#endif
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS unix_main_loop(void *args)
+{
+    struct main_loop_params *params = args;
+    NtSetEvent(params->event, NULL);
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS unix_get_endpoint_ids(void *args)
@@ -721,13 +742,6 @@ static NTSTATUS unix_create_stream(void *args)
 
     stream->period = params->period;
     stream->period_frames = muldiv(params->period, stream->fmt->nSamplesPerSec, 10000000);
-
-    if (stream->period_frames == 0)
-    {
-        params->result = E_INVALIDARG;
-        goto end;
-    }
-
     stream->dev_id = dev_id_from_device(params->device);
     stream->flow = params->flow;
     stream->flags = params->flags;
@@ -811,10 +825,10 @@ static NTSTATUS unix_release_stream( void *args )
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
     SIZE_T size;
 
-    if(stream->timer_thread){
+    if(params->timer_thread){
         stream->please_quit = TRUE;
-        NtWaitForSingleObject(stream->timer_thread, FALSE, NULL);
-        NtClose(stream->timer_thread);
+        NtWaitForSingleObject(params->timer_thread, FALSE, NULL);
+        NtClose(params->timer_thread);
     }
 
     if(stream->unit){
@@ -1342,37 +1356,10 @@ static NTSTATUS unix_get_current_padding(void *args)
     return STATUS_SUCCESS;
 }
 
-static void unix_timer_loop(void *args)
-{
-    struct coreaudio_stream *stream = args;
-    LARGE_INTEGER delay, next, last;
-    int adjust;
-
-    delay.QuadPart = -stream->period;
-    NtQueryPerformanceCounter(&last, NULL);
-    next.QuadPart = last.QuadPart + stream->period;
-
-    while(!stream->please_quit){
-        NtSetEvent(stream->event, NULL);
-        NtDelayExecution(FALSE, &delay);
-        NtQueryPerformanceCounter(&last, NULL);
-
-        adjust = next.QuadPart - last.QuadPart;
-        if(adjust > stream->period / 2)
-            adjust = stream->period / 2;
-        else if(adjust < -stream->period / 2)
-            adjust = -stream->period / 2;
-
-        delay.QuadPart = -(stream->period + adjust);
-        next.QuadPart += stream->period;
-    }
-}
-
 static NTSTATUS unix_start(void *args)
 {
     struct start_params *params = args;
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
-    static const WCHAR name[] = {'a','u','d','i','o','_','c','l','i','e','n','t','_','t','i','m','e','r',0};
 
     os_unfair_lock_lock(&stream->lock);
 
@@ -1386,7 +1373,6 @@ static NTSTATUS unix_start(void *args)
     }
 
     os_unfair_lock_unlock(&stream->lock);
-    if (!stream->timer_thread) create_unix_thread( &stream->timer_thread, name, unix_timer_loop, stream );
 
     return STATUS_SUCCESS;
 }
@@ -1435,6 +1421,35 @@ static NTSTATUS unix_reset(void *args)
     }
 
     os_unfair_lock_unlock(&stream->lock);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS unix_timer_loop(void *args)
+{
+    struct timer_loop_params *params = args;
+    struct coreaudio_stream *stream = handle_get_stream(params->stream);
+    LARGE_INTEGER delay, next, last;
+    int adjust;
+
+    delay.QuadPart = -stream->period;
+    NtQueryPerformanceCounter(&last, NULL);
+    next.QuadPart = last.QuadPart + stream->period;
+
+    while(!stream->please_quit){
+        NtSetEvent(stream->event, NULL);
+        NtDelayExecution(FALSE, &delay);
+        NtQueryPerformanceCounter(&last, NULL);
+
+        adjust = next.QuadPart - last.QuadPart;
+        if(adjust > stream->period / 2)
+            adjust = stream->period / 2;
+        else if(adjust < -stream->period / 2)
+            adjust = -stream->period / 2;
+
+        delay.QuadPart = -(stream->period + adjust);
+        next.QuadPart += stream->period;
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -1765,16 +1780,16 @@ static NTSTATUS unix_set_event_handle(void *args)
 
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
+    unix_process_attach,
     unix_not_implemented,
-    unix_not_implemented,
-    unix_not_implemented,
-    unix_not_implemented,
+    unix_main_loop,
     unix_get_endpoint_ids,
     unix_create_stream,
     unix_release_stream,
     unix_start,
     unix_stop,
     unix_reset,
+    unix_timer_loop,
     unix_get_render_buffer,
     unix_release_render_buffer,
     unix_get_capture_buffer,
@@ -1810,13 +1825,17 @@ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
 
 typedef UINT PTR32;
 
-static NTSTATUS unix_wow64_process_attach(void *args)
+static NTSTATUS unix_wow64_main_loop(void *args)
 {
-    SYSTEM_BASIC_INFORMATION info;
-
-    NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL);
-    zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
-    return STATUS_SUCCESS;
+    struct
+    {
+        PTR32 event;
+    } *params32 = args;
+    struct main_loop_params params =
+    {
+        .event = ULongToHandle(params32->event)
+    };
+    return unix_main_loop(&params);
 }
 
 static NTSTATUS unix_wow64_get_endpoint_ids(void *args)
@@ -1883,11 +1902,13 @@ static NTSTATUS unix_wow64_release_stream(void *args)
     struct
     {
         stream_handle stream;
+        PTR32 timer_thread;
         HRESULT result;
     } *params32 = args;
     struct release_stream_params params =
     {
         .stream = params32->stream,
+        .timer_thread = ULongToHandle(params32->timer_thread)
     };
     unix_release_stream(&params);
     params32->result = params.result;
@@ -2215,16 +2236,16 @@ static NTSTATUS unix_wow64_get_prop_value(void *args)
 
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
-    unix_wow64_process_attach,
+    unix_process_attach,
     unix_not_implemented,
-    unix_not_implemented,
-    unix_not_implemented,
+    unix_wow64_main_loop,
     unix_wow64_get_endpoint_ids,
     unix_wow64_create_stream,
     unix_wow64_release_stream,
     unix_start,
     unix_stop,
     unix_reset,
+    unix_timer_loop,
     unix_wow64_get_render_buffer,
     unix_release_render_buffer,
     unix_wow64_get_capture_buffer,

@@ -51,6 +51,7 @@
 #endif
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
 #include "winbase.h"
@@ -62,8 +63,8 @@
 #include "error.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(environ);
+WINE_DECLARE_DEBUG_CHANNEL(nls);
 
-DWORD pid = 0;
 PEB *peb = NULL;
 WOW_PEB *wow_peb = NULL;
 USHORT *uctable = NULL, *lctable = NULL;
@@ -154,7 +155,7 @@ static NTSTATUS open_nls_data_file( const char *path, const WCHAR *sysdir, HANDL
     OBJECT_ATTRIBUTES attr;
     UNICODE_STRING valueW;
     WCHAR buffer[64];
-    const char *p;
+    char *p;
 
     wcscpy( buffer, system_dir );
     p = strrchr( path, '/' ) + 1;
@@ -278,13 +279,14 @@ static const struct { const char *name; UINT cp; } charset_names[] =
 
 static void init_unix_codepage(void)
 {
+    const char *name, *ctype;
     char charset_name[16];
-    const char *name;
     size_t i, j;
     int min = 0, max = ARRAY_SIZE(charset_names) - 1;
 
-    setlocale( LC_CTYPE, "" );
-    if (!(name = nl_langinfo( CODESET ))) return;
+    if (!(ctype = setlocale( LC_CTYPE, "" ))) name = "UTF-8";
+    else if (!(name = nl_langinfo( CODESET ))) return;
+    TRACE_(nls)( "Unix LC_CTYPE %s, using %s codeset\n", debugstr_a(ctype), debugstr_a(name) );
 
     /* remove punctuation characters from charset name */
     for (i = j = 0; name[i] && j < sizeof(charset_name)-1; i++)
@@ -355,7 +357,8 @@ static BOOL is_ignored_env_var( const char *var )
             STARTS_WITH( var, "SDL_AUDIO_DRIVER=" ) ||
             STARTS_WITH( var, "SDL_VIDEODRIVER=" ) ||
             STARTS_WITH( var, "SDL_VIDEO_DRIVER=" ) ||
-            STARTS_WITH( var, "VK_" ));
+            STARTS_WITH( var, "VK_" ) ||
+            STARTS_WITH( var, "XR_" ));
 }
 
 
@@ -484,7 +487,7 @@ const WCHAR *ntdll_get_data_dir(void)
  */
 static void set_process_name( const char *name )
 {
-    const char *p;
+    char *p;
 
 #ifdef HAVE_SETPROCTITLE
     setproctitle("-%s", name );
@@ -726,13 +729,33 @@ static const NLS_LOCALE_DATA *get_win_locale( const NLS_LOCALE_HEADER *header, c
 static void init_locale(void)
 {
     struct locale_nls_header *header;
+    const char *all, *ctype, *messages;
     const NLS_LOCALE_HEADER *locale_table;
     const NLS_LOCALE_DATA *locale;
     char *p;
 
-    setlocale( LC_ALL, "" );
-    if (!unix_to_win_locale( setlocale( LC_CTYPE, NULL ), system_locale )) system_locale[0] = 0;
-    if (!unix_to_win_locale( setlocale( LC_MESSAGES, NULL ), user_locale )) user_locale[0] = 0;
+    if (!(all = setlocale( LC_ALL, "" )) && (all = getenv( "LC_ALL" )))
+        FIXME_(nls)( "Failed to set LC_ALL to %s, is the locale supported?\n", debugstr_a(all) );
+    if (!(ctype = setlocale( LC_CTYPE, "" )) && (ctype = getenv( "LC_CTYPE" )))
+        FIXME_(nls)( "Failed to set LC_CTYPE to %s, is the locale supported?\n", debugstr_a(ctype) );
+    if (!(messages = setlocale( LC_MESSAGES, "" )) && (messages = getenv( "LC_MESSAGES" )))
+        FIXME_(nls)( "Failed to set LC_MESSAGES to %s, is the locale supported?\n", debugstr_a(messages) );
+
+    if (!unix_to_win_locale( ctype, system_locale )) system_locale[0] = 0;
+    TRACE_(nls)( "Unix LC_CTYPE is %s, setting system locale to %s\n", debugstr_a(ctype), debugstr_a(user_locale) );
+
+    if (main_argc > 1 && (
+            strstr(main_argv[1], "start_protected_game.exe")
+            || strstr(main_argv[1], "RocketLeague_EAC.exe")
+            || ((p = getenv( "SteamGameId" )) && !strcmp( p, "2221490" ) && !strcmp( main_argv[1], "-public_key_store_address" ))
+       ))
+    {
+        FIXME( "HACK setting EN locale.\n" );
+        messages = "en-US";
+    }
+
+    if (!unix_to_win_locale( messages, user_locale )) user_locale[0] = 0;
+    TRACE_(nls)( "Unix LC_MESSAGES is %s, user system locale to %s\n", debugstr_a(messages), debugstr_a(user_locale) );
 
 #ifdef __APPLE__
     if (!system_locale[0])
@@ -839,7 +862,7 @@ void init_environment(void)
 /* check if a WINE_HOST_ prefixed variable already exists in the environment */
 static BOOL host_var_exists( const char *name )
 {
-    const char *end = strchr( name, '=' );
+    char *end = strchr( name, '=' );
 
     if (!end) return FALSE;
     for (char **e = environ; *e; e++)
@@ -986,10 +1009,7 @@ static void add_path_var( WCHAR **env, SIZE_T *pos, SIZE_T *size, const char *na
 {
     WCHAR *nt_name = NULL;
 
-    if (path && unix_to_nt_file_name( path, &nt_name, FILE_OPEN ))
-    {
-        return;
-    }
+    if (path && unix_to_nt_file_name( path, &nt_name, FILE_OPEN )) return;
     append_envW( env, pos, size, name, nt_name );
     free( nt_name );
 }
@@ -1031,6 +1051,7 @@ static void add_system_dll_path_var( WCHAR **env, SIZE_T *pos, SIZE_T *size )
  */
 static void add_dynamic_environment( WCHAR **env, SIZE_T *pos, SIZE_T *size )
 {
+    const char *var;
     unsigned int i;
     char str[22];
 
@@ -1060,6 +1081,9 @@ static void add_dynamic_environment( WCHAR **env, SIZE_T *pos, SIZE_T *size )
     append_envA( env, pos, size, "WINEUSERLOCALE", user_locale );
     append_envA( env, pos, size, "SystemDrive", "C:" );
     append_envA( env, pos, size, "SystemRoot", "C:\\windows" );
+
+    if ((var = getenv( "VR_CONFIG_PATH" ))) add_path_var( env, pos, size, "VR_CONFIG_PATH", var );
+    if ((var = getenv( "VR_LOG_PATH" ))) add_path_var( env, pos, size, "VR_LOG_PATH", var );
 }
 
 
@@ -1334,6 +1358,27 @@ static void add_registry_environment( WCHAR **env, SIZE_T *pos, SIZE_T *size )
     }
 }
 
+static void get_std_handle( int fd, unsigned int access, unsigned int attributes, HANDLE *handle )
+{
+    IO_STATUS_BLOCK io;
+    FILE_POSITION_INFORMATION pos_info;
+    FILE_NAME_INFORMATION name_info;
+    NTSTATUS status;
+
+    wine_server_fd_to_handle( fd, access, attributes, handle );
+    if (!*handle) return;
+
+    /* Python checks if a file is seekable and if so expects the file name to be gettable from handle. */
+    if (NtQueryInformationFile( *handle, &io, &pos_info, sizeof(pos_info), FilePositionInformation ))
+        return;
+
+    TRACE("handle for fd %d is seekable.\n", fd);
+    if (!(status = NtQueryInformationFile( *handle, &io, &name_info, sizeof(name_info), FileNameInformation ))
+          || status == STATUS_BUFFER_OVERFLOW) return;
+    TRACE("closing handle for fd %d.\n", fd);
+    NtClose( *handle );
+    *handle = NULL;
+}
 
 /*************************************************************************
  *		get_initial_console
@@ -1344,9 +1389,9 @@ static void get_initial_console( RTL_USER_PROCESS_PARAMETERS *params )
 {
     int output_fd = -1;
 
-    wine_server_fd_to_handle( 0, GENERIC_READ|SYNCHRONIZE,  OBJ_INHERIT, &params->hStdInput );
-    wine_server_fd_to_handle( 1, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdOutput );
-    wine_server_fd_to_handle( 2, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdError );
+    get_std_handle( 0, GENERIC_READ|SYNCHRONIZE,  OBJ_INHERIT, &params->hStdInput );
+    get_std_handle( 1, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdOutput );
+    get_std_handle( 2, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdError );
 
     if (main_image_info.SubSystemType != IMAGE_SUBSYSTEM_WINDOWS_CUI)
         return;
@@ -1539,6 +1584,32 @@ static WCHAR *build_command_line( WCHAR **wargv )
 /***********************************************************************
  *           run_wineboot
  */
+static void write_winehua_wineboot_status( const char *format, ... )
+{
+    static const char status_name[] = "/.winehua-wineboot-init-status";
+    char record[96];
+    char *path;
+    va_list args;
+    int fd, length;
+
+    if (!config_dir || asprintf( &path, "%s%s", config_dir, status_name ) == -1) return;
+
+    /* Only a launcher-created request enables this private completion channel.
+     * Ordinary Wine processes must not create or mutate the marker. */
+    if ((fd = open( path, O_WRONLY | O_TRUNC | O_CLOEXEC )) == -1)
+    {
+        free( path );
+        return;
+    }
+
+    va_start( args, format );
+    length = vsnprintf( record, sizeof(record), format, args );
+    va_end( args );
+    if (length > 0 && length < sizeof(record)) write( fd, record, length );
+    close( fd );
+    free( path );
+}
+
 static void run_wineboot( WCHAR *env, SIZE_T size )
 {
     static const WCHAR eventW[] = {'\\','K','e','r','n','e','l','O','b','j','e','c','t','s',
@@ -1557,6 +1628,8 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
     LARGE_INTEGER timeout;
     unsigned int status;
     int count = 1;
+
+    write_winehua_wineboot_status( "wineboot-dispatch" );
 
     init_unicode_string( &nameW, eventW );
     InitializeObjectAttributes( &attr, &nameW, OBJ_OPENIF, 0, NULL );
@@ -1595,6 +1668,7 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
     if (status)
     {
         ERR( "failed to start wineboot %x\n", status );
+        write_winehua_wineboot_status( "wineboot-create-failed-%08x", status );
         NtClose( handles[0] );
         return;
     }
@@ -1604,8 +1678,25 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
 
 wait:
     timeout.QuadPart = (ULONGLONG)5 * 60 * 1000 * -10000;
-    if (NtWaitForMultipleObjects( count, handles, WaitAny, FALSE, &timeout ) == WAIT_TIMEOUT)
+    status = NtWaitForMultipleObjects( count, handles, WaitAny, FALSE, &timeout );
+    if (status == WAIT_OBJECT_0)
+        write_winehua_wineboot_status( "wineboot-init-ok" );
+    else if (status == WAIT_TIMEOUT)
+    {
         ERR( "boot event wait timed out\n" );
+        write_winehua_wineboot_status( "wineboot-event-timeout" );
+    }
+    else if (count > 1 && status == WAIT_OBJECT_0 + 1)
+    {
+        PROCESS_BASIC_INFORMATION info;
+        NTSTATUS query_status = NtQueryInformationProcess( process, ProcessBasicInformation,
+                                                           &info, sizeof(info), NULL );
+        if (!query_status)
+            write_winehua_wineboot_status( "wineboot-process-exit-%08x", info.ExitStatus );
+        else
+            write_winehua_wineboot_status( "wineboot-process-exit-query-%08x", query_status );
+    }
+    else write_winehua_wineboot_status( "wineboot-wait-failed-%08x", status );
     while (count) NtClose( handles[--count] );
 }
 
@@ -1755,6 +1846,7 @@ static void load_global_options( const UNICODE_STRING *image )
             peb->NtGlobalFlag = get_dword_option( key, globalflagW, peb->NtGlobalFlag );
             NtClose( key );
         }
+        else peb->ProcessParameters->Flags |= PROCESS_PARAMS_IMAGE_KEY_MISSING;
         NtClose( attr.RootDirectory );
     }
 }
@@ -1842,11 +1934,10 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
 #ifdef _WIN64
     if (!is_machine_64bit( main_image_info.Machine ))
     {
-        struct thread_data *data = get_thread_data();
-        data->teb->WowTebOffset = teb_offset;
-        data->teb->Tib.ExceptionList = (void *)((char *)data->teb + teb_offset);
+        NtCurrentTeb()->WowTebOffset = teb_offset;
+        NtCurrentTeb()->Tib.ExceptionList = (void *)((char *)NtCurrentTeb() + teb_offset);
         wow_peb = (PEB32 *)((char *)peb + page_size);
-        set_thread_id( data );
+        set_thread_id( NtCurrentTeb(), GetCurrentProcessId(), GetCurrentThreadId() );
     }
 #endif
 
@@ -1894,9 +1985,8 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     WCHAR *curdir = get_initial_directory();
     UNICODE_STRING nt_name;
     NTSTATUS status;
-    TEB64 *teb64 = get_teb64( NtCurrentTeb() );
 
-    if (teb64) teb64->TlsSlots[WOW64_TLS_FILESYSREDIR] = TRUE;
+    if (NtCurrentTeb64()) NtCurrentTeb64()->TlsSlots[WOW64_TLS_FILESYSREDIR] = TRUE;
 
     /* store the initial PATH value */
     path = get_env_var( env, env_pos, pathW, 4 );
@@ -1951,7 +2041,7 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     else
     {
         rebuild_argv();
-        if (teb64) teb64->TlsSlots[WOW64_TLS_FILESYSREDIR] = FALSE;
+        if (NtCurrentTeb64()) NtCurrentTeb64()->TlsSlots[WOW64_TLS_FILESYSREDIR] = FALSE;
     }
 
     main_wargv = build_wargv( get_dos_path( nt_name.Buffer ));
@@ -1960,26 +2050,36 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     TRACE( "image %s cmdline %s dir %s\n",
            debugstr_w(main_wargv[0]), debugstr_w(cmdline), debugstr_w(curdir) );
 
+#ifdef __OHOS__
     /* OHOS: build DllPath from WINEDLLPATH for PE DLL search */
     DWORD dllpath_len = 0;
     WCHAR *dllpath_w = NULL;
-    const char *winedllpath = getenv("WINEDLLPATH");
-    if (winedllpath)
     {
-        DWORD ulen = strlen(winedllpath);
-        dllpath_w = malloc((ulen + 2) * sizeof(WCHAR));
-        if (dllpath_w)
+        static const char system_dll_path[] = ";C:\\windows\\system32;C:\\windows";
+        const char *winedllpath = getenv("WINEDLLPATH");
+        if (winedllpath)
         {
-            for (const char *s = winedllpath; *s; s++)
-                dllpath_w[dllpath_len++] = (*s == ':') ? ';' : *s;
-            dllpath_w[dllpath_len] = 0;
-            dllpath_len = (dllpath_len + 1) * sizeof(WCHAR);
+            DWORD ulen = strlen(winedllpath);
+            DWORD system_len = strlen(system_dll_path);
+            dllpath_w = malloc((ulen + system_len + 1) * sizeof(WCHAR));
+            if (dllpath_w)
+            {
+                for (const char *s = winedllpath; *s; s++)
+                    dllpath_w[dllpath_len++] = (*s == ':') ? ';' : *s;
+                for (const char *s = system_dll_path; *s; s++)
+                    dllpath_w[dllpath_len++] = *s;
+                dllpath_w[dllpath_len] = 0;
+                dllpath_len = (dllpath_len + 1) * sizeof(WCHAR);
+            }
         }
     }
+#endif
 
     size = (sizeof(*params)
             + MAX_PATH * sizeof(WCHAR)  /* curdir */
+#ifdef __OHOS__
             + dllpath_len               /* dll path */
+#endif
             + (wcslen( cmdline ) + 1) * sizeof(WCHAR)  /* command line */
             + (wcslen( main_wargv[0] ) + 1) * sizeof(WCHAR) * 2 /* image path + window title */
             + env_pos * sizeof(WCHAR));
@@ -1992,7 +2092,7 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     params->Size            = size;
     params->Flags           = PROCESS_PARAMS_FLAG_NORMALIZED;
     params->wShowWindow     = 1; /* SW_SHOWNORMAL */
-    params->ProcessGroupId  = pid;
+    params->ProcessGroupId  = GetCurrentProcessId();
 
     params->CurrentDirectory.DosPath.Buffer = (WCHAR *)(params + 1);
     wcscpy( params->CurrentDirectory.DosPath.Buffer, get_dos_path( curdir ));
@@ -2003,6 +2103,7 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
     put_unicode_string( main_wargv[0], &dst, &params->ImagePathName );
     put_unicode_string( cmdline, &dst, &params->CommandLine );
     put_unicode_string( main_wargv[0], &dst, &params->WindowTitle );
+#ifdef __OHOS__
     if (dllpath_w)
     {
         memcpy(dst, dllpath_w, dllpath_len);
@@ -2012,6 +2113,7 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
         dst += dllpath_len / sizeof(WCHAR);
         free(dllpath_w);
     }
+#endif
     free( nt_name.Buffer );
     free( cmdline );
     free( curdir );
@@ -2434,9 +2536,8 @@ void WINAPI RtlInitUnicodeString( UNICODE_STRING *str, const WCHAR *data )
  */
 ULONG WINAPI RtlNtStatusToDosError( NTSTATUS status )
 {
-    TEB *teb = NtCurrentTeb();
+    NtCurrentTeb()->LastStatusValue = status;
 
-    if (teb) teb->LastStatusValue = status;
     if (!status || (status & 0x20000000)) return status;
     if ((status & 0xf0000000) == 0xd0000000) status &= ~0x10000000;
 
@@ -2452,17 +2553,7 @@ ULONG WINAPI RtlNtStatusToDosError( NTSTATUS status )
  */
 DWORD WINAPI RtlGetLastWin32Error(void)
 {
-    TEB *teb = NtCurrentTeb();
-
-    if (teb)
-    {
-#ifdef _WIN64
-        WOW_TEB *wow_teb = get_wow_teb( teb );
-        if (wow_teb) return wow_teb->LastErrorValue;
-#endif
-        return teb->LastErrorValue;
-    }
-    else return 0;
+    return NtCurrentTeb()->LastErrorValue;
 }
 
 /**********************************************************************
@@ -2471,37 +2562,9 @@ DWORD WINAPI RtlGetLastWin32Error(void)
 void WINAPI RtlSetLastWin32Error( DWORD err )
 {
     TEB *teb = NtCurrentTeb();
-
-    if (teb)
-    {
 #ifdef _WIN64
-        WOW_TEB *wow_teb = get_wow_teb( teb );
-        if (wow_teb) wow_teb->LastErrorValue = err;
+    WOW_TEB *wow_teb = get_wow_teb( teb );
+    if (wow_teb) wow_teb->LastErrorValue = err;
 #endif
-        teb->LastErrorValue = err;
-    }
-}
-
-/**********************************************************************
- *      RtlGetCurrentPeb  (ntdll.so)
- */
-PEB * WINAPI RtlGetCurrentPeb(void)
-{
-    return peb;
-}
-
-/**********************************************************************
- *      PsGetCurrentProcessId  (ntdll.so)
- */
-HANDLE WINAPI PsGetCurrentProcessId(void)
-{
-    return ULongToHandle( pid );
-}
-
-/**********************************************************************
- *      PsGetCurrentThreadId  (ntdll.so)
- */
-HANDLE WINAPI PsGetCurrentThreadId(void)
-{
-    return ULongToHandle( get_thread_data()->tid );
+    teb->LastErrorValue = err;
 }

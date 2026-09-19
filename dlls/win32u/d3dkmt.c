@@ -26,9 +26,11 @@
 #include <pthread.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "ntgdi_private.h"
 #include "win32u_private.h"
 #include "ntuser_private.h"
+#include "d3dkmdt.h"
 
 #include <d3d9types.h>
 #include <dxgi.h>
@@ -491,7 +493,7 @@ static void d3dkmt_init_vulkan(void)
     static const struct vulkan_instance_extensions extensions =
     {
         .has_VK_KHR_get_physical_device_properties2 = 1,
-        .has_VK_KHR_external_fence_capabilities = 1,
+        .has_VK_KHR_external_memory_capabilities = 1,
     };
 
     d3dkmt_vulkan_instance = vulkan_instance_create( &extensions );
@@ -683,6 +685,8 @@ NTSTATUS WINAPI NtGdiDdDDIDestroyDevice( const D3DKMT_DESTROYDEVICE *desc )
  */
 NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
 {
+    struct d3dkmt_adapter *adapter;
+
     TRACE( "(%p).\n", desc );
 
     if (!desc || !desc->hAdapter || !desc->pPrivateDriverData)
@@ -708,6 +712,43 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
             return STATUS_INVALID_PARAMETER;
 
         *value = KMT_DRIVERVERSION_WDDM_3_1;
+        return STATUS_SUCCESS;
+    }
+    case KMTQAITYPE_WDDM_2_7_CAPS:
+    {
+        VkPhysicalDeviceDriverPropertiesKHR driverProperties;
+        struct vulkan_physical_device *physical_device;
+        VkPhysicalDeviceProperties2KHR properties2;
+        struct vulkan_instance *instance;
+        D3DKMT_WDDM_2_7_CAPS *data;
+        const char *e;
+
+        if (!(adapter = get_d3dkmt_object( desc->hAdapter, D3DKMT_ADAPTER ))) return STATUS_INVALID_PARAMETER;
+        if (!(physical_device = adapter->physical_device)) return STATUS_INVALID_PARAMETER;
+        instance = physical_device->instance;
+
+        memset( &driverProperties, 0, sizeof(driverProperties) );
+        memset( &properties2, 0, sizeof(properties2) );
+        driverProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES_KHR;
+        properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR;
+        properties2.pNext = &driverProperties;
+        instance->p_vkGetPhysicalDeviceProperties2KHR( physical_device->host.physical_device, &properties2 );
+
+        /*
+         * Advertise Hardware-Scheduling as enabled for NVIDIA Adapters. NVIDIA driver does
+         * userspace submission. Allow overriding this value via the
+         * WINE_DISABLE_HARDWARE_SCHEDULING environment variable.
+         */
+        data = desc->pPrivateDriverData;
+        memset( data, 0, sizeof(*data) );
+        e = getenv( "WINE_DISABLE_HARDWARE_SCHEDULING" );
+        if ((!e || *e == '\0' || *e == '0') && (driverProperties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY))
+        {
+            data->HwSchEnabled = 1;
+            data->HwSchSupported = 1;
+            data->HwSchEnabledByDefault = 1;
+        }
+
         return STATUS_SUCCESS;
     }
     default:
@@ -994,6 +1035,9 @@ BOOL get_vulkan_gpus( struct list *gpus )
     for (i = 0; i < instance->physical_device_count; ++i)
     {
         struct gpu_info *gpu;
+
+        /* Ignore Khronos vendor IDs */
+        if (devinfo[i].properties2.properties.vendorID >= 0x10000) continue;
 
         if (!(gpu = calloc( 1, sizeof(*gpu) ))) break;
         memcpy( &gpu->uuid, devinfo[i].id.deviceUUID, sizeof(gpu->uuid) );

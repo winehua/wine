@@ -73,6 +73,16 @@ void msvcrt_init_math( void *module )
     sse2_supported = IsProcessorFeaturePresent( PF_XMMI64_INSTRUCTIONS_AVAILABLE );
 #if _MSVCR_VER <=71
     sse2_enabled = FALSE;
+    {
+        char sgi[64];
+
+        if (GetEnvironmentVariableA("SteamGameId", sgi, sizeof(sgi))
+                && (!strcmp(sgi, "560430") || !strcmp(sgi, "12330")))
+        {
+            sse2_supported = FALSE;
+            FIXME("HACK: disabling sse2 support in msvcrt.\n");
+        }
+    }
 #else
     sse2_enabled = sse2_supported;
 #endif
@@ -1992,7 +2002,7 @@ int CDECL _gcvt_s(char *buff, size_t size, double number, int digits)
  * VERSION
  *	[i386] Windows binary compatible - returns the struct in eax/edx.
  */
-#if defined(__i386__) && !defined(__WINE_PE_BUILD)
+#ifdef __i386__
 unsigned __int64 CDECL div(int num, int denom)
 {
     union {
@@ -2007,6 +2017,8 @@ unsigned __int64 CDECL div(int num, int denom)
 #else
 /*********************************************************************
  *		div (MSVCRT.@)
+ * VERSION
+ *	[!i386] Non-x86 can't run win32 apps so we don't need binary compatibility
  */
 div_t CDECL div(int num, int denom)
 {
@@ -2024,7 +2036,7 @@ div_t CDECL div(int num, int denom)
  * VERSION
  * 	[i386] Windows binary compatible - returns the struct in eax/edx.
  */
-#if defined(__i386__) && !defined(__WINE_PE_BUILD)
+#ifdef __i386__
 unsigned __int64 CDECL ldiv(__msvcrt_long num, __msvcrt_long denom)
 {
     union {
@@ -2039,6 +2051,8 @@ unsigned __int64 CDECL ldiv(__msvcrt_long num, __msvcrt_long denom)
 #else
 /*********************************************************************
  *		ldiv (MSVCRT.@)
+ * VERSION
+ *	[!i386] Non-x86 can't run win32 apps so we don't need binary compatibility
  */
 ldiv_t CDECL ldiv(__msvcrt_long num, __msvcrt_long denom)
 {

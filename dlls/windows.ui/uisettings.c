@@ -163,15 +163,8 @@ static HRESULT WINAPI uisettings_get_MessageDuration( IUISettings *iface, UINT32
 
 static HRESULT WINAPI uisettings_get_AnimationsEnabled( IUISettings *iface, boolean *value )
 {
-    BOOL enabled, ret;
-
-    TRACE( "iface %p, value %p.\n", iface, value );
-
-    ret = SystemParametersInfoW( SPI_GETCLIENTAREAANIMATION, 0, &enabled, 0 );
-    if (!ret) return E_FAIL;
-
-    *value = !!enabled;
-    return S_OK;
+    FIXME( "iface %p, value %p stub!\n", iface, value );
+    return E_NOTIMPL;
 }
 
 static HRESULT WINAPI uisettings_get_CaretBrowsingEnabled( IUISettings *iface, boolean *value )
@@ -204,46 +197,10 @@ static HRESULT WINAPI uisettings_get_MouseHoverTime( IUISettings *iface, UINT32 
     return E_NOTIMPL;
 }
 
-static void colorref_to_winui_color( COLORREF colorref, Color *color )
-{
-    color->A = 255;
-    color->R = GetRValue( colorref );
-    color->G = GetGValue( colorref );
-    color->B = GetBValue( colorref );
-}
-
 static HRESULT WINAPI uisettings_UIElementColor( IUISettings *iface, enum UIElementType element, struct Color *value )
 {
-    TRACE( "iface %p, element %d value %p.\n", iface, element, value );
-
-    switch (element)
-    {
-#define X( element_type, syscolor_index )                                \
-    case element_type:                                                   \
-        colorref_to_winui_color( GetSysColor( syscolor_index ), value ); \
-        break;
-
-    X( UIElementType_ActiveCaption, COLOR_ACTIVECAPTION )
-    X( UIElementType_Background, COLOR_BACKGROUND )
-    X( UIElementType_ButtonFace, COLOR_BTNFACE )
-    X( UIElementType_ButtonText, COLOR_BTNTEXT )
-    X( UIElementType_CaptionText, COLOR_CAPTIONTEXT )
-    X( UIElementType_GrayText, COLOR_GRAYTEXT )
-    X( UIElementType_Highlight, COLOR_HIGHLIGHT )
-    X( UIElementType_HighlightText, COLOR_HIGHLIGHTTEXT )
-    X( UIElementType_Hotlight, COLOR_HOTLIGHT )
-    X( UIElementType_InactiveCaption, COLOR_INACTIVECAPTION )
-    X( UIElementType_InactiveCaptionText, COLOR_INACTIVECAPTIONTEXT )
-    X( UIElementType_Window, COLOR_WINDOW )
-    X( UIElementType_WindowText, COLOR_WINDOWTEXT )
-
-#undef X
-    default:
-        memset( value, 0, sizeof(*value) );
-        break;
-    }
-
-    return S_OK;
+    FIXME( "iface %p, element %d value %p stub!\n", iface, element, value );
+    return E_NOTIMPL;
 }
 
 static const struct IUISettingsVtbl uisettings_vtbl =
@@ -286,13 +243,14 @@ static HRESULT WINAPI uisettings2_add_TextScaleFactorChanged( IUISettings2 *ifac
         EventRegistrationToken *cookie )
 {
     FIXME( "iface %p, handler %p, cookie %p stub!\n", iface, handler, cookie );
-    return E_NOTIMPL;
+    *cookie = dummy_cookie;
+    return S_OK;
 }
 
 static HRESULT WINAPI uisettings2_remove_TextScaleFactorChanged( IUISettings2 *iface, EventRegistrationToken cookie )
 {
     FIXME( "iface %p, cookie %#I64x stub!\n", iface, cookie.value );
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 static const struct IUISettings2Vtbl uisettings2_vtbl =

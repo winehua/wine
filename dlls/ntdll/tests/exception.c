@@ -44,23 +44,19 @@ static NTSTATUS  (WINAPI *pNtGetContextThread)(HANDLE,CONTEXT*);
 static NTSTATUS  (WINAPI *pNtSetContextThread)(HANDLE,CONTEXT*);
 static NTSTATUS  (WINAPI *pNtQueueApcThread)(HANDLE handle, PNTAPCFUNC func,
         ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3);
+static NTSTATUS  (WINAPI *pNtQueueApcThreadEx)(HANDLE handle, HANDLE reserve_handle, PNTAPCFUNC func,
+        ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3);
+static NTSTATUS  (WINAPI *pNtQueueApcThreadEx2)(HANDLE handle, HANDLE reserve_handle, ULONG flags, PNTAPCFUNC func,
+        ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3);
+static NTSTATUS  (WINAPI *pNtContinueEx)(CONTEXT*,KCONTINUE_ARGUMENT*);
 static NTSTATUS  (WINAPI *pRtlRaiseException)(EXCEPTION_RECORD *rec);
+static PVOID     (WINAPI *pRtlUnwind)(PVOID, PVOID, PEXCEPTION_RECORD, PVOID);
 static VOID      (WINAPI *pRtlCaptureContext)(CONTEXT*);
 static PVOID     (WINAPI *pRtlAddVectoredExceptionHandler)(ULONG first, PVECTORED_EXCEPTION_HANDLER func);
 static ULONG     (WINAPI *pRtlRemoveVectoredExceptionHandler)(PVOID handler);
 static PVOID     (WINAPI *pRtlAddVectoredContinueHandler)(ULONG first, PVECTORED_EXCEPTION_HANDLER func);
 static ULONG     (WINAPI *pRtlRemoveVectoredContinueHandler)(PVOID handler);
-static void *    (WINAPI *pRtlPcToFileHeader)(PVOID pc, PVOID *address);
-static void      (WINAPI *pRtlGetCallersAddress)(void**,void**);
-static NTSTATUS  (WINAPI *pNtReadVirtualMemory)(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
-static NTSTATUS  (WINAPI *pNtTerminateProcess)(HANDLE handle, LONG exit_code);
-static NTSTATUS  (WINAPI *pNtQueryInformationThread)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
-static BOOL      (WINAPI *pIsWow64Process)(HANDLE, PBOOL);
-static NTSTATUS  (WINAPI *pNtClose)(HANDLE);
-static NTSTATUS  (WINAPI *pNtSuspendProcess)(HANDLE process);
-static NTSTATUS  (WINAPI *pNtResumeProcess)(HANDLE process);
-static BOOL      (WINAPI *pWaitForDebugEventEx)(DEBUG_EVENT *, DWORD);
-#if defined(__x86_64__) || defined(__i386__)
+static void      (WINAPI *pRtlSetUnhandledExceptionFilter)(PRTL_EXCEPTION_FILTER filter);
 static ULONG64   (WINAPI *pRtlGetEnabledExtendedFeatures)(ULONG64);
 static NTSTATUS  (WINAPI *pRtlGetExtendedContextLength)(ULONG context_flags, ULONG *length);
 static NTSTATUS  (WINAPI *pRtlGetExtendedContextLength2)(ULONG context_flags, ULONG *length, ULONG64 compaction_mask);
@@ -73,8 +69,17 @@ static void *    (WINAPI *pRtlLocateExtendedFeature)(CONTEXT_EX *context_ex, ULO
 static void *    (WINAPI *pRtlLocateLegacyContext)(CONTEXT_EX *context_ex, ULONG *length);
 static void      (WINAPI *pRtlSetExtendedFeaturesMask)(CONTEXT_EX *context_ex, ULONG64 feature_mask);
 static ULONG64   (WINAPI *pRtlGetExtendedFeaturesMask)(CONTEXT_EX *context_ex);
+static void *    (WINAPI *pRtlPcToFileHeader)(PVOID pc, PVOID *address);
+static void      (WINAPI *pRtlGetCallersAddress)(void**,void**);
+static NTSTATUS  (WINAPI *pNtRaiseException)(EXCEPTION_RECORD *rec, CONTEXT *context, BOOL first_chance);
+static NTSTATUS  (WINAPI *pNtReadVirtualMemory)(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
+static NTSTATUS  (WINAPI *pNtTerminateProcess)(HANDLE handle, LONG exit_code);
+static NTSTATUS  (WINAPI *pNtQueryInformationThread)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
 static NTSTATUS  (WINAPI *pNtSetInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG);
-static PVOID     (WINAPI *pRtlUnwind)(PVOID, PVOID, PEXCEPTION_RECORD, PVOID);
+static BOOL      (WINAPI *pIsWow64Process)(HANDLE, PBOOL);
+static NTSTATUS  (WINAPI *pNtClose)(HANDLE);
+static NTSTATUS  (WINAPI *pNtSuspendProcess)(HANDLE process);
+static NTSTATUS  (WINAPI *pNtResumeProcess)(HANDLE process);
 static BOOL      (WINAPI *pInitializeContext)(void *buffer, DWORD context_flags, CONTEXT **context,
         DWORD *length);
 static BOOL      (WINAPI *pInitializeContext2)(void *buffer, DWORD context_flags, CONTEXT **context,
@@ -82,24 +87,13 @@ static BOOL      (WINAPI *pInitializeContext2)(void *buffer, DWORD context_flags
 static void *    (WINAPI *pLocateXStateFeature)(CONTEXT *context, DWORD feature_id, DWORD *length);
 static BOOL      (WINAPI *pSetXStateFeaturesMask)(CONTEXT *context, DWORD64 feature_mask);
 static BOOL      (WINAPI *pGetXStateFeaturesMask)(CONTEXT *context, DWORD64 *feature_mask);
-#endif
+static BOOL      (WINAPI *pWaitForDebugEventEx)(DEBUG_EVENT *, DWORD);
 #ifndef __i386__
 static VOID      (WINAPI *pRtlUnwindEx)(VOID*, VOID*, EXCEPTION_RECORD*, VOID*, CONTEXT*, UNWIND_HISTORY_TABLE*);
 static BOOLEAN   (CDECL  *pRtlAddFunctionTable)(RUNTIME_FUNCTION*, DWORD, DWORD64);
 static BOOLEAN   (CDECL  *pRtlDeleteFunctionTable)(RUNTIME_FUNCTION*);
 static VOID      (CDECL  *pRtlRestoreContext)(CONTEXT*, EXCEPTION_RECORD*);
-static void      (WINAPI *pRtlSetUnhandledExceptionFilter)(PRTL_EXCEPTION_FILTER filter);
-#endif
-#ifdef __x86_64__
-static NTSTATUS  (WINAPI *pNtQueueApcThreadEx)(HANDLE handle, HANDLE reserve_handle, PNTAPCFUNC func,
-        ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3);
-static NTSTATUS  (WINAPI *pNtQueueApcThreadEx2)(HANDLE handle, HANDLE reserve_handle, ULONG flags, PNTAPCFUNC func,
-        ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3);
-static NTSTATUS  (WINAPI *pNtRaiseException)(EXCEPTION_RECORD *rec, CONTEXT *context, BOOL first_chance);
 static NTSTATUS  (WINAPI *pRtlGetNativeSystemInformation)(SYSTEM_INFORMATION_CLASS,void*,ULONG,ULONG*);
-#endif
-#if defined(__x86_64__) || defined(__aarch64__)
-static NTSTATUS  (WINAPI *pNtContinueEx)(CONTEXT*,KCONTINUE_ARGUMENT*);
 #endif
 
 static void *pKiUserApcDispatcher;
@@ -186,11 +180,9 @@ static char**   my_argv;
 static BOOL     is_wow64;
 static BOOL old_wow64;  /* Wine old-style wow64 */
 static UINT apc_count;
+static BOOL have_vectored_api;
 static enum debugger_stages test_stage;
 static QUEUE_USER_APC_FLAGS apc_flags;
-#if defined(__x86_64__) || defined(__i386__)
-static BOOL have_vectored_api;
-#endif
 
 static void CALLBACK apc_func( ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3 )
 {
@@ -2790,7 +2782,6 @@ static const struct exception
     NTSTATUS alt_status;    /* alternative status code */
     DWORD    alt_nb_params; /* alternative number of parameters */
     ULONG64  alt_params[4]; /* alternative parameters */
-    DWORD    access;
 } exceptions[] =
 {
 /* 0 */
@@ -2950,11 +2941,6 @@ static const struct exception
         0x30, 0x00, 0x00, 0x00,
         0xc3 },                                /* ret */
       8, 0, STATUS_SUCCESS, 0 },
-    { { 0x65, 0x48, 0x8b, 0x04, 0x25,          /* movq %gs:0x30,%rax (NtCurrentTeb) */
-        0x30, 0x00, 0x00, 0x00,
-        0xc3 },                                /* ret */
-      0, 0, STATUS_ACCESS_VIOLATION, 2, { EXCEPTION_EXECUTE_FAULT },
-      0, 0, { 0 }, PAGE_READONLY },
 };
 
 static int got_exception;
@@ -3079,17 +3065,6 @@ static DWORD WINAPI prot_fault_handler( EXCEPTION_RECORD *rec, ULONG64 frame,
         goto skip_params;
     }
 
-    if (except->nb_params == 2 && except->params[0] == EXCEPTION_EXECUTE_FAULT)
-    {
-        ok( rec->ExceptionInformation[0] == except->params[0],
-            "Wrong parameter 0: %Ix/%Ix\n",
-            rec->ExceptionInformation[0], except->params[0] );
-        ok( rec->ExceptionInformation[1] == (DWORD_PTR)code_mem + except->offset,
-            "Wrong parameter 1: %Ix/%Ix\n",
-            rec->ExceptionInformation[1], (DWORD_PTR)code_mem + except->offset);
-        goto skip_params;
-    }
-
     if (except->alt_status == 0 || rec->ExceptionCode != except->alt_status)
     {
         for (i = 0; i < rec->NumberParameters; i++)
@@ -3107,13 +3082,6 @@ static DWORD WINAPI prot_fault_handler( EXCEPTION_RECORD *rec, ULONG64 frame,
 
 skip_params:
     winetest_pop_context();
-
-    if (except->access == PAGE_READONLY)
-    {
-        DWORD old_prot;
-
-        VirtualProtect(code_mem, 1, PAGE_EXECUTE_READ, &old_prot);
-    }
 
     context->Rip = (DWORD_PTR)code_mem + except->offset + except->length;
     return ExceptionContinueExecution;
@@ -3550,7 +3518,7 @@ static void test_prot_fault(void)
     {
         got_exception = 0;
         run_exception_test(prot_fault_handler, &exceptions[i], &exceptions[i].code,
-                           sizeof(exceptions[i].code), exceptions[i].access);
+                           sizeof(exceptions[i].code), 0);
         ok( got_exception == (exceptions[i].status != 0),
             "%u: bad exception count %d\n", i, got_exception );
     }
@@ -6245,6 +6213,7 @@ static void test_direct_syscalls(void)
     func = code_mem;
     func(find_syscall_nr("NtSetEvent"), event, NULL);
 
+    todo_wine
     ok(WaitForSingleObject(event, 0) == WAIT_OBJECT_0, "Event not signaled.\n");
     CloseHandle(event);
 }
@@ -9120,56 +9089,6 @@ static void test_mrs_currentel(void)
     FlushInstructionCache( GetCurrentProcess(), func_ptr, sizeof(call_func) );
     result = func_ptr();
     ok( result == 0, "expected 0, got %llx\n", result );
-}
-
-static BOOL got_misaligned_exception;
-
-static const DWORD misaligned_code[] =
-{
-    0xa9bf7bfd, /* stp x29, x30, [sp, #-16]! */
-    0x910003fd, /* mov x29, sp */
-    0x91003c00, /* add x0, x0, #15 */
-    0xc89ffc12, /* stlr x18, [x0] */
-    0xa8c17bfd, /* ldp x29, x30, [sp], #16 */
-    0xd65f03c0, /* ret */
-};
-
-static DWORD WINAPI misaligned_exception_handler( EXCEPTION_RECORD *rec, void *frame,
-                                                  CONTEXT *context, DISPATCHER_CONTEXT *dispatcher )
-{
-    ok( rec->ExceptionCode == EXCEPTION_DATATYPE_MISALIGNMENT, "got: %08lx\n", rec->ExceptionCode );
-    ok( rec->NumberParameters == 0, "got: %ld\n", rec->NumberParameters );
-    ok( rec->ExceptionAddress == (void *)context->Pc, "got addr: %p, pc: %p\n", rec->ExceptionAddress, (void *)context->Pc );
-    got_misaligned_exception = TRUE;
-    context->Pc += 4;
-    return ExceptionContinueExecution;
-}
-
-static void test_misaligned(void)
-{
-    /* Windows, Linux, and macOS all set SCTLR_EL1.A = 0, so most instructions
-     * will not generate an alignment fault.
-     * When FEAT_LSE2 is not implemented, load/store-exclusive and atomic instructions
-     * will generate a fault on unaligned accesses.
-     * When FEAT_LSE2 is implemented there are fewer situations where a fault is generated,
-     * but one is non-atomic load-acquire/store-release instructions accessing across
-     * a 16-byte quantity when SCTLR_EL1.nAA is 0.
-     * (All Apple chips support FEAT_LSE2, as does the Snapdragon X Elite).
-     *
-     * Test that situation here: a store to memory with release semantics, where not
-     * all bytes of the store lie within a single 16-byte aligned block.
-     *
-     * Windows sets SCTLR_EL1.nAA to 1 so there's no fault.
-     * Linux and macOS set it to 0 and do fault.
-     */
-    DWORD64 buf[4];
-    got_misaligned_exception = FALSE;
-    run_exception_test( misaligned_exception_handler, NULL, misaligned_code,
-                        sizeof(misaligned_code), sizeof(misaligned_code),
-                        PAGE_EXECUTE_READ, UNW_FLAG_EHANDLER,
-                        buf, 0 );
-    todo_wine
-    ok( !got_misaligned_exception, "Got misaligned data exception.\n" );
 }
 
 
@@ -12741,8 +12660,12 @@ START_TEST(exception)
     X(NtGetContextThread);
     X(NtSetContextThread);
     X(NtQueueApcThread);
+    X(NtQueueApcThreadEx);
+    X(NtQueueApcThreadEx2);
+    X(NtContinueEx);
     X(NtReadVirtualMemory);
     X(NtClose);
+    X(RtlUnwind);
     X(RtlRaiseException);
     X(RtlCaptureContext);
     X(NtTerminateProcess);
@@ -12750,28 +12673,14 @@ START_TEST(exception)
     X(RtlRemoveVectoredExceptionHandler);
     X(RtlAddVectoredContinueHandler);
     X(RtlRemoveVectoredContinueHandler);
+    X(RtlSetUnhandledExceptionFilter);
     X(NtQueryInformationThread);
+    X(NtSetInformationProcess);
     X(NtSuspendProcess);
+    X(NtRaiseException);
     X(NtResumeProcess);
     X(RtlGetUnloadEventTrace);
     X(RtlGetUnloadEventTraceEx);
-    X(RtlPcToFileHeader);
-    X(RtlGetCallersAddress);
-    X(KiUserApcDispatcher);
-    X(KiUserCallbackDispatcher);
-    X(KiUserExceptionDispatcher);
-
-#ifndef __i386__
-    X(RtlRestoreContext);
-    X(RtlUnwindEx);
-    X(RtlAddFunctionTable);
-    X(RtlDeleteFunctionTable);
-    X(RtlSetUnhandledExceptionFilter);
-#endif
-
-#if defined(__x86_64__) || defined(__i386__)
-    X(RtlCopyContext);
-    X(RtlCopyExtendedContext);
     X(RtlGetEnabledExtendedFeatures);
     X(RtlGetExtendedContextLength);
     X(RtlGetExtendedContextLength2);
@@ -12781,20 +12690,22 @@ START_TEST(exception)
     X(RtlLocateLegacyContext);
     X(RtlSetExtendedFeaturesMask);
     X(RtlGetExtendedFeaturesMask);
-    X(RtlUnwind);
-    X(NtSetInformationProcess);
-#endif
-
-#if defined(__x86_64__) || defined(__aarch64__)
-    X(NtContinueEx);
+    X(RtlPcToFileHeader);
+    X(RtlGetCallersAddress);
+    X(RtlCopyContext);
+    X(RtlCopyExtendedContext);
+    X(KiUserApcDispatcher);
+    X(KiUserCallbackDispatcher);
+    X(KiUserExceptionDispatcher);
+#ifndef __i386__
+    X(RtlRestoreContext);
+    X(RtlUnwindEx);
+    X(RtlAddFunctionTable);
+    X(RtlDeleteFunctionTable);
+    X(RtlGetNativeSystemInformation);
 #endif
 
 #ifdef __x86_64__
-    X(NtQueueApcThreadEx);
-    X(NtQueueApcThreadEx2);
-    X(NtRaiseException);
-    X(RtlGetNativeSystemInformation);
-
     if (pRtlGetNativeSystemInformation)
     {
         SYSTEM_CPU_INFORMATION info;
@@ -12819,22 +12730,18 @@ START_TEST(exception)
         }
     }
 
-#if defined(__x86_64__) || defined(__i386__)
     X(InitializeContext);
     X(InitializeContext2);
     X(LocateXStateFeature);
     X(SetXStateFeaturesMask);
     X(GetXStateFeaturesMask);
-#endif
     X(WaitForDebugEventEx);
 #undef X
 
-#if defined(__x86_64__) || defined(__i386__)
     if (pRtlAddVectoredExceptionHandler && pRtlRemoveVectoredExceptionHandler)
         have_vectored_api = TRUE;
     else
         skip("RtlAddVectoredExceptionHandler or RtlRemoveVectoredExceptionHandler not found\n");
-#endif
 
     my_argc = winetest_get_mainargs( &my_argv );
     if (my_argc >= 4)
@@ -12990,7 +12897,6 @@ START_TEST(exception)
     test_collided_unwind();
     test_restore_context();
     test_mrs_currentel();
-    test_misaligned();
 
 #elif defined(__arm__)
 

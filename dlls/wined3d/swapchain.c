@@ -630,7 +630,7 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
 
     TRACE("Presenting DC %p.\n", context_gl->dc);
 
-    pixel_format = &wined3d_adapter_gl(swapchain->device->adapter)->pixel_formats[context_gl->pixel_format - 1];
+    pixel_format = &wined3d_adapter_gl(swapchain->device->adapter)->pixel_formats[context_gl->pixel_format];
     if (context_gl->dc == wined3d_device_gl(swapchain->device)->backup_dc
             || (pixel_format->swap_method != WGL_SWAP_COPY_ARB
             && swapchain_present_is_partial_copy(swapchain, dst_rect)))
@@ -1559,6 +1559,12 @@ static HRESULT wined3d_swapchain_init(struct wined3d_swapchain *swapchain, struc
 
     wined3d_mutex_lock();
 
+    if (desc->backbuffer_count > 1)
+    {
+        FIXME("The application requested more than one back buffer, this is not properly supported.\n"
+                "Please configure the application to use double buffering (1 back buffer) if possible.\n");
+    }
+
     if (desc->swap_effect != WINED3D_SWAP_EFFECT_DISCARD
             && desc->swap_effect != WINED3D_SWAP_EFFECT_SEQUENTIAL
             && desc->swap_effect != WINED3D_SWAP_EFFECT_COPY)
@@ -2254,7 +2260,6 @@ static void set_window_state(struct wined3d_window_state *s)
     static const UINT timeout = 1500;
     DWORD window_tid = GetWindowThreadProcessId(s->window, NULL);
     DWORD tid = GetCurrentThreadId();
-    HANDLE thread;
 
     TRACE("Window %p belongs to thread %#lx.\n", s->window, window_tid);
     /* If the window belongs to a different thread, modifying the style and/or
@@ -2272,18 +2277,8 @@ static void set_window_state(struct wined3d_window_state *s)
             else
                 KillTimer(s->window, WINED3D_WINDOW_TOPMOST_TIMER_ID);
         }
-
-        set_window_state_thread(s);
     }
-    else if ((thread = CreateThread(NULL, 0, set_window_state_thread, s, 0, NULL)))
-    {
-        SetThreadDescription(thread, L"wined3d_set_window_state");
-        CloseHandle(thread);
-    }
-    else
-    {
-        ERR("Failed to create thread.\n");
-    }
+    set_window_state_thread(s);
 }
 
 HRESULT wined3d_swapchain_state_setup_fullscreen(struct wined3d_swapchain_state *state,

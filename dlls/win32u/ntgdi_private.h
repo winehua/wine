@@ -73,6 +73,7 @@ typedef struct tagDC
     HRGN          hMetaRgn;      /* Meta region */
     HRGN          hVisRgn;       /* Visible region */
     HRGN          region;        /* Total DC region (intersection of clip and visible) */
+    HRGN          monitor_region;/* region in raw monitor DPI */
     HPEN          hPen;
     HBRUSH        hBrush;
     HFONT         hFont;
@@ -90,6 +91,8 @@ typedef struct tagDC
     XFORM         xformVport2World;  /* Inverse of the above transformation */
     BOOL          vport2WorldValid;  /* Is xformVport2World valid? */
     RECT          bounds;            /* Current bounding rect */
+    UINT          dpi_from;
+    UINT          dpi_to;
 } DC;
 
 /* dce flags */
@@ -163,8 +166,8 @@ extern void free_brush_pattern( struct brush_pattern *pattern );
 /* clipping.c */
 extern BOOL clip_device_rect( DC *dc, RECT *dst, const RECT *src );
 extern BOOL clip_visrect( DC *dc, RECT *dst, const RECT *src );
-extern void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect,
-                                const RECT *device_rect, struct window_surface *surface );
+extern void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect, const RECT *device_rect,
+                                struct window_surface *surface, UINT dpi_from, UINT dpi_to );
 extern void update_dc_clipping( DC * dc );
 
 /* Return the total DC region (if any) */
@@ -331,7 +334,7 @@ struct font_backend_funcs
     UINT  (*get_default_glyph)( struct gdi_font *gdi_font );
     UINT  (*get_glyph_outline)( struct gdi_font *font, UINT glyph, UINT format,
                                 GLYPHMETRICS *gm, ABC *abc, UINT buflen, void *buf,
-                                const MAT2 *mat, BOOL tategaki );
+                                const MAT2 *mat, BOOL tategaki, UINT aa_flags );
     UINT  (*get_unicode_ranges)( struct gdi_font *font, GLYPHSET *gs );
     BOOL  (*get_char_width_info)( struct gdi_font *font, struct char_width_info *info );
     BOOL  (*set_outline_text_metrics)( struct gdi_font *font );

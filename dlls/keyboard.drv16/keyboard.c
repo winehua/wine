@@ -48,6 +48,9 @@ typedef struct _KBINFO
 } KBINFO, *LPKBINFO;
 #pragma pack(pop)
 
+static FARPROC16 DefKeybEventProc;
+static LPBYTE pKeyStateTable;
+
 /***********************************************************************
  *		Inquire (KEYBOARD.1)
  */
@@ -67,6 +70,9 @@ WORD WINAPI Inquire16(LPKBINFO kbInfo)
  */
 VOID WINAPI Enable16( FARPROC16 proc, LPBYTE lpKeyState )
 {
+    DefKeybEventProc = proc;
+    pKeyStateTable = lpKeyState;
+
     memset( lpKeyState, 0, 256 ); /* all states to false */
 }
 
@@ -75,6 +81,8 @@ VOID WINAPI Enable16( FARPROC16 proc, LPBYTE lpKeyState )
  */
 VOID WINAPI Disable16(VOID)
 {
+    DefKeybEventProc = NULL;
+    pKeyStateTable = NULL;
 }
 
 /****************************************************************************

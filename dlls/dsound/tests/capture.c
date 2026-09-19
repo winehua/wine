@@ -304,6 +304,12 @@ static BOOL capture_buffer_service(capture_state_t* state)
 
     ptr1 = ptr2 = (void *)0xdeadbeef;
     len1 = len2 = 0xdeadbeef;
+    rc=IDirectSoundCaptureBuffer_Lock(state->dscbo,(DWORD)-32,64,&ptr1,&len1,&ptr2,&len2,0);
+    ok(rc==DSERR_INVALIDPARAM,"IDirectSoundCaptureBuffer_Lock() returned: %08lx\n", rc);
+    ok(!ptr1 && !ptr2 && !len1 && !len2, "got %p, %lu, %p, %lu.\n", ptr1, len1, ptr2, len2);
+
+    ptr1 = ptr2 = (void *)0xdeadbeef;
+    len1 = len2 = 0xdeadbeef;
     rc=IDirectSoundCaptureBuffer_Lock(state->dscbo,0,0,&ptr1,&len1,&ptr2,&len2,0);
     ok(rc==DSERR_INVALIDPARAM,"IDirectSoundCaptureBuffer_Lock() returned: %08lx\n", rc);
     ok(!ptr1 && !ptr2 && !len1 && !len2, "got %p, %lu, %p, %lu.\n", ptr1, len1, ptr2, len2);
@@ -313,6 +319,12 @@ static BOOL capture_buffer_service(capture_state_t* state)
     rc=IDirectSoundCaptureBuffer_Lock(state->dscbo,0,0,&ptr1,&len1,NULL,NULL,0);
     ok(rc==DSERR_INVALIDPARAM,"IDirectSoundCaptureBuffer_Lock() returned: %08lx\n", rc);
     ok(!ptr1 && !len1, "got %p, %lu.\n", ptr1, len1);
+
+    ptr1 = ptr2 = (void *)0xdeadbeef;
+    len1 = len2 = 0xdeadbeef;
+    rc=IDirectSoundCaptureBuffer_Lock(state->dscbo,state->buffer_size,1,&ptr1,&len1,&ptr2,&len2,0);
+    ok(rc==DSERR_INVALIDPARAM,"IDirectSoundCaptureBuffer_Lock() returned: %08lx\n", rc);
+    ok(!ptr1 && !ptr2 && !len1 && !len2, "got %p, %lu, %p, %lu.\n", ptr1, len1, ptr2, len2);
 
     ptr1 = ptr2 = (void *)0xdeadbeef;
     len1 = len2 = 0xdeadbeef;

@@ -24,6 +24,7 @@
 #include <stdarg.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "ntuser.h"
@@ -81,6 +82,8 @@ struct window
     unsigned int     is_layered : 1;  /* has layered info been set? */
     unsigned int     is_orphan : 1;   /* is window orphaned */
     unsigned int     set_foreground : 1;/* has window been foreground once */
+    int              is_update_region_full_frame : 1; /* the whole window rect is invalidated */
+    int              is_update_region_full_client : 1; /* the whole client rect is invalidated */
     unsigned int     color_key;       /* color key for a layered window */
     unsigned int     alpha;           /* alpha value for a layered window */
     unsigned int     layered_flags;   /* flags for a layered window */
@@ -616,21 +619,19 @@ void post_desktop_message( struct desktop *desktop, unsigned int message,
 static struct window *create_window( struct window *parent, struct window *owner, atom_t atom,
                                      mod_handle_t class_instance, mod_handle_t instance )
 {
-    data_size_t extra_bytes, private_size;
+    int extra_bytes;
     struct window *win = NULL;
     struct desktop *desktop;
     struct window_class *class;
     struct obj_locator class_locator;
-    unsigned int fnid;
 
     if (!(desktop = get_thread_desktop( current, DESKTOP_CREATEWINDOW ))) return NULL;
 
-    if (!(class = grab_class( current->process, atom, class_instance, &class_locator )))
+    if (!(class = grab_class( current->process, atom, class_instance, &extra_bytes, &class_locator )))
     {
         release_object( desktop );
         return NULL;
     }
-    fnid = get_class_fnid( class, &extra_bytes, &private_size );
 
     if (!parent)  /* null parent is only allowed for desktop or HWND_MESSAGE top window */
     {
@@ -689,10 +690,8 @@ static struct window *create_window( struct window *parent, struct window *owner
     if (!(win->shared = alloc_shared_object( sizeof(*win->shared) ))) goto failed;
     SHARED_WRITE_BEGIN( win->shared, window_shm_t )
     {
-        shared->class           = class_locator;
-        shared->dpi_context     = NTUSER_DPI_PER_MONITOR_AWARE;
-        shared->fnid            = fnid;
-        shared->private_size    = private_size;
+        shared->class       = class_locator;
+        shared->dpi_context = NTUSER_DPI_PER_MONITOR_AWARE;
     }
     SHARED_WRITE_END;
 
@@ -1489,8 +1488,9 @@ done:
 
 
 /* set a region as new update region for the window */
-static void set_update_region( struct window *win, struct region *region )
+static void set_update_region( struct window *win, struct region *region, int clear_full_window )
 {
+    if (clear_full_window) win->is_update_region_full_client = win->is_update_region_full_frame = 0;
     if (region && !is_region_empty( region ))
     {
         if (!win->update_region) inc_window_paint_count( win, 1 );
@@ -1519,7 +1519,7 @@ static int add_update_region( struct window *win, struct region *region )
         free_region( region );
         return 0;
     }
-    set_update_region( win, region );
+    set_update_region( win, region, 0 );
     return 1;
 }
 
@@ -1537,7 +1537,7 @@ static void crop_children_update_region( struct window *win, struct rectangle *r
         if (!rect)  /* crop everything out */
         {
             crop_children_update_region( child, NULL );
-            set_update_region( child, NULL );
+            set_update_region( child, NULL, 1 );
             continue;
         }
 
@@ -1557,7 +1557,7 @@ static void crop_children_update_region( struct window *win, struct rectangle *r
         if (!(tmp = create_empty_region())) continue;
         set_region_rect( tmp, rect );
         offset_region( tmp, -child->window_rect.left, -child->window_rect.top );
-        if (intersect_region( tmp, child->update_region, tmp )) set_update_region( child, tmp );
+        if (intersect_region( tmp, child->update_region, tmp )) set_update_region( child, tmp, 0 );
         else free_region( tmp );
     }
 }
@@ -1581,7 +1581,7 @@ static void validate_non_client( struct window *win )
     {
         set_region_rect( tmp, &rect );
         if (intersect_region( tmp, win->update_region, tmp ))
-            set_update_region( win, tmp );
+            set_update_region( win, tmp, 1 );
         else
             free_region( tmp );
     }
@@ -1592,7 +1592,7 @@ static void validate_non_client( struct window *win )
 /* validate a window completely so that we don't get any further paint messages for it */
 static void validate_whole_window( struct window *win )
 {
-    set_update_region( win, NULL );
+    set_update_region( win, NULL, 1 );
 
     if (win->paint_flags & PAINT_INTERNAL)
     {
@@ -1643,7 +1643,7 @@ static void validate_parents( struct window *child )
             offset_region( child->update_region, offset_x, offset_y );
             if (subtract_region( tmp, win->update_region, child->update_region ))
             {
-                set_update_region( win, tmp );
+                set_update_region( win, tmp, 1 );
                 tmp = NULL;
             }
             /* restore child coords */
@@ -1655,7 +1655,8 @@ static void validate_parents( struct window *child )
 
 
 /* add/subtract a region (in client coordinates) to the update region of the window */
-static void redraw_window( struct window *win, struct region *region, unsigned int flags, int nested )
+static void redraw_window( struct window *win, struct region *region, unsigned int flags, int nested,
+                           int invalidate_full_window )
 {
     struct region *child_rgn, *tmp;
     struct window *child;
@@ -1666,6 +1667,11 @@ static void redraw_window( struct window *win, struct region *region, unsigned i
         if (!(tmp = crop_region_to_win_rect( win, region, frame ))) return;
 
         if (!add_update_region( win, tmp )) return;
+        if (invalidate_full_window)
+        {
+            if (frame) win->is_update_region_full_frame = 1;
+            else       win->is_update_region_full_client = 1;
+        }
 
         if (flags & RDW_FRAME) win->paint_flags |= PAINT_NONCLIENT;
         if (flags & RDW_ERASE) win->paint_flags |= PAINT_ERASE;
@@ -1674,7 +1680,7 @@ static void redraw_window( struct window *win, struct region *region, unsigned i
     {
         if (!region && (flags & RDW_NOFRAME))  /* shortcut: validate everything */
         {
-            set_update_region( win, NULL );
+            set_update_region( win, NULL, 1 );
         }
         else if (win->update_region)
         {
@@ -1686,7 +1692,11 @@ static void redraw_window( struct window *win, struct region *region, unsigned i
                     free_region( tmp );
                     return;
                 }
-                set_update_region( win, tmp );
+                set_update_region( win, tmp, 1 );
+            }
+            else
+            {
+                win->is_update_region_full_client = win->is_update_region_full_frame = 0;
             }
             if (flags & RDW_NOFRAME) validate_non_client( win );
             if (flags & RDW_NOERASE) win->paint_flags &= ~(PAINT_ERASE | PAINT_DELAYED_ERASE);
@@ -1728,7 +1738,7 @@ static void redraw_window( struct window *win, struct region *region, unsigned i
             if (rect_in_region( child_rgn, &child->window_rect ))
             {
                 offset_region( child_rgn, -child->client_rect.left, -child->client_rect.top );
-                redraw_window( child, child_rgn, flags, 1 );
+                redraw_window( child, child_rgn, flags, 1, invalidate_full_window );
             }
         }
         free_region( child_rgn );
@@ -1925,7 +1935,7 @@ static struct region *expose_window( struct window *win, const struct rectangle 
             {
                 /* make it relative to parent */
                 offset_region( new_vis_rgn, old_window_rect->left, old_window_rect->top );
-                redraw_window( win->parent, new_vis_rgn, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
+                redraw_window( win->parent, new_vis_rgn, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0, 0 );
             }
         }
     }
@@ -2002,6 +2012,11 @@ static void set_window_pos( struct window *win, struct window *previous,
 
     if (win->update_region)
     {
+        if (win->is_update_region_full_client || win->is_update_region_full_frame)
+        {
+            if (get_window_visible_rect( win, &rect, win->is_update_region_full_frame ))
+                set_region_rect( win->update_region, &rect );
+        }
         if (get_window_visible_rect( win, &rect, 1 ))
         {
             struct region *tmp = create_empty_region();
@@ -2009,12 +2024,12 @@ static void set_window_pos( struct window *win, struct window *previous,
             {
                 set_region_rect( tmp, &rect );
                 if (intersect_region( tmp, win->update_region, tmp ))
-                    set_update_region( win, tmp );
+                    set_update_region( win, tmp, 0 );
                 else
                     free_region( tmp );
             }
         }
-        else set_update_region( win, NULL ); /* visible rect is empty */
+        else set_update_region( win, NULL, 1 ); /* visible rect is empty */
     }
 
     /* crop children regions to the new window rect */
@@ -2096,7 +2111,7 @@ static void set_window_pos( struct window *win, struct window *previous,
     }
 
     if (exposed_rgn)
-        redraw_window( win, exposed_rgn, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN, 0 );
+        redraw_window( win, exposed_rgn, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN, 0, 0 );
 
 done:
     if (old_vis_rgn) free_region( old_vis_rgn );
@@ -2121,7 +2136,7 @@ static void set_window_region( struct window *win, struct region *region, int re
     /* expose anything revealed by the change */
     if (old_vis_rgn && ((exposed_rgn = expose_window( win, &win->window_rect, old_vis_rgn, 0 ))))
     {
-        redraw_window( win, exposed_rgn, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN, 0 );
+        redraw_window( win, exposed_rgn, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN, 0, 0 );
         free_region( exposed_rgn );
     }
 
@@ -2278,32 +2293,6 @@ DECL_HANDLER(create_window)
 }
 
 
-/* Set the window builtin class FNID */
-DECL_HANDLER(set_window_fnid)
-{
-    data_size_t extra_bytes, private_size;
-    struct obj_locator class_locator;
-    struct window_class *class;
-    struct window *win;
-    unsigned int fnid;
-
-    if (!(win = get_window( req->handle ))) return;
-    if (is_desktop_window( win ) && win->thread != current) return set_error( STATUS_ACCESS_DENIED );
-
-    if (!(class = grab_class( current->process, req->atom, 0, &class_locator ))) return;
-    fnid = get_class_fnid( class, &extra_bytes, &private_size );
-
-    if (win->shared->fnid && win->shared->fnid != fnid) set_error( STATUS_INVALID_PARAMETER );
-    else SHARED_WRITE_BEGIN( win->shared, window_shm_t )
-    {
-        shared->fnid            = fnid;
-        shared->private_size    = private_size;
-    }
-    SHARED_WRITE_END;
-    release_class( class );
-}
-
-
 /* set the parent of a window */
 DECL_HANDLER(set_parent)
 {
@@ -2426,8 +2415,7 @@ DECL_HANDLER(get_window_info)
     case GWLP_USERDATA:   reply->info = win->user_data;  break;
     default:
         if (req->size > sizeof(reply->info) || req->offset < 0 ||
-            req->offset > win->nb_extra_bytes - (int)req->size ||
-            req->offset < win->shared->private_size)
+            req->offset > win->nb_extra_bytes - (int)req->size)
         {
             set_win32_error( ERROR_INVALID_INDEX );
             break;
@@ -3113,7 +3101,7 @@ DECL_HANDLER(redraw_window)
         }
     }
 
-    redraw_window( win, region, flags, 0 );
+    redraw_window( win, region, flags, 0, !region );
     if (region) free_region( region );
 }
 
@@ -3292,7 +3280,7 @@ DECL_HANDLER(set_window_layered_info)
         win->layered_flags = req->flags;
         win->is_layered    = 1;
         /* repaint since we know now it's not going to use UpdateLayeredWindow */
-        if (!was_layered) redraw_window( win, 0, RDW_ALLCHILDREN | RDW_INVALIDATE | RDW_ERASE | RDW_FRAME, 0 );
+        if (!was_layered) redraw_window( win, 0, RDW_ALLCHILDREN | RDW_INVALIDATE | RDW_ERASE | RDW_FRAME, 0, 0 );
     }
     else set_win32_error( ERROR_INVALID_WINDOW_HANDLE );
 }

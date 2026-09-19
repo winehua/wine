@@ -30,6 +30,7 @@
 #include <string.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "waylanddrv.h"
 #include "wine/debug.h"
 
@@ -40,9 +41,12 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 #include <wayland-egl.h>
 
 #include "wine/opengl_driver.h"
+#include "opengl_diag.h"
+#include "opengl_readback.h"
 
-static const struct egl_platform *egl;
-static const struct opengl_funcs *funcs;
+/* Exported for opengl_readback.c */
+const struct egl_platform *egl;
+const struct opengl_funcs *funcs;
 static const struct opengl_drawable_funcs wayland_drawable_funcs;
 
 struct wayland_gl_drawable
@@ -62,7 +66,7 @@ static void wayland_drawable_destroy(struct opengl_drawable *base)
     if (gl->wl_egl_window) wl_egl_window_destroy(gl->wl_egl_window);
 }
 
-static EGLConfig egl_config_for_format(int format)
+EGLConfig egl_config_for_format(int format)
 {
     return egl->configs[(format - 1) % egl->config_count];
 }
@@ -80,7 +84,7 @@ static void wayland_gl_drawable_sync_size(struct wayland_gl_drawable *gl)
     wl_egl_window_resize(gl->wl_egl_window, client_width, client_height, 0, 0);
 }
 
-static BOOL wayland_opengl_surface_create(HWND hwnd, int format, struct opengl_drawable **drawable)
+static BOOL wayland_opengl_surface_create(HWND hwnd, BOOL raw, int format, struct opengl_drawable **drawable)
 {
     EGLConfig config = egl_config_for_format(format);
     struct wayland_client_surface *client;
@@ -110,11 +114,10 @@ static BOOL wayland_opengl_surface_create(HWND hwnd, int format, struct opengl_d
     gl = opengl_drawable_create(sizeof(*gl), &wayland_drawable_funcs, format, &client->client);
     client_surface_release(&client->client);
     if (!gl) return FALSE;
-
-    opengl_drawable_map_buffer(&gl->base, GL_FRONT_LEFT, GL_BACK_LEFT);
-    opengl_drawable_map_buffer(&gl->base, GL_FRONT, GL_BACK);
-    opengl_drawable_map_buffer(&gl->base, GL_FRONT_AND_BACK, GL_BACK);
-    if (gl->base.stereo) opengl_drawable_map_buffer(&gl->base, GL_FRONT_RIGHT, GL_BACK_RIGHT);
+    gl->base.buffer_map[0] = GL_BACK_LEFT;
+    gl->base.buffer_map[1] = GL_BACK_RIGHT;
+    gl->base.buffer_map[GL_FRONT - GL_FRONT_LEFT] = GL_BACK;
+    gl->base.buffer_map[GL_FRONT_AND_BACK - GL_FRONT_LEFT] = GL_BACK;
 
     if (!(gl->wl_egl_window = wl_egl_window_create(client->wl_surface, rect.right, rect.bottom))) goto err;
     if (!(gl->base.surface = funcs->p_eglCreateWindowSurface(egl->display, config, gl->wl_egl_window, attribs))) goto err;
@@ -256,10 +259,21 @@ UINT WAYLAND_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, c
     if (!opengl_funcs->egl_handle) return STATUS_NOT_SUPPORTED;
     funcs = opengl_funcs;
 
+    if (winehua_env_enabled("WINEHUA_WAYLAND_READBACK"))
+    {
+        winehua_base_driver_funcs = *driver_funcs;
+        winehua_readback_driver_funcs = *winehua_base_driver_funcs;
+        winehua_readback_driver_funcs.p_init_egl_platform = winehua_readback_init_egl_platform;
+        winehua_readback_driver_funcs.p_surface_create = winehua_readback_surface_create;
+        winehua_readback_driver_funcs.p_make_current = winehua_readback_make_current;
+        *driver_funcs = &winehua_readback_driver_funcs;
+        return STATUS_SUCCESS;
+    }
+
     wayland_driver_funcs.p_get_proc_address = (*driver_funcs)->p_get_proc_address;
     wayland_driver_funcs.p_init_pixel_formats = (*driver_funcs)->p_init_pixel_formats;
     wayland_driver_funcs.p_describe_pixel_format = (*driver_funcs)->p_describe_pixel_format;
-    wayland_driver_funcs.p_init_extensions = (*driver_funcs)->p_init_extensions;
+    wayland_driver_funcs.p_init_wgl_extensions = (*driver_funcs)->p_init_wgl_extensions;
     wayland_driver_funcs.p_context_create = (*driver_funcs)->p_context_create;
     wayland_driver_funcs.p_context_destroy = (*driver_funcs)->p_context_destroy;
     wayland_driver_funcs.p_make_current = (*driver_funcs)->p_make_current;

@@ -37,6 +37,7 @@
 #endif /* HAVE_FT2BUILD_H */
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "wine/debug.h"
 #include "unixlib.h"

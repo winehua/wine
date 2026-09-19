@@ -1210,7 +1210,7 @@ void output_static_lib( const char *output_name, struct strarray files, int crea
 {
     struct strarray args;
 
-    if (!create || !is_llvm_pe_target( target ))
+    if (!create || target.platform != PLATFORM_WINDOWS)
     {
         args = find_tool( "ar", NULL );
         strarray_add( &args, create ? "rc" : "r" );
@@ -1228,7 +1228,7 @@ void output_static_lib( const char *output_name, struct strarray files, int crea
     if (create) unlink( output_name );
     spawn( args );
 
-    if (!is_llvm_pe_target( target ))
+    if (target.platform != PLATFORM_WINDOWS)
     {
         struct strarray ranlib = find_tool( "ranlib", NULL );
         strarray_add( &ranlib, output_name );

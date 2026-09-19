@@ -46,6 +46,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(wgl);
 struct gl_info {
     char *glExtensions;
 
+    char wglExtensions[4096];
+
     GLint max_viewport_dims[2];
 
     unsigned int max_major, max_minor;
@@ -1455,7 +1457,7 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     return TRUE;
 }
 
-static BOOL macdrv_surface_create(HWND hwnd, int format, struct opengl_drawable **drawable)
+static BOOL macdrv_surface_create(HWND hwnd, BOOL raw, int format, struct opengl_drawable **drawable)
 {
     struct macdrv_client_surface *client;
     struct macdrv_win_data *data;
@@ -2018,11 +2020,6 @@ static void macdrv_surface_flush(struct opengl_drawable *base, UINT flags)
     if (!context) return;
     if (flags & GL_FLUSH_INTERVAL) set_swap_interval(context, base->interval);
     if (flags & GL_FLUSH_UPDATED) make_context_current(context, context->read_view == client->cocoa_view);
-    if (flags & GL_FLUSH_PRESENT)
-    {
-        macdrv_flush_opengl_context(context->context);
-        client_surface_present(base->client);
-    }
 }
 
 
@@ -2540,7 +2537,16 @@ static BOOL macdrv_pbuffer_updated(HDC hdc, struct opengl_drawable *base, GLenum
     return GL_TRUE;
 }
 
-static void macdrv_init_extensions(struct opengl_funcs *funcs, BOOLEAN extensions[GL_EXTENSION_COUNT])
+static void register_extension(const char *ext)
+{
+    if (gl_info.wglExtensions[0])
+        strcat(gl_info.wglExtensions, " ");
+    strcat(gl_info.wglExtensions, ext);
+
+    TRACE("'%s'\n", ext);
+}
+
+static const char *macdrv_init_wgl_extensions(struct opengl_funcs *funcs)
 {
     /*
      * ARB Extensions
@@ -2548,40 +2554,42 @@ static void macdrv_init_extensions(struct opengl_funcs *funcs, BOOLEAN extension
 
     if (gluCheckExtension((GLubyte*)"GL_ARB_color_buffer_float", (GLubyte*)gl_info.glExtensions))
     {
-        extensions[WGL_ARB_pixel_format_float] = 1;
-        extensions[WGL_ATI_pixel_format_float] = 1;
+        register_extension("WGL_ARB_pixel_format_float");
+        register_extension("WGL_ATI_pixel_format_float");
     }
 
     if (gluCheckExtension((GLubyte*)"GL_ARB_multisample", (GLubyte*)gl_info.glExtensions))
-        extensions[WGL_ARB_multisample] = 1;
+        register_extension("WGL_ARB_multisample");
 
     if (gluCheckExtension((GLubyte*)"GL_ARB_framebuffer_sRGB", (GLubyte*)gl_info.glExtensions))
-        extensions[WGL_ARB_framebuffer_sRGB] = 1;
+        register_extension("WGL_ARB_framebuffer_sRGB");
 
     if (gluCheckExtension((GLubyte*)"GL_APPLE_pixel_buffer", (GLubyte*)gl_info.glExtensions))
     {
         if (gluCheckExtension((GLubyte*)"GL_ARB_texture_rectangle", (GLubyte*)gl_info.glExtensions) ||
             gluCheckExtension((GLubyte*)"GL_EXT_texture_rectangle", (GLubyte*)gl_info.glExtensions))
-            extensions[WGL_NV_render_texture_rectangle] = 1;
+            register_extension("WGL_NV_render_texture_rectangle");
     }
 
     /* Presumably identical to [W]GL_ARB_framebuffer_sRGB, above, but clients may
        check for either, so register them separately. */
     if (gluCheckExtension((GLubyte*)"GL_EXT_framebuffer_sRGB", (GLubyte*)gl_info.glExtensions))
-        extensions[WGL_EXT_framebuffer_sRGB] = 1;
+        register_extension("WGL_EXT_framebuffer_sRGB");
 
     if (gluCheckExtension((GLubyte*)"GL_EXT_packed_float", (GLubyte*)gl_info.glExtensions))
-        extensions[WGL_EXT_pixel_format_packed_float] = 1;
+        register_extension("WGL_EXT_pixel_format_packed_float");
 
     /*
      * WINE-specific WGL Extensions
      */
 
-    extensions[WGL_WINE_query_renderer] = 1;
+    register_extension("WGL_WINE_query_renderer");
     funcs->p_wglQueryCurrentRendererIntegerWINE = macdrv_wglQueryCurrentRendererIntegerWINE;
     funcs->p_wglQueryCurrentRendererStringWINE = macdrv_wglQueryCurrentRendererStringWINE;
     funcs->p_wglQueryRendererIntegerWINE = macdrv_wglQueryRendererIntegerWINE;
     funcs->p_wglQueryRendererStringWINE = macdrv_wglQueryRendererStringWINE;
+
+    return gl_info.wglExtensions;
 }
 
 /**********************************************************************
@@ -2752,13 +2760,7 @@ static BOOL macdrv_surface_swap(struct opengl_drawable *base)
     TRACE("%s context %p/%p/%p\n", debugstr_opengl_drawable(base), context, (context ? context->context : NULL),
           (context ? context->cglcontext : NULL));
 
-    if (context)
-    {
-        struct macdrv_client_surface *client = impl_from_client_surface(base->client);
-        make_context_current(context, context->read_view == client->cocoa_view);
-        macdrv_flush_opengl_context(context->context);
-    }
-    client_surface_present(base->client);
+    macdrv_flush_opengl_context(context->context);
     return TRUE;
 }
 
@@ -2767,7 +2769,7 @@ static const struct opengl_driver_funcs macdrv_driver_funcs =
     .p_get_proc_address = macdrv_get_proc_address,
     .p_init_pixel_formats = macdrv_init_pixel_formats,
     .p_describe_pixel_format = macdrv_describe_pixel_format,
-    .p_init_extensions = macdrv_init_extensions,
+    .p_init_wgl_extensions = macdrv_init_wgl_extensions,
     .p_surface_create = macdrv_surface_create,
     .p_context_create = macdrv_context_create,
     .p_context_destroy = macdrv_context_destroy,

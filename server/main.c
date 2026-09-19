@@ -40,12 +40,14 @@
 #include "thread.h"
 #include "request.h"
 #include "unicode.h"
+#include "security.h"
+
+#include "fsync.h"
 
 /* command-line options */
 int debug_level = 0;
 int foreground = 0;
-int no_auto_close = 0;
-timeout_t master_socket_timeout = 3 * -TICKS_PER_SEC;  /* master socket timeout, default is 3 seconds */
+timeout_t master_socket_timeout = 0; /* master socket timeout, default is 3 seconds */
 const char *server_argv0;
 
 /* parse-line args */
@@ -59,7 +61,6 @@ static void usage( FILE *fh )
     fprintf(fh, "   -h,    --help            display this help message\n");
     fprintf(fh, "   -k[n], --kill[=n]        kill the current wineserver, optionally with signal n\n");
     fprintf(fh, "   -p[n], --persistent[=n]  make server persistent, optionally for n seconds\n");
-    fprintf(fh, "   --no-auto-close           don't close desktop when last non-system process exits\n");
     fprintf(fh, "   -v,    --version         display version information and exit\n");
     fprintf(fh, "   -w,    --wait            wait until the current wineserver terminates\n");
     fprintf(fh, "\n");
@@ -79,9 +80,6 @@ static void option_callback( int optc, char *optarg )
         break;
     case 'f':
         foreground = 1;
-        break;
-    case 128:  /* --no-auto-close */
-        no_auto_close = 1;
         break;
     case 'h':
         usage(stdout);
@@ -123,7 +121,6 @@ static struct long_option
     {"help",        0, 'h'},
     {"kill",        2, 'k'},
     {"persistent",  2, 'p'},
-    {"no-auto-close", 0, 128},  /* 128 = non-ASCII, long-only */
     {"version",     0, 'v'},
     {"wait",        0, 'w'},
     { NULL }
@@ -219,6 +216,37 @@ error:
     exit(1);
 }
 
+#ifdef __OHOS__
+/* OHOS: the app sandbox seccomp filter terminates processes with SIGSYS for
+ * forbidden syscalls.  Log which syscall was rejected (stderr is captured by
+ * the WineHua child process log) before letting the default action run. */
+static void sigsys_diag( int signum, siginfo_t *info, void *context )
+{
+    /* stderr goes through a pipe drained by the app-side wine_child thread, which
+     * dies with us — write the report straight into the prefix instead. */
+    char path[512], buf[256];
+    const char *prefix = getenv( "WINEPREFIX" );
+    int fd, len;
+
+    len = snprintf( buf, sizeof(buf), "SIGSYS syscall=%ld arch=%d code=%d addr=%p pid=%d\n",
+                    (long)info->si_syscall, info->si_arch, info->si_code,
+                    info->si_addr, (int)getpid() );
+    if (prefix)
+    {
+        snprintf( path, sizeof(path), "%s/.winehua-wineserver-sigsys.log", prefix );
+        if ((fd = open( path, O_WRONLY | O_CREAT | O_APPEND, 0666 )) != -1)
+        {
+            write( fd, buf, len );
+            fsync( fd );
+            close( fd );
+        }
+    }
+    write( 2, buf, len );
+    signal( SIGSYS, SIG_DFL );
+    raise( SIGSYS );
+}
+#endif
+
 static void sigterm_handler( int signum )
 {
     exit(1);  /* make sure atexit functions get called */
@@ -249,10 +277,20 @@ static void init_limits(void)
 
 int main( int argc, char *argv[] )
 {
-    write(2, "OHOS-WS: main() ENTER\n", 22);
     setvbuf( stderr, NULL, _IOLBF, 0 );
+#ifdef __OHOS__
+    {
+        /* OHOS: the app sandbox seccomp filter kills processes with SIGSYS for
+         * forbidden syscalls.  Report which one before dying; stderr is
+         * captured by the WineHua child process log. */
+        struct sigaction sa;
+        memset( &sa, 0, sizeof(sa) );
+        sa.sa_sigaction = sigsys_diag;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction( SIGSYS, &sa, NULL );
+    }
+#endif
     server_argv0 = argv[0];
-    write(2, "OHOS-WS: parse_options...\n", 26);
     parse_options( argc, argv, "d::fhk::p::vw", long_options, option_callback );
 
     /* setup temporary handlers before the real signal initialization is done */
@@ -264,27 +302,20 @@ int main( int argc, char *argv[] )
     signal( SIGABRT, sigterm_handler );
     init_limits();
 
-    fprintf(stderr, "OHOS-WS: sock_init...\n");
     sock_init();
-    fprintf(stderr, "OHOS-WS: open_master_socket...\n");
     open_master_socket();
 
-    fprintf(stderr, "wineserver: starting (pid=%ld)\n", (long) getpid() );
+    if (do_fsync())
+        fsync_init();
+
+    if (debug_level) fprintf( stderr, "wineserver: starting (pid=%ld)\n", (long) getpid() );
     set_current_time();
-    fprintf(stderr, "OHOS-WS: init_signals...\n");
     init_signals();
-    fprintf(stderr, "OHOS-WS: init_memory...\n");
     init_memory();
-    fprintf(stderr, "OHOS-WS: init_directories...\n");
+    init_user_sid();
     init_directories( load_intl_file() );
-    fprintf(stderr, "OHOS-WS: init_threading...\n");
     init_threading();
-    fprintf(stderr, "OHOS-WS: init_registry...\n");
     init_registry();
-    fprintf(stderr, "OHOS-WS: master_socket_timeout=%lld (TIMEOUT_INFINITE=%lld)\n",
-            (long long)master_socket_timeout, (long long)TIMEOUT_INFINITE);
-    write(2, "OHOS-WS: entering main_loop\n", 29);
     main_loop();
-    write(2, "OHOS-WS: main_loop RETURNED!\n", 30);
     return 0;
 }

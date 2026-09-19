@@ -50,9 +50,6 @@
 WINE_DEFAULT_DEBUG_CHANNEL(ole);
 WINE_DECLARE_DEBUG_CHANNEL(accel);
 
-/* Combase exports */
-BOOL WINAPI InternalIsProcessInitialized(void);
-
 /******************************************************************************
  * These are static/global variables and internal data structures that the
  * OLE module uses to maintain its state.
@@ -547,9 +544,9 @@ HRESULT WINAPI RegisterDragDrop(HWND hwnd, LPDROPTARGET pDropTarget)
 
   TRACE("(%p,%p)\n", hwnd, pDropTarget);
 
-  if (!COM_CurrentInfo()->ole_inits)
+  if (!COM_CurrentApt())
   {
-    ERR("OleInitialize not called\n");
+    ERR("COM not initialized\n");
     return E_OUTOFMEMORY;
   }
 
@@ -560,12 +557,6 @@ HRESULT WINAPI RegisterDragDrop(HWND hwnd, LPDROPTARGET pDropTarget)
   {
     ERR("invalid hwnd %p\n", hwnd);
     return DRAGDROP_E_INVALIDHWND;
-  }
-
-  if (!InternalIsProcessInitialized())
-  {
-    ERR("COM not initialized\n");
-    return CO_E_NOTINITIALIZED;
   }
 
   /* block register for other processes windows */

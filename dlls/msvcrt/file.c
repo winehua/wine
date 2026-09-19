@@ -44,6 +44,7 @@
 #include "mtdll.h"
 #include "wine/asm.h"
 #include "wine/debug.h"
+#include "wine/asm.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(msvcrt);
 
@@ -855,12 +856,30 @@ static int msvcrt_flush_buffer(FILE* file)
 /*********************************************************************
  *		_isatty (MSVCRT.@)
  */
+#if defined(__x86_64__) && !defined(__arm64ec__)
+int CDECL MSVCRT__isatty(int fd)
+{
+    TRACE(":fd (%d)\n",fd);
+
+    return get_ioinfo_nolock(fd)->wxflag & WX_TTY;
+}
+__ASM_GLOBAL_FUNC( _isatty,
+        "sub $0x30,%rsp\n\t"
+        __ASM_SEH(".seh_stackalloc 0x30\n\t")
+        __ASM_SEH(".seh_endprologue\n\t")
+        "lea MSVCRT___pioinfo(%rip),%rdx\n\t"
+        "nop;nop;nop;nop;nop;nop;nop;nop;nop\n\t"
+        "add $0x30,%rsp\n\t"
+        "jmp " __ASM_NAME( "MSVCRT__isatty" ) )
+#else
 int CDECL _isatty(int fd)
 {
     TRACE(":fd (%d)\n",fd);
 
     return get_ioinfo_nolock(fd)->wxflag & WX_TTY;
 }
+#endif
+
 
 /* INTERNAL: Allocate stdio file buffer */
 static BOOL msvcrt_alloc_buffer(FILE* file)
@@ -1117,10 +1136,7 @@ int CDECL _commit(int fd)
     TRACE(":fd (%d) handle (%p)\n", fd, info->handle);
 
     if (info->handle == INVALID_HANDLE_VALUE)
-    {
-        *_errno() = EBADF;
         ret = -1;
-    }
     else if (!FlushFileBuffers(info->handle))
     {
         if (GetLastError() == ERROR_INVALID_HANDLE)
@@ -4150,12 +4166,14 @@ size_t CDECL fwrite(const void *ptr, size_t size, size_t nmemb, FILE* file)
 size_t CDECL _fwrite_nolock(const void *ptr, size_t size, size_t nmemb, FILE* file)
 {
     size_t wrcnt=size * nmemb;
-    int written = 0, bufsize = 1;
+    BOOL no_buffer = FALSE;
+    int written = 0;
     if (size == 0)
         return 0;
 
-    if ((file->_flag & (MSVCRT__NOBUF | _IOMYBUF | MSVCRT__USERBUF)) || msvcrt_alloc_buffer(file))
-        bufsize = file->_bufsiz;
+    if(!(file->_flag & (MSVCRT__NOBUF | _IOMYBUF | MSVCRT__USERBUF)))
+        no_buffer = !msvcrt_alloc_buffer(file);
+    no_buffer = no_buffer || (file->_flag & MSVCRT__NOBUF);
 
     while(wrcnt) {
         if(file->_cnt < 0) {
@@ -4170,9 +4188,20 @@ size_t CDECL _fwrite_nolock(const void *ptr, size_t size, size_t nmemb, FILE* fi
             written += pcnt;
             wrcnt -= pcnt;
             ptr = (const char*)ptr + pcnt;
-        } else if(wrcnt >= bufsize) {
+        } else if(no_buffer
+                || ((file->_flag & (_IOMYBUF | MSVCRT__USERBUF)) && wrcnt >= file->_bufsiz)
+                || (!(file->_flag & (_IOMYBUF | MSVCRT__USERBUF)) && wrcnt >= MSVCRT_INTERNAL_BUFSIZ)) {
             size_t pcnt;
-            pcnt = (wrcnt / bufsize) * bufsize;
+            int bufsiz;
+
+            if(no_buffer)
+                bufsiz = 1;
+            else if(!(file->_flag & (_IOMYBUF | MSVCRT__USERBUF)))
+                bufsiz = MSVCRT_INTERNAL_BUFSIZ;
+            else
+                bufsiz = file->_bufsiz;
+
+            pcnt = (wrcnt / bufsiz) * bufsiz;
 
             if(msvcrt_flush_buffer(file) == EOF)
                 break;
@@ -5535,14 +5564,6 @@ int CDECL vwprintf(const wchar_t *format, va_list valist)
 }
 
 /*********************************************************************
- *              _vwprintf_l (MSVCRT.@)
- */
-int CDECL _vwprintf_l(const wchar_t *format, _locale_t locale, va_list valist)
-{
-    return _vfwprintf_l(stdout, format, locale, valist);
-}
-
-/*********************************************************************
  *		vwprintf_s (MSVCRT.@)
  */
 int CDECL vwprintf_s(const wchar_t *format, va_list valist)
@@ -5846,19 +5867,6 @@ int WINAPIV wprintf(const wchar_t *format, ...)
     int res;
     va_start(valist, format);
     res = vwprintf(format, valist);
-    va_end(valist);
-    return res;
-}
-
-/*********************************************************************
- *              _wprintf_l (MSVCRT.@)
- */
-int WINAPIV _wprintf_l(const wchar_t *format, _locale_t locale, ...)
-{
-    va_list valist;
-    int res;
-    va_start(valist, locale);
-    res = _vwprintf_l(format, locale, valist);
     va_end(valist);
     return res;
 }

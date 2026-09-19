@@ -38,7 +38,6 @@
 #include "xdg-shell-client-protocol.h"
 #include "wlr-data-control-unstable-v1-client-protocol.h"
 #include "xdg-toplevel-icon-v1-client-protocol.h"
-#include "pointer-warp-v1-client-protocol.h"
 
 #include "windef.h"
 #include "winbase.h"
@@ -179,7 +178,6 @@ struct wayland
     struct wl_data_device_manager *wl_data_device_manager;
     struct xdg_toplevel_icon_manager_v1 *xdg_toplevel_icon_manager_v1;
     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
-    struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
     struct wayland_seat seat;
     struct wayland_keyboard keyboard;
     struct wayland_pointer pointer;
@@ -237,7 +235,6 @@ struct wayland_window_config
     double scale;
     BOOL visible;
     BOOL managed;
-    BOOL minimized;
 };
 
 struct wayland_client_surface
@@ -291,6 +288,7 @@ struct wayland_surface
     BOOL resizing;
     struct wayland_window_config window;
     int content_width, content_height;
+    BOOL has_contents;
     HCURSOR hcursor;
 
     /* xdg_toplevel min/max size 约束 (surface-local 坐标, 0 = 无限制) */
@@ -337,7 +335,8 @@ void wayland_surface_coords_to_window(struct wayland_surface *surface,
                                       int *window_x, int *window_y);
 struct wayland_client_surface *wayland_client_surface_create(HWND hwnd);
 void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel);
-void wayland_surface_ensure_contents(struct wayland_surface *surface);
+void wayland_surface_ensure_contents(struct wayland_surface *surface,
+                                     struct wayland_shm_buffer *window_contents);
 void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
 void wayland_surface_assign_icon(struct wayland_surface *surface);
 void wayland_surface_set_icon_buffer(struct wayland_surface *surface, UINT type, const ICONINFO *ii);
@@ -353,8 +352,10 @@ static inline BOOL wayland_surface_is_toplevel(struct wayland_surface *surface)
 
 struct wayland_shm_buffer *wayland_shm_buffer_create(int width, int height,
                                                      enum wl_shm_format format);
+void wayland_shm_buffer_copy(struct wayland_shm_buffer *src,
+                             struct wayland_shm_buffer *dst, HRGN region);
 struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMAP color,
-                                                                 HBITMAP mask, BOOL allow_padding);
+                                                                 HBITMAP mask);
 void wayland_shm_buffer_ref(struct wayland_shm_buffer *shm_buffer);
 void wayland_shm_buffer_unref(struct wayland_shm_buffer *shm_buffer);
 
@@ -399,7 +400,6 @@ void wayland_keyboard_init(struct wl_keyboard *wl_keyboard);
 void wayland_keyboard_deinit(void);
 const KBDTABLES *WAYLAND_KbdLayerDescriptor(HKL hkl);
 void WAYLAND_ReleaseKbdTables(const KBDTABLES *);
-void activate_keyboard_hkl(HWND hwnd, BOOL ime);
 
 /**********************************************************************
  *          Wayland pointer

@@ -48,6 +48,7 @@
 #endif
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
@@ -60,6 +61,7 @@
 #include "user.h"
 #include "security.h"
 
+#include "fsync.h"
 
 /* thread queues */
 
@@ -424,7 +426,6 @@ static inline void init_thread_structure( struct thread *thread )
     thread->suspend         = 0;
     thread->dbg_hidden      = 0;
     thread->bypass_proc_suspend = 0;
-    thread->is_system       = 0;
     thread->desktop_users   = 0;
     thread->token           = NULL;
     thread->desc            = NULL;
@@ -580,6 +581,7 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
     }
 
     set_fd_events( thread->request_fd, POLLIN );  /* start listening to events */
+    add_process_thread( thread->process, thread );
     return thread;
 
 error:
@@ -801,8 +803,19 @@ int set_thread_affinity( struct thread *thread, affinity_t affinity )
 
         CPU_ZERO( &set );
         for (i = 0, mask = 1; mask; i++, mask <<= 1)
-            if (affinity & mask) CPU_SET( i, &set );
-
+            if (affinity & mask)
+            {
+                if (thread->process->cpu_override.cpu_count)
+                {
+                    if (i >= thread->process->cpu_override.cpu_count)
+                        break;
+                    CPU_SET( thread->process->cpu_override.host_cpu_id[i], &set );
+                }
+                else
+                {
+                    CPU_SET( i, &set );
+                }
+            }
         ret = sched_setaffinity( thread->unix_tid, sizeof(set), &set );
     }
 #endif
@@ -820,8 +833,21 @@ affinity_t get_thread_affinity( struct thread *thread )
         unsigned int i;
 
         if (!sched_getaffinity( thread->unix_tid, sizeof(set), &set ))
+        {
             for (i = 0; i < 8 * sizeof(mask); i++)
-                if (CPU_ISSET( i, &set )) mask |= (affinity_t)1 << i;
+                if (CPU_ISSET( i, &set ))
+                {
+                    if (thread->process->cpu_override.cpu_count)
+                    {
+                        if (i < ARRAY_SIZE(thread->process->wine_cpu_id_from_host))
+                            mask |= (affinity_t)1 << thread->process->wine_cpu_id_from_host[i];
+                    }
+                    else
+                    {
+                        mask |= (affinity_t)1 << i;
+                    }
+                }
+        }
     }
 #endif
     if (!mask) mask = ~(affinity_t)0;
@@ -972,7 +998,7 @@ int suspend_thread( struct thread *thread )
         thread->suspend++;
     }
     else set_error( STATUS_SUSPEND_COUNT_EXCEEDED );
-    return old_count;
+    return thread == current ? old_count | 0x80000000 : old_count;
 }
 
 /* resume a thread */
@@ -1708,10 +1734,8 @@ DECL_HANDLER(new_thread)
     {
         thread->system_regs = current->system_regs;
         if (req->flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) thread->suspend++;
-        thread->is_system = req->is_system;
         thread->dbg_hidden = !!(req->flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER);
         thread->bypass_proc_suspend = !!(req->flags & THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE);
-        add_process_thread( process, thread );
         reply->tid = get_thread_id( thread );
         if ((reply->handle = alloc_handle_no_access_check( current->process, thread,
                                                            req->access, objattr->attributes )))
@@ -1761,8 +1785,30 @@ DECL_HANDLER(init_first_thread)
 {
     struct process *process = current->process;
     int fd;
+    const struct cpu_topology_override *cpu_override = get_req_data();
+    unsigned int have_cpu_override = get_req_data_size() / sizeof(*cpu_override);
+    unsigned int i;
 
-    process->page_size = req->page_size;
+    if (have_cpu_override)
+    {
+        if (cpu_override->cpu_count > ARRAY_SIZE(process->wine_cpu_id_from_host))
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
+        memset( process->wine_cpu_id_from_host, 0, sizeof(process->wine_cpu_id_from_host) );
+        for (i = 0; i < cpu_override->cpu_count; ++i)
+        {
+            if (cpu_override->host_cpu_id[i] >= ARRAY_SIZE(process->wine_cpu_id_from_host))
+            {
+                set_error( STATUS_INVALID_PARAMETER );
+                return;
+            }
+            process->wine_cpu_id_from_host[cpu_override->host_cpu_id[i]] = i;
+        }
+        process->cpu_override = *cpu_override;
+    }
+
     if (!init_thread( current, req->reply_fd, req->wait_fd )) return;
 
     current->unix_pid = process->unix_pid = req->unix_pid;
@@ -1785,7 +1831,11 @@ DECL_HANDLER(init_first_thread)
     set_reply_data( supported_machines,
                     min( supported_machines_count * sizeof(unsigned short), get_reply_max_size() ));
 
-    if ((fd = get_inproc_device_fd()) >= 0)
+    if (do_fsync())
+    {
+        reply->inproc_device = FSYNC_USED_BY_SERVER;
+    }
+    else if ((fd = get_inproc_device_fd()) >= 0)
     {
         reply->inproc_device = get_process_id( process ) | 1;
         send_client_fd( process, fd, reply->inproc_device );
@@ -1809,7 +1859,7 @@ DECL_HANDLER(init_thread)
     current->entry_point = req->entry;
 
     init_thread_context( current );
-    if (!current->is_system) generate_debug_event( current, DbgCreateThreadStateChange, &req->entry );
+    generate_debug_event( current, DbgCreateThreadStateChange, &req->entry );
     set_thread_base_priority( current, current->base_priority );
     set_thread_affinity( current, current->affinity );
 
@@ -1869,7 +1919,7 @@ DECL_HANDLER(get_thread_info)
             reply->flags |= GET_THREAD_INFO_FLAG_DBG_HIDDEN;
         if (thread->state == TERMINATED)
             reply->flags |= GET_THREAD_INFO_FLAG_TERMINATED;
-        if (thread->process->user_threads == 1)
+        if (thread->process->running_threads == 1)
             reply->flags |= GET_THREAD_INFO_FLAG_LAST;
         if (thread->disable_boost)
             reply->flags |= GET_THREAD_INFO_FLAG_DISABLE_BOOST;
@@ -1921,12 +1971,32 @@ DECL_HANDLER(suspend_thread)
 {
     struct thread *thread;
 
-    if ((thread = get_thread_from_handle( req->handle, THREAD_SUSPEND_RESUME )))
+    if (req->waited_handle)
     {
-        if (thread->state == TERMINATED) set_error( STATUS_ACCESS_DENIED );
-        else reply->count = suspend_thread( thread );
-        release_object( thread );
+        struct context *context;
+
+        if (!(context = (struct context *)get_handle_obj( current->process, req->waited_handle,
+                                                          0, &context_ops )))
+            return;
+        close_handle( current->process, req->waited_handle ); /* avoid extra server call */
+        set_error( context->status );
+        release_object( context );
+        return;
     }
+
+    if (!(thread = get_thread_from_handle( req->handle, THREAD_SUSPEND_RESUME ))) return;
+
+    if (thread->state != RUNNING) set_error( STATUS_ACCESS_DENIED );
+    else
+    {
+        reply->count = suspend_thread( thread );
+        if (!get_error() && thread != current && thread->context && thread->context->status == STATUS_PENDING)
+        {
+            set_error( STATUS_PENDING );
+            reply->wait_handle = alloc_handle( current->process, thread->context, SYNCHRONIZE, 0 );
+        }
+    }
+    release_object( thread );
 }
 
 /* resume a thread */
@@ -2058,9 +2128,7 @@ DECL_HANDLER(select)
         {
             union apc_call *data;
             data_size_t size = sizeof(*data) + (ctx->regs[CTX_WOW].flags ? 2 : 1) * sizeof(struct context_data);
-            unsigned int flags = system_flags & ctx->regs[CTX_NATIVE].flags;
 
-            if (flags) set_thread_context( current, &ctx->regs[CTX_NATIVE], flags );
             size = min( size, get_reply_max_size() );
             if ((data = set_reply_data_size( size )))
             {
@@ -2099,15 +2167,8 @@ DECL_HANDLER(queue_apc)
             release_object( apc );
             return;
         }
-        if (!(thread = get_thread_from_handle( req->handle, THREAD_SET_CONTEXT ))) break;
-        if (thread->is_system)
-        {
-            release_object( apc );
-            release_object( thread );
-            set_error( STATUS_ACCESS_DENIED );
-            return;
-        }
-        if (call && call->user.flags & SERVER_USER_APC_SPECIAL && is_wow64_process( thread->process ))
+        thread = get_thread_from_handle( req->handle, THREAD_SET_CONTEXT );
+        if (thread && call && call->user.flags & SERVER_USER_APC_SPECIAL && is_wow64_process( thread->process ))
         {
             release_object( apc );
             release_object( thread );
@@ -2239,8 +2300,6 @@ DECL_HANDLER(get_thread_context)
         if (!(thread = get_thread_from_handle( req->handle, THREAD_GET_CONTEXT ))) return;
         if (req->machine != native_machine && req->machine != thread->process->machine)
             set_error( STATUS_INVALID_PARAMETER );
-        else if (thread->is_system)
-            set_error( STATUS_ACCESS_DENIED );
         else if (thread->state != RUNNING)
             set_error( STATUS_UNSUCCESSFUL );
         else
@@ -2323,16 +2382,12 @@ DECL_HANDLER(set_thread_context)
     if (contexts[CTX_NATIVE].machine != native_machine ||
         (ctx_count == 2 && contexts[CTX_WOW].machine != thread->process->machine))
         set_error( STATUS_INVALID_PARAMETER );
-    else if (thread->is_system)
-        set_error( STATUS_ACCESS_DENIED );
-    else if (thread->state == TERMINATED)
-        set_error( STATUS_UNSUCCESSFUL );
-    else
+    else if (thread->state != TERMINATED)
     {
         unsigned int flags = system_flags & contexts[CTX_NATIVE].flags;
 
         if (thread != current) stop_thread( thread );
-        else if (flags) set_thread_context( thread, &contexts[CTX_NATIVE], flags );
+        if (flags) set_thread_context( thread, &contexts[CTX_NATIVE], flags );
 
         if (thread->context && !get_error())
         {
@@ -2362,6 +2417,7 @@ DECL_HANDLER(set_thread_context)
             }
         }
     }
+    else set_error( STATUS_UNSUCCESSFUL );
 
     release_object( thread );
 }
@@ -2402,7 +2458,7 @@ DECL_HANDLER(get_next_thread)
     while (ptr)
     {
         thread = LIST_ENTRY( ptr, struct thread, entry );
-        if (thread->process == process && !thread->is_system &&
+        if (thread->process == process &&
             (reply->handle = alloc_handle( current->process, thread, req->access, req->attributes )))
         {
             release_object( process );
@@ -2422,6 +2478,7 @@ DECL_HANDLER(get_inproc_alert_fd)
     int fd;
 
     if ((fd = get_inproc_sync_fd( current->alert_sync )) < 0) set_error( STATUS_INVALID_PARAMETER );
+    else if (do_fsync()) reply->fsync_shm_idx = fd;
     else
     {
         reply->handle = get_thread_id( current ) | 1; /* arbitrary token */

@@ -665,7 +665,9 @@ BOOL macdrv_ClipCursor(const RECT *clip, BOOL reset)
 
     TRACE("%s %u\n", wine_dbgstr_rect(clip), reset);
 
-    if (!reset && clip)
+    if (reset) return TRUE;
+
+    if (clip)
     {
         rect = CGRectMake(clip->left, clip->top, max(1, clip->right - clip->left),
                           max(1, clip->bottom - clip->top));

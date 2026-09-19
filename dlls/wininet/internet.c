@@ -4179,14 +4179,15 @@ BOOL WINAPI InternetCheckConnectionW( LPCWSTR lpszUrl, DWORD dwFlags, DWORD dwRe
       struct server_addr *addr;
       WCHAR *host_z;
       int fd;
+      BOOL b;
 
       host_z = strndupW(host, host_len);
       if (!host_z)
           return FALSE;
 
-      addr = GetAddress(host_z, port);
+      b = GetAddress(host_z, port, &addr);
       free(host_z);
-      if(!addr)
+      if(!b)
           goto End;
       init_winsock();
       fd = create_connect_socket(addr, AF_UNSPEC, INFINITE, NULL, 0);

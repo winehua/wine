@@ -22,6 +22,7 @@
 
 #define IPHLPAPI_DLL_LINKAGE
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winreg.h"
@@ -1148,20 +1149,22 @@ err:
 static DWORD call_families( DWORD (*fn)( IP_ADAPTER_ADDRESSES *aa, ULONG family, ULONG flags ),
                             IP_ADAPTER_ADDRESSES *aa, ULONG family, ULONG flags )
 {
-    DWORD err;
+    DWORD err6, err4;
 
-    if (family != AF_INET)
-    {
-        err = fn( aa, AF_INET6, flags );
-        if (err) return err;
-    }
+    if (family == AF_INET6) return fn( aa, AF_INET6, flags );
+    if (family == AF_INET) return fn( aa, AF_INET, flags );
 
-    if (family != AF_INET6)
-    {
-        err = fn( aa, AF_INET, flags );
-        if (err) return err;
-    }
-    return err;
+    err6 = fn( aa, AF_INET6, flags );
+    if (err6 && err6 != ERROR_NOT_SUPPORTED && err6 != ERROR_NO_DATA) return err6;
+
+    err4 = fn( aa, AF_INET, flags );
+    if (err4 && err4 != ERROR_NOT_SUPPORTED && err4 != ERROR_NO_DATA) return err4;
+
+    /* Some Unix hosts expose only one address-family table through NSI.  An
+     * AF_UNSPEC query must retain usable data from the other family instead
+     * of failing the complete adapter enumeration. */
+    if (!err6 || !err4) return ERROR_SUCCESS;
+    return err4;
 }
 
 static DWORD dns_servers_query_code( ULONG family )
@@ -1248,7 +1251,7 @@ static DWORD dns_info_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG family, ULONG flags
 
 static DWORD adapters_addresses_alloc( ULONG family, ULONG flags, IP_ADAPTER_ADDRESSES **info, ULONG *count )
 {
-    IP_ADAPTER_ADDRESSES *aa = NULL;
+    IP_ADAPTER_ADDRESSES *aa;
     NET_LUID *luids;
     struct nsi_ndis_ifinfo_rw *rw;
     struct nsi_ndis_ifinfo_dynamic *dyn;
@@ -1261,12 +1264,6 @@ static DWORD adapters_addresses_alloc( ULONG family, ULONG flags, IP_ADAPTER_ADD
                                   (void **)&rw, sizeof(*rw), (void **)&dyn, sizeof(*dyn),
                                   (void **)&stat, sizeof(*stat), count, 0 );
     if (err) return err;
-
-    if (!*count)
-    {
-        err = ERROR_NO_DATA;
-        goto err;
-    }
 
     needed = *count * (sizeof(*aa) + ((CHARS_IN_GUID + 1) & ~1) + sizeof(stat->descr.String));
     needed += *count * sizeof(rw->alias.String); /* GAA_FLAG_SKIP_FRIENDLY_NAME is ignored */

@@ -25,10 +25,12 @@
 #include <assert.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 #include <pthread.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "ntuser.h"
@@ -578,8 +580,8 @@ BOOL WINAPI NtUserSetThreadDesktop( HDESK handle )
         struct session_thread_data *data = get_session_thread_data();
         data->shared_desktop = find_shared_session_object( locator.id, locator.offset );
         memset( &data->shared_foreground, 0, sizeof(data->shared_foreground) );
-        thread_info->top_window = 0;
-        thread_info->msg_window = 0;
+        thread_info->client_info.top_window = 0;
+        thread_info->client_info.msg_window = 0;
         if (was_virtual_desktop != is_virtual_desktop()) update_display_cache( TRUE );
     }
     return ret;
@@ -756,6 +758,8 @@ BOOL WINAPI NtUserGetObjectInformation( HANDLE handle, INT index, void *info,
     }
 }
 
+#define TICKSPERSEC  10000000
+
 /***********************************************************************
  *           NtUserSetObjectInformation   (win32u.@)
  */
@@ -763,8 +767,19 @@ BOOL WINAPI NtUserSetObjectInformation( HANDLE handle, INT index, void *info, DW
 {
     BOOL ret;
     const USEROBJECTFLAGS *obj_flags = info;
+    LONG64 close_timeout = 0;
 
-    if (index != UOI_FLAGS || !info || len < sizeof(*obj_flags))
+    if (index == 1000)
+    {
+        /* Wine specific: set desktop close timeout. */
+        if (!info || len < sizeof(DWORD))
+        {
+            RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
+            return FALSE;
+        }
+        close_timeout = -(*(DWORD *)info * (ULONG64)TICKSPERSEC / 1000);
+    }
+    else if (index != UOI_FLAGS || !info || len < sizeof(*obj_flags))
     {
         RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
         return FALSE;
@@ -773,8 +788,16 @@ BOOL WINAPI NtUserSetObjectInformation( HANDLE handle, INT index, void *info, DW
     SERVER_START_REQ( set_user_object_info )
     {
         req->handle    = wine_server_obj_handle( handle );
-        req->flags     = SET_USER_OBJECT_SET_FLAGS;
-        req->obj_flags = obj_flags->dwFlags;
+        if (index == 1000)
+        {
+            req->flags = SET_USER_OBJECT_SET_CLOSE_TIMEOUT;
+            req->close_timeout = close_timeout;
+        }
+        else
+        {
+            req->flags     = SET_USER_OBJECT_SET_FLAGS;
+            req->obj_flags = obj_flags->dwFlags;
+        }
         ret = !wine_server_call_err( req );
     }
     SERVER_END_REQ;
@@ -789,10 +812,10 @@ static inline TEB64 *NtCurrentTeb64(void) { return (TEB64 *)NtCurrentTeb()->GdiB
 
 HWND get_desktop_window(void)
 {
-    struct user_thread_info *thread_info = get_user_thread_info();
+    struct ntuser_thread_info *thread_info = NtUserGetThreadInfo();
     BOOL is_service;
 
-    if (thread_info->top_window) return thread_info->top_window;
+    if (thread_info->top_window) return UlongToHandle( thread_info->top_window );
 
     /* don't create an actual explorer desktop window for services */
     is_service = is_service_process();
@@ -802,8 +825,8 @@ HWND get_desktop_window(void)
         req->force = is_service;
         if (!wine_server_call( req ))
         {
-            thread_info->top_window = wine_server_ptr_handle( reply->top_window );
-            thread_info->msg_window = wine_server_ptr_handle( reply->msg_window );
+            thread_info->top_window = reply->top_window;
+            thread_info->msg_window = reply->msg_window;
         }
     }
     SERVER_END_REQ;
@@ -821,7 +844,7 @@ HWND get_desktop_window(void)
         PS_ATTRIBUTE_LIST ps_attr;
         PS_CREATE_INFO create_info;
         WCHAR desktop[MAX_PATH];
-        PEB *peb = RtlGetCurrentPeb();
+        PEB *peb = NtCurrentTeb()->Peb;
         HANDLE process, thread;
         unsigned int status;
 
@@ -884,17 +907,18 @@ HWND get_desktop_window(void)
             req->force = 1;
             if (!wine_server_call( req ))
             {
-                thread_info->top_window = wine_server_ptr_handle( reply->top_window );
-                thread_info->msg_window = wine_server_ptr_handle( reply->msg_window );
+                thread_info->top_window = reply->top_window;
+                thread_info->msg_window = reply->msg_window;
             }
         }
         SERVER_END_REQ;
     }
+
     if (!thread_info->top_window) ERR_(win)( "failed to create desktop window\n" );
-    else user_driver->pSetDesktopWindow( thread_info->top_window );
+    else user_driver->pSetDesktopWindow( UlongToHandle( thread_info->top_window ));
 
     register_builtin_classes();
-    return thread_info->top_window;
+    return UlongToHandle( thread_info->top_window );
 }
 
 static HANDLE get_winstations_dir_handle(void)
@@ -906,7 +930,7 @@ static HANDLE get_winstations_dir_handle(void)
     NTSTATUS status;
     HANDLE dir;
 
-    snprintf( bufferA, sizeof(bufferA), "\\Sessions\\%u\\Windows\\WindowStations", RtlGetCurrentPeb()->SessionId );
+    snprintf( bufferA, sizeof(bufferA), "\\Sessions\\%u\\Windows\\WindowStations", NtCurrentTeb()->Peb->SessionId );
     str.Buffer = buffer;
     str.MaximumLength = asciiz_to_unicode( buffer, bufferA );
     str.Length = str.MaximumLength - sizeof(WCHAR);
@@ -922,9 +946,10 @@ static HANDLE get_winstations_dir_handle(void)
  */
 static const WCHAR *get_default_desktop( void *buf, size_t buf_size )
 {
-    const WCHAR *p, *appname = RtlGetCurrentPeb()->ProcessParameters->ImagePathName.Buffer;
+    const WCHAR *p, *appname = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
     KEY_VALUE_PARTIAL_INFORMATION *info = buf;
     WCHAR *buffer = buf;
+    const char *desktop_env;
     HKEY tmpkey, appkey;
     DWORD len;
 
@@ -950,6 +975,14 @@ static const WCHAR *get_default_desktop( void *buf, size_t buf_size )
         }
     }
 
+#ifdef __OHOS__
+    if ((desktop_env = getenv( "WINEHUA_DESKTOP" )) && *desktop_env)
+    {
+        asciiz_to_unicode( buffer, desktop_env );
+        return buffer;
+    }
+#endif
+
     /* @@ Wine registry key: HKCU\Software\Wine\Explorer */
     if ((appkey = reg_open_hkcu_key( "Software\\Wine\\Explorer" )))
     {
@@ -968,7 +1001,7 @@ static const WCHAR *get_default_desktop( void *buf, size_t buf_size )
  */
 void winstation_init(void)
 {
-    RTL_USER_PROCESS_PARAMETERS *params = RtlGetCurrentPeb()->ProcessParameters;
+    RTL_USER_PROCESS_PARAMETERS *params = NtCurrentTeb()->Peb->ProcessParameters;
     WCHAR *winstation = NULL, *desktop = NULL, *buffer = NULL;
     HANDLE handle, dir = NULL;
     OBJECT_ATTRIBUTES attr;

@@ -185,6 +185,7 @@ struct media_engine
         BYTE *buffer;
         UINT buffer_size;
         DXGI_FORMAT output_format;
+        BOOL format_mismatch;
 
         struct
         {
@@ -815,55 +816,44 @@ static unsigned int get_gcd(unsigned int a, unsigned int b)
     return a;
 }
 
-static void media_engine_get_frame_size(struct media_engine *engine, IMFTopology *topology)
+static void media_engine_get_frame_size(struct media_engine *engine)
 {
     IMFMediaTypeHandler *handler;
     IMFMediaType *media_type;
-    IMFStreamDescriptor *sd;
-    IMFTopologyNode *node;
-    unsigned int gcd;
-    UINT64 size;
-    HRESULT hr;
 
     engine->video_frame.size.cx = 0;
     engine->video_frame.size.cy = 0;
     engine->video_frame.ratio.cx = 1;
     engine->video_frame.ratio.cy = 1;
 
-    if (FAILED(IMFTopology_GetNodeByID(topology, engine->video_frame.node_id, &node)))
-        return;
-
-    hr = IMFTopologyNode_GetUnknown(node, &MF_TOPONODE_STREAM_DESCRIPTOR,
-            &IID_IMFStreamDescriptor, (void **)&sd);
-    IMFTopologyNode_Release(node);
-    if (FAILED(hr))
-        return;
-
-    hr = IMFStreamDescriptor_GetMediaTypeHandler(sd, &handler);
-    IMFStreamDescriptor_Release(sd);
-    if (FAILED(hr))
-        return;
-
-    hr = IMFMediaTypeHandler_GetCurrentMediaType(handler, &media_type);
-    IMFMediaTypeHandler_Release(handler);
-    if (FAILED(hr))
+    if (engine->presentation.frame_sink &&
+                SUCCEEDED(video_frame_sink_query_iface(engine->presentation.frame_sink, &IID_IMFMediaTypeHandler, (void**)&handler)))
     {
-        WARN("Failed to get current media type %#lx.\n", hr);
-        return;
+        if (SUCCEEDED(IMFMediaTypeHandler_GetCurrentMediaType(handler, &media_type)))
+        {
+            UINT64 size;
+            HRESULT hr = IMFMediaType_GetUINT64(media_type, &MF_MT_FRAME_SIZE, &size);
+            if (SUCCEEDED(hr))
+            {
+                unsigned int gcd;
+                engine->video_frame.size.cx = size >> 32;
+                engine->video_frame.size.cy = size;
+
+                if ((gcd = get_gcd(engine->video_frame.size.cx, engine->video_frame.size.cy)))
+                {
+                    engine->video_frame.ratio.cx = engine->video_frame.size.cx / gcd;
+                    engine->video_frame.ratio.cy = engine->video_frame.size.cy / gcd;
+                }
+            }
+            else
+            {
+                WARN("Failed to get frame size %#lx.\n", hr);
+            }
+
+            IMFMediaType_Release(media_type);
+        }
+        IMFMediaTypeHandler_Release(handler);
     }
-
-    IMFMediaType_GetUINT64(media_type, &MF_MT_FRAME_SIZE, &size);
-
-    engine->video_frame.size.cx = size >> 32;
-    engine->video_frame.size.cy = size;
-
-    if ((gcd = get_gcd(engine->video_frame.size.cx, engine->video_frame.size.cy)))
-    {
-        engine->video_frame.ratio.cx = engine->video_frame.size.cx / gcd;
-        engine->video_frame.ratio.cy = engine->video_frame.size.cy / gcd;
-    }
-
-    IMFMediaType_Release(media_type);
 }
 
 static void media_engine_apply_volume(const struct media_engine *engine)
@@ -973,24 +963,11 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
         case MESessionTopologyStatus:
         {
             UINT32 topo_status = 0;
-            IMFTopology *topology;
             PROPVARIANT value;
 
             IMFMediaEvent_GetUINT32(event, &MF_EVENT_TOPOLOGY_STATUS, &topo_status);
             if (topo_status != MF_TOPOSTATUS_READY)
                 break;
-
-            value.vt = VT_EMPTY;
-            if (FAILED(IMFMediaEvent_GetValue(event, &value)))
-                break;
-
-            if (value.vt != VT_UNKNOWN)
-            {
-                PropVariantClear(&value);
-                break;
-            }
-
-            topology = (IMFTopology *)value.punkVal;
 
             EnterCriticalSection(&engine->cs);
 
@@ -998,7 +975,7 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
 
             engine->ready_state = MF_MEDIA_ENGINE_READY_HAVE_METADATA;
 
-            media_engine_get_frame_size(engine, topology);
+            media_engine_get_frame_size(engine);
 
             IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_DURATIONCHANGE, 0, 0);
             IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA, 0, 0);
@@ -1270,6 +1247,23 @@ static HRESULT media_engine_create_video_renderer(struct media_engine *engine, I
     {
         WARN("Output format was not specified.\n");
         return E_FAIL;
+    }
+
+    switch (output_format)
+    {
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        case DXGI_FORMAT_R10G10B10A2_UNORM:
+        case DXGI_FORMAT_R10G10B10A2_UINT:
+            /* IMFMediaSession doesn't support output to these formats unless the decoder supports
+             * MFVideoFormat_P010 output, which would allow inclusion of a suitable converter.
+             * The Windows H.264 decoder doesn't suppport MFVideoFormat_P010 output, and Media
+             * Engine apparently performs a format conversion.
+             * Create an 8-bit output and ensure the sampled texture is copied via a pixel shader. */
+            output_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            engine->video_frame.format_mismatch = TRUE;
+            break;
+        default:
+            break;
     }
 
     memcpy(&subtype, &MFVideoFormat_Base, sizeof(subtype));
@@ -1974,6 +1968,23 @@ static HRESULT media_engine_set_current_time(struct media_engine *engine, double
         return S_OK;
     }
 
+    /* HACK: Don't seek if the time delta is too small. */
+    do
+    {
+        const char *game_id = getenv("SteamGameId");
+        MFTIME clocktime;
+
+        if (game_id && !strcmp(game_id, "3185890"))
+        {
+            if (IMFMediaEngineEx_IsPaused(&engine->IMFMediaEngineEx_iface)
+                    || FAILED(IMFPresentationClock_GetTime(engine->clock, &clocktime)))
+                break;
+
+            if (fabs(mftime_to_seconds(clocktime) - seektime) < 0.01)
+                return S_OK;
+        }
+    } while(0);
+
     engine->next_seek = NAN;
 
     position.vt = VT_I8;
@@ -2527,48 +2538,6 @@ static void media_engine_adjust_destination_for_ratio(const struct media_engine 
     }
 }
 
-static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context, struct media_engine *engine)
-{
-    D3D11_TEXTURE2D_DESC surface_desc;
-    IMFMediaBuffer *media_buffer;
-    IMFSample *sample;
-
-    if (!video_frame_sink_get_sample(engine->presentation.frame_sink, &sample))
-        return;
-
-    ID3D11Texture2D_GetDesc(engine->video_frame.d3d11.source, &surface_desc);
-
-    switch (surface_desc.Format)
-    {
-    case DXGI_FORMAT_B8G8R8A8_UNORM:
-    case DXGI_FORMAT_B8G8R8X8_UNORM:
-        surface_desc.Width *= 4;
-        break;
-    default:
-        FIXME("Unsupported format %#x.\n", surface_desc.Format);
-        surface_desc.Width = 0;
-    }
-
-    if (SUCCEEDED(IMFSample_ConvertToContiguousBuffer(sample, &media_buffer)))
-    {
-        BYTE *buffer;
-        DWORD buffer_size;
-        if (SUCCEEDED(IMFMediaBuffer_Lock(media_buffer, &buffer, NULL, &buffer_size)))
-        {
-            if (buffer_size == surface_desc.Width * surface_desc.Height)
-            {
-                ID3D11DeviceContext_UpdateSubresource(context, (ID3D11Resource *)engine->video_frame.d3d11.source,
-                        0, NULL, buffer, surface_desc.Width, 0);
-            }
-
-            IMFMediaBuffer_Unlock(media_buffer);
-        }
-        IMFMediaBuffer_Release(media_buffer);
-    }
-
-    IMFSample_Release(sample);
-}
-
 static HRESULT get_d3d11_resource_from_sample(IMFSample *sample, ID3D11Texture2D **resource, UINT *subresource)
 {
     IMFDXGIBuffer *dxgi_buffer;
@@ -2590,6 +2559,69 @@ static HRESULT get_d3d11_resource_from_sample(IMFSample *sample, ID3D11Texture2D
 
     IMFMediaBuffer_Release(buffer);
     return hr;
+}
+
+static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context, struct media_engine *engine)
+{
+    D3D11_TEXTURE2D_DESC surface_desc;
+    D3D11_TEXTURE2D_DESC src_desc;
+    IMFMediaBuffer *media_buffer;
+    ID3D11Texture2D *src_texture;
+    ID3D11Device *device;
+    IMFSample *sample;
+    UINT subresource;
+    HRESULT hr;
+
+    if (!video_frame_sink_get_sample(engine->presentation.frame_sink, &sample))
+        return;
+
+    ID3D11Texture2D_GetDesc(engine->video_frame.d3d11.source, &surface_desc);
+
+    switch (surface_desc.Format)
+    {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+        surface_desc.Width *= 4;
+        break;
+    default:
+        FIXME("Unsupported format %#x.\n", surface_desc.Format);
+        surface_desc.Width = 0;
+    }
+
+    if (SUCCEEDED(hr = get_d3d11_resource_from_sample(sample, &src_texture, &subresource)))
+    {
+
+        ID3D11Texture2D_GetDesc(src_texture, &src_desc);
+
+        if (SUCCEEDED(hr = media_engine_lock_d3d_device(engine, &device)))
+        {
+            ID3D11Device_GetImmediateContext(device, &context);
+            ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)engine->video_frame.d3d11.source, (ID3D11Resource *)src_texture);
+            ID3D11DeviceContext_Release(context);
+            media_engine_unlock_d3d_device(engine, device);
+        }
+
+        ID3D11Texture2D_Release(src_texture);
+    }
+
+    if (FAILED(hr) && SUCCEEDED(IMFSample_ConvertToContiguousBuffer(sample, &media_buffer)))
+    {
+        BYTE *buffer;
+        DWORD buffer_size;
+        if (SUCCEEDED(IMFMediaBuffer_Lock(media_buffer, &buffer, NULL, &buffer_size)))
+        {
+            if (buffer_size == surface_desc.Width * surface_desc.Height)
+            {
+                ID3D11DeviceContext_UpdateSubresource(context, (ID3D11Resource *)engine->video_frame.d3d11.source,
+                        0, NULL, buffer, surface_desc.Width, 0);
+            }
+
+            IMFMediaBuffer_Unlock(media_buffer);
+        }
+        IMFMediaBuffer_Release(media_buffer);
+    }
+
+    IMFSample_Release(sample);
 }
 
 static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Texture2D *dst_texture,
@@ -2934,7 +2966,9 @@ static HRESULT WINAPI media_engine_TransferVideoFrame(IMFMediaEngineEx *iface, I
 
     if (SUCCEEDED(IUnknown_QueryInterface(surface, &IID_ID3D11Texture2D, (void **)&texture)))
     {
-        if (!engine->device_manager || FAILED(hr = media_engine_transfer_d3d11(engine, texture, src_rect, dst_rect, color)))
+        if (!engine->device_manager
+                || engine->video_frame.format_mismatch
+                || FAILED(hr = media_engine_transfer_d3d11(engine, texture, src_rect, dst_rect, color)))
             hr = media_engine_transfer_to_d3d11_texture(engine, texture, src_rect, dst_rect, color);
         ID3D11Texture2D_Release(texture);
     }

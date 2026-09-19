@@ -311,11 +311,7 @@ static HRESULT test_dsound8(LPGUID lpGuid)
 
         /* Create a second DirectSound8 object */
         rc = DirectSoundCreate8(lpGuid, &dso1, NULL);
-        /* Running without pulseaudio can't open twice. */
-        if (rc==AUDCLNT_E_DEVICE_IN_USE)
-            skip("Failed to open device a second time, skipping test.\n");
-        else
-            ok(rc==DS_OK,"DirectSoundCreate8() failed: %08lx\n",rc);
+        ok(rc==DS_OK,"DirectSoundCreate8() failed: %08lx\n",rc);
         if (rc==DS_OK) {
             /* Release the second DirectSound8 object */
             ref=IDirectSound8_Release(dso1);

@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "../../../../shared/audio/audio_ipc_protocol.h"
+#include "audio_ipc_protocol.h"
 
 typedef struct OhosAudioClient
 {
@@ -40,6 +40,7 @@ int ohos_audio_client_get_status(OhosAudioClient *client,
                                  WinehuaAudioGetStatusResp *out_status);
 
 size_t ohos_audio_client_write_frames(OhosAudioClientStream *stream, const void *data, size_t frames);
+size_t ohos_audio_client_read_frames(OhosAudioClientStream *stream, void *data, size_t frames);
 size_t ohos_audio_client_get_free_frames(const OhosAudioClientStream *stream);
 size_t ohos_audio_client_get_queued_frames(const OhosAudioClientStream *stream);
 

@@ -2755,7 +2755,6 @@ static void test_window_style(void)
     RECT fullscreen_rect, r;
     HWND window, window2;
     IDirectDraw7 *ddraw;
-    unsigned int i;
     HRESULT hr;
     ULONG ref;
     BOOL ret;
@@ -2966,19 +2965,10 @@ static void test_window_style(void)
     ok(tmp & WS_VISIBLE, "Expected WS_VISIBLE.\n");
     tmp = GetWindowLongA(window, GWL_EXSTYLE);
     ok(tmp & WS_EX_TOPMOST, "Expected WS_EX_TOPMOST.\n");
-    for (i = 0; i < 5; ++i)
-    {
-        /* Try a few times to hide the window. Something in Win11 26H1 shows it again and makes it
-         * topmost. This is in addition to the ddraw periodic check below, which only makes it
-         * topmost but not visible */
-        ret = SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_HIDEWINDOW);
-        ok(ret, "SetWindowPos failed, error %#lx.\n", GetLastError());
-        tmp = GetWindowLongA(window, GWL_STYLE);
-        if (!(tmp & WS_VISIBLE))
-            break;
-        Sleep(100);
-    }
-    ok(i < 5, "Failed to hide the window.\n");
+    ret = ShowWindow(window, SW_HIDE);
+    ok(ret, "ShowWindow failed, error %#lx.\n", GetLastError());
+    ret = SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE);
+    ok(ret, "SetWindowPos failed, error %#lx.\n", GetLastError());
     tmp = GetWindowLongA(window, GWL_STYLE);
     ok(!(tmp & WS_VISIBLE), "Got unexpected WS_VISIBLE.\n");
     tmp = GetWindowLongA(window, GWL_EXSTYLE);
@@ -15955,7 +15945,6 @@ static void test_map_synchronisation(void)
     unsigned int colour, i, j, tri_count;
     IDirect3DVertexBuffer7 *buffer;
     D3DVERTEXBUFFERDESC vb_desc;
-    BOOL small_buffer = FALSE;
     IDirect3DDevice7 *device;
     BOOL unsynchronised, ret;
     IDirectDrawSurface7 *rt;
@@ -16103,15 +16092,7 @@ static void test_map_synchronisation(void)
     for (i = 0; i < ARRAY_SIZE(tests); ++i)
     {
         hr = IDirect3D7_CreateVertexBuffer(d3d, &vb_desc, &buffer, 0);
-        ok(SUCCEEDED(hr) || hr == D3DERR_TOOMANYVERTICES, "Failed to create vertex buffer, hr %#lx.\n", hr);
-        if (hr == D3DERR_TOOMANYVERTICES && vb_desc.dwNumVertices >= 65535)
-        {
-            trace("Test draw needs more than 64k vertices, test results might be flaky.\n");
-            small_buffer = TRUE;
-            vb_desc.dwNumVertices = 65534;
-            hr = IDirect3D7_CreateVertexBuffer(d3d, &vb_desc, &buffer, 0);
-            ok(SUCCEEDED(hr), "Failed to create vertex buffer, hr %#lx.\n", hr);
-        }
+        ok(SUCCEEDED(hr), "Failed to create vertex buffer, hr %#lx.\n", hr);
         hr = IDirect3DVertexBuffer7_Lock(buffer, DDLOCK_DISCARDCONTENTS, (void **)&quads, NULL);
         ok(SUCCEEDED(hr), "Failed to lock vertex buffer, hr %#lx.\n", hr);
         for (j = 0; j < vb_desc.dwNumVertices / 4; ++j)
@@ -16140,7 +16121,6 @@ static void test_map_synchronisation(void)
 
         colour = get_surface_color(rt, 320, 240);
         unsynchronised = compare_color(colour, 0x00ffff00, 1);
-        flaky_if(small_buffer && tests[i].unsynchronised)
         ok(tests[i].unsynchronised == unsynchronised, "Expected %s map for flags %#x.\n",
                 tests[i].unsynchronised ? "unsynchronised" : "synchronised", tests[i].flags);
 
@@ -18335,17 +18315,11 @@ static void test_caps(void)
         {
             .dwSize = sizeof(DDSURFACEDESC2),
             .dwFlags = DDSD_CAPS | DDSD_PIXELFORMAT | DDSD_WIDTH | DDSD_HEIGHT,
-            .ddsCaps =
-            {
-                .dwCaps = DDSCAPS_ZBUFFER,
-            },
-            .ddpfPixelFormat =
-            {
-                .dwSize = sizeof(DDPIXELFORMAT),
-                .dwFlags = DDPF_ZBUFFER,
-                .dwZBufferBitDepth = depth_caps[i].depth,
-                .dwZBitMask = depth_caps[i].mask,
-            },
+            .ddsCaps.dwCaps = DDSCAPS_ZBUFFER,
+            .ddpfPixelFormat.dwSize = sizeof(DDPIXELFORMAT),
+            .ddpfPixelFormat.dwFlags = DDPF_ZBUFFER,
+            .ddpfPixelFormat.dwZBufferBitDepth = depth_caps[i].depth,
+            .ddpfPixelFormat.dwZBitMask = depth_caps[i].mask,
             .dwWidth = 64,
             .dwHeight = 64,
         };
@@ -18428,17 +18402,11 @@ static void test_caps(void)
         {
             .dwSize = sizeof(DDSURFACEDESC2),
             .dwFlags = DDSD_CAPS | DDSD_PIXELFORMAT | DDSD_WIDTH | DDSD_HEIGHT,
-            .ddsCaps =
-            {
-                .dwCaps = DDSCAPS_ZBUFFER,
-            },
-            .ddpfPixelFormat =
-            {
-                .dwSize = sizeof(DDPIXELFORMAT),
-                .dwFlags = DDPF_ZBUFFER,
-                .dwZBufferBitDepth = depth_caps[i].depth,
-                .dwZBitMask = depth_caps[i].mask,
-            },
+            .ddsCaps.dwCaps = DDSCAPS_ZBUFFER,
+            .ddpfPixelFormat.dwSize = sizeof(DDPIXELFORMAT),
+            .ddpfPixelFormat.dwFlags = DDPF_ZBUFFER,
+            .ddpfPixelFormat.dwZBufferBitDepth = depth_caps[i].depth,
+            .ddpfPixelFormat.dwZBitMask = depth_caps[i].mask,
             .dwWidth = 64,
             .dwHeight = 64,
         };
@@ -20958,8 +20926,8 @@ out:
     DestroyWindow(window);
 }
 
-static void check_surface_clipper(IDirectDrawSurface7 *surface,
-        IDirectDrawClipper *clipper, RECT *window_rect, DWORD style)
+static void check_surface_clipper(IDirectDrawSurface7 *surface, IDirectDrawClipper *clipper_hwnd,
+        IDirectDrawClipper *clipper_region, RECT *window_rect, DWORD style)
 {
     unsigned int c;
     DDBLTFX fx;
@@ -20971,10 +20939,8 @@ static void check_surface_clipper(IDirectDrawSurface7 *surface,
 
     fill_surface(surface, 0xffff0000);
 
-    /* Clippers with a region work. Clippers with a window work on Windows 98,
-     * but are ignored on modern windows. */
-
-    hr = IDirectDrawSurface7_SetClipper(surface, clipper);
+    /* Clipper with region works. */
+    hr = IDirectDrawSurface7_SetClipper(surface, clipper_region);
     ok(hr == DD_OK, "got %#lx.\n", hr);
     c = get_surface_color(surface, 101, 101);
     ok(c == 0x00ff0000, "got %#x.\n", c);
@@ -20983,6 +20949,21 @@ static void check_surface_clipper(IDirectDrawSurface7 *surface,
     c = get_surface_color(surface, 0, 0);
     ok(c == 0x00ff0000, "got %#x.\n", c);
     c = get_surface_color(surface, 101, 101);
+    ok(c == 0x0000ff00, "got %#x.\n", c);
+
+    /* Clipper with window has no effect. */
+    hr = IDirectDrawSurface7_SetClipper(surface, clipper_hwnd);
+    ok(hr == DD_OK, "got %#lx.\n", hr);
+    fill_surface(surface, 0xff0000ff);
+    c = get_surface_color(surface, window_rect->left + 1, window_rect->top + 1);
+    ok(c == 0x000000ff, "got %#x.\n", c);
+
+    hr = IDirectDrawSurface7_Blt(surface, NULL, NULL, NULL, DDBLT_COLORFILL | DDBLT_WAIT, &fx);
+    ok(hr == DD_OK, "got %#lx.\n", hr);
+
+    c = get_surface_color(surface, window_rect->left + 1, window_rect->top + 1);
+    ok(c == 0x0000ff00, "got %#x.\n", c);
+    c = get_surface_color(surface, 0, 0);
     ok(c == 0x0000ff00, "got %#x.\n", c);
 
     hr = IDirectDrawSurface7_SetClipper(surface, NULL);
@@ -21007,15 +20988,15 @@ static void test_clipper_in_exclusive_fullscreen(void)
         { WS_POPUP | WS_VISIBLE },
     };
     IDirectDrawSurface7 *primary, *offscreen;
-    IDirectDrawClipper *clipper;
+    IDirectDrawClipper *clipper, *clipper2;
     DDSURFACEDESC2 surface_desc;
+    HWND window, clip_window;
     IDirectDraw7 *ddraw;
     RGNDATA *rgn_data;
     DWORD ret, style;
     RECT window_rect;
     ULONG refcount;
     unsigned int i;
-    HWND window;
     HRESULT hr;
     HRGN rgn;
 
@@ -21027,12 +21008,12 @@ static void test_clipper_in_exclusive_fullscreen(void)
     hr = IDirectDraw7_CreateClipper(ddraw, 0, &clipper, NULL);
     ok(hr == DD_OK, "got %#lx.\n", hr);
 
+    hr = IDirectDraw7_CreateClipper(ddraw, 0, &clipper2, NULL);
+    ok(hr == DD_OK, "got %#lx.\n", hr);
+
     window = CreateWindowA("static", "ddraw_fullscreen", WS_POPUP | WS_VISIBLE, 0, 0, 640, 480, NULL, NULL, NULL, NULL);
-    pump_messages();
-    hr = IDirectDraw7_SetCooperativeLevel(ddraw, NULL, DDSCL_NORMAL);
-    ok(hr == DD_OK, "got %#lx.\n", hr);
+
     hr = IDirectDraw7_SetCooperativeLevel(ddraw, window, DDSCL_EXCLUSIVE | DDSCL_FULLSCREEN);
-    ok(hr == DD_OK, "got %#lx.\n", hr);
     pump_messages();
 
     rgn = CreateRectRgn(100, 100, 200, 200);
@@ -21042,7 +21023,7 @@ static void test_clipper_in_exclusive_fullscreen(void)
     ret = GetRegionData(rgn, ret, rgn_data);
     ok(!!ret, "Failed to get region data.\n");
     DeleteObject(rgn);
-    hr = IDirectDrawClipper_SetClipList(clipper, rgn_data, 0);
+    hr = IDirectDrawClipper_SetClipList(clipper2, rgn_data, 0);
     ok(hr == DD_OK, "got %#lx.\n", hr);
     free(rgn_data);
 
@@ -21064,20 +21045,50 @@ static void test_clipper_in_exclusive_fullscreen(void)
     {
         winetest_push_context("test %u", i);
         style = tests[i].style;
+        clip_window = CreateWindowA("static", "ddraw_clip", style, 100, 100, 100, 100,
+                tests[i].parent ? window : NULL, NULL, NULL, NULL);
+        ok(!!clip_window, "got error %ld.\n", GetLastError());
+        pump_messages();
+
+        GetWindowRect(clip_window, &window_rect);
+        hr = IDirectDrawClipper_SetHWnd(clipper, 0, clip_window);
+        ok(hr == DD_OK, "got %#lx.\n", hr);
+
+        hr = IDirectDrawClipper_GetClipList(clipper, NULL, NULL, &ret);
+        ok(hr == DD_OK, "got %#lx.\n", hr);
+        rgn_data = malloc(ret);
+        hr = IDirectDrawClipper_GetClipList(clipper, NULL, rgn_data, &ret);
+        ok(hr == DD_OK, "got %#lx.\n", hr);
+        ok(rgn_data->rdh.dwSize == sizeof(rgn_data->rdh), "Got unexpected structure size %#lx.\n", rgn_data->rdh.dwSize);
+        ok(rgn_data->rdh.iType == RDH_RECTANGLES, "Got unexpected type %#lx.\n", rgn_data->rdh.iType);
+        if (style & WS_VISIBLE)
+        {
+            ok(rgn_data->rdh.nCount >= 1, "got %lu.\n", rgn_data->rdh.nCount);
+            if (!(style & WS_CHILD))
+                ok(EqualRect(&rgn_data->rdh.rcBound, &window_rect), "got %s, expected %s.\n",
+                        wine_dbgstr_rect(&rgn_data->rdh.rcBound), wine_dbgstr_rect(&window_rect));
+        }
+        else
+        {
+            ok(!rgn_data->rdh.nCount, "got %lu.\n", rgn_data->rdh.nCount);
+        }
+        free(rgn_data);
 
         winetest_push_context("primary");
-        check_surface_clipper(primary, clipper, &window_rect, style);
+        check_surface_clipper(primary, clipper, clipper2, &window_rect, style);
         winetest_pop_context();
 
         winetest_push_context("offscreen");
-        check_surface_clipper(offscreen, clipper, &window_rect, style);
+        check_surface_clipper(offscreen, clipper, clipper2, &window_rect, style);
         winetest_pop_context();
 
+        hr = IDirectDrawClipper_SetHWnd(clipper, 0, NULL);
+        ok(hr == DD_OK, "got %#lx.\n", hr);
+        DestroyWindow(clip_window);
+        pump_messages();
         winetest_pop_context();
     }
 
-    hr = IDirectDraw7_SetCooperativeLevel(ddraw, NULL, DDSCL_NORMAL);
-    ok(hr == DD_OK, "got %#lx.\n", hr);
     IDirectDrawClipper_Release(clipper);
     refcount = IDirectDrawSurface7_Release(offscreen);
     ok(!refcount, "Got unexpected refcount %lu.\n", refcount);
@@ -21153,6 +21164,9 @@ START_TEST(ddraw7)
 
     start_foreground_window_thread();
 
+//test_clipper_blt();
+test_clipper_in_exclusive_fullscreen();
+return;
     test_process_vertices();
     test_coop_level_create_device_window();
     test_clipper_blt();

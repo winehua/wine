@@ -24,6 +24,7 @@
  */
 
 #include <stdarg.h>
+#include <math.h>
 
 #define COBJMACROS
 #include "windef.h"
@@ -52,12 +53,6 @@ static DWORD speaker_config_to_channel_mask(DWORD speaker_config)
 
         case DSSPEAKER_5POINT1_BACK:
             return SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER | SPEAKER_LOW_FREQUENCY | SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT;
-
-        case DSSPEAKER_7POINT1_SURROUND:
-            return KSAUDIO_SPEAKER_5POINT1 | SPEAKER_SIDE_LEFT | SPEAKER_SIDE_RIGHT;
-
-        case DSSPEAKER_7POINT1_WIDE:
-            return KSAUDIO_SPEAKER_5POINT1 | SPEAKER_FRONT_LEFT_OF_CENTER | SPEAKER_FRONT_RIGHT_OF_CENTER;
     }
 
     WARN("unknown speaker_config %lu\n", speaker_config);
@@ -99,11 +94,7 @@ static DWORD DSOUND_FindSpeakerConfig(IMMDevice *mmdevice, int channels)
     PropVariantClear(&pv);
     IPropertyStore_Release(store);
 
-    if ((channels >= 8 || channels == 0) && (phys_speakers & KSAUDIO_SPEAKER_7POINT1_SURROUND) == KSAUDIO_SPEAKER_7POINT1_SURROUND)
-        return DSSPEAKER_7POINT1_SURROUND;
-    else if ((channels >= 8 || channels == 0) && (phys_speakers & KSAUDIO_SPEAKER_7POINT1) == KSAUDIO_SPEAKER_7POINT1)
-        return DSSPEAKER_7POINT1_WIDE;
-    else if ((channels >= 6 || channels == 0) && (phys_speakers & KSAUDIO_SPEAKER_5POINT1) == KSAUDIO_SPEAKER_5POINT1)
+    if ((channels >= 6 || channels == 0) && (phys_speakers & KSAUDIO_SPEAKER_5POINT1) == KSAUDIO_SPEAKER_5POINT1)
         return DSSPEAKER_5POINT1_BACK;
     else if ((channels >= 6 || channels == 0) && (phys_speakers & KSAUDIO_SPEAKER_5POINT1_SURROUND) == KSAUDIO_SPEAKER_5POINT1_SURROUND)
         return DSSPEAKER_5POINT1_SURROUND;
@@ -115,6 +106,78 @@ static DWORD DSOUND_FindSpeakerConfig(IMMDevice *mmdevice, int channels)
         return DSSPEAKER_MONO;
 
     return def;
+}
+
+static void DSOUND_ParseSpeakerConfig(DirectSoundDevice *device)
+{
+    switch (DSSPEAKER_CONFIG(device->speaker_config)) {
+        case DSSPEAKER_MONO:
+            device->speaker_angles[0] = M_PI/180.0f * 0.0f;
+            device->speaker_num[0] = 0;
+            device->num_speakers = 1;
+            device->lfe_channel = -1;
+        break;
+
+        case DSSPEAKER_STEREO:
+        case DSSPEAKER_HEADPHONE:
+            device->speaker_angles[0] = M_PI/180.0f * -90.0f;
+            device->speaker_angles[1] = M_PI/180.0f *  90.0f;
+            device->speaker_num[0] = 0; /* Left */
+            device->speaker_num[1] = 1; /* Right */
+            device->num_speakers = 2;
+            device->lfe_channel = -1;
+        break;
+
+        case DSSPEAKER_QUAD:
+            device->speaker_angles[0] = M_PI/180.0f * -135.0f;
+            device->speaker_angles[1] = M_PI/180.0f *  -45.0f;
+            device->speaker_angles[2] = M_PI/180.0f *   45.0f;
+            device->speaker_angles[3] = M_PI/180.0f *  135.0f;
+            device->speaker_num[0] = 2; /* Rear left */
+            device->speaker_num[1] = 0; /* Front left */
+            device->speaker_num[2] = 1; /* Front right */
+            device->speaker_num[3] = 3; /* Rear right */
+            device->num_speakers = 4;
+            device->lfe_channel = -1;
+        break;
+
+        case DSSPEAKER_5POINT1_BACK:
+            device->speaker_angles[0] = M_PI/180.0f * -135.0f;
+            device->speaker_angles[1] = M_PI/180.0f *  -45.0f;
+            device->speaker_angles[2] = M_PI/180.0f *    0.0f;
+            device->speaker_angles[3] = M_PI/180.0f *   45.0f;
+            device->speaker_angles[4] = M_PI/180.0f *  135.0f;
+            device->speaker_angles[5] = 9999.0f;
+            device->speaker_num[0] = 4; /* Rear left */
+            device->speaker_num[1] = 0; /* Front left */
+            device->speaker_num[2] = 2; /* Front centre */
+            device->speaker_num[3] = 1; /* Front right */
+            device->speaker_num[4] = 5; /* Rear right */
+            device->speaker_num[5] = 3; /* LFE */
+            device->num_speakers = 6;
+            device->lfe_channel = 3;
+        break;
+
+        case DSSPEAKER_5POINT1_SURROUND:
+            device->speaker_angles[0] = M_PI/180.0f *  -90.0f;
+            device->speaker_angles[1] = M_PI/180.0f *  -30.0f;
+            device->speaker_angles[2] = M_PI/180.0f *    0.0f;
+            device->speaker_angles[3] = M_PI/180.0f *   30.0f;
+            device->speaker_angles[4] = M_PI/180.0f *   90.0f;
+            device->speaker_angles[5] = 9999.0f;
+            device->speaker_num[0] = 4; /* Rear left */
+            device->speaker_num[1] = 0; /* Front left */
+            device->speaker_num[2] = 2; /* Front centre */
+            device->speaker_num[3] = 1; /* Front right */
+            device->speaker_num[4] = 5; /* Rear right */
+            device->speaker_num[5] = 3; /* LFE */
+            device->num_speakers = 6;
+            device->lfe_channel = 3;
+        break;
+
+        default:
+            WARN("unknown speaker_config %lu\n", device->speaker_config);
+    }
 }
 
 static HRESULT DSOUND_WaveFormat(DirectSoundDevice *device, IAudioClient *client,
@@ -137,7 +200,7 @@ static HRESULT DSOUND_WaveFormat(DirectSoundDevice *device, IAudioClient *client
         wfe.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
         wfe.Samples.wValidBitsPerSample = wfe.Format.wBitsPerSample = 32;
 
-        if (wfe.Format.nChannels < device->num_speakers) {
+        if (device->num_speakers == 0 || wfe.Format.nChannels < device->num_speakers) {
             device->speaker_config = DSOUND_FindSpeakerConfig(device->mmdevice, wfe.Format.nChannels);
             DSOUND_ParseSpeakerConfig(device);
         } else if (wfe.Format.nChannels > device->num_speakers) {

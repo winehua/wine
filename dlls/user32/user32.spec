@@ -14,8 +14,8 @@
 
 2010 stub -noname SlicerControl  # NtUserSlicerControl
 
-2503 stdcall DelegateInput(ptr ptr ptr ptr ptr ptr)  # NtUserDelegateInput
-2504 stdcall UndelegateInput(ptr ptr)  # NtUserUndelegateInput
+2503 stub DelegateInput  # NtUserDelegateInput
+2504 stub UndelegateInput  # NtUserUndelegateInput
 2505 stub HandleDelegatedInput  # NtUserHandleDelegatedInput
 2506 stub @
 2507 stub -noname SetAutoRotation  # NtUserSetAutoRotation
@@ -613,7 +613,7 @@
 @ stdcall GetMenuStringW(long long ptr long long)
 @ stdcall GetMessageA(ptr long long long)
 @ stdcall GetMessageExtraInfo()
-@ stdcall GetMessagePos() NtUserGetMessagePos
+@ stdcall GetMessagePos()
 @ stdcall GetMessageTime()
 @ stdcall GetMessageW(ptr long long long)
 @ stdcall GetMonitorInfoA(long ptr)
@@ -625,7 +625,7 @@
 @ stdcall GetParent(long)
 @ stdcall GetPhysicalCursorPos(ptr)
 # @ stub GetPointerCursorId
-# @ stub GetPointerDevice
+@ stdcall GetPointerDevice(ptr ptr)
 # @ stub GetPointerDeviceCursors
 # @ stub GetPointerDeviceInputSpace
 # @ stub GetPointerDeviceOrientation
@@ -640,7 +640,7 @@
 # @ stub GetPointerFrameTouchInfo
 # @ stub GetPointerFrameTouchInfoHistory
 @ stdcall GetPointerInfo(long ptr)
-# @ stub GetPointerInfoHistory
+@ stub GetPointerInfoHistory(long ptr ptr)
 # @ stub GetPointerInputTransform
 @ stdcall GetPointerPenInfo(long ptr)
 # @ stub GetPointerPenInfoHistory
@@ -686,7 +686,7 @@
 @ stdcall GetTitleBarInfo(long ptr) NtUserGetTitleBarInfo
 # @ stub GetTopLevelWindow
 @ stdcall GetTopWindow(long)
-@ stdcall GetTouchInputInfo(long long ptr long)
+@ stdcall GetTouchInputInfo(long long ptr long) NtUserGetTouchInputInfo
 # @ stub GetUnpredictedMessagePos
 @ stdcall GetUpdateRect(long ptr long) NtUserGetUpdateRect
 @ stdcall GetUpdateRgn(long long long) NtUserGetUpdateRgn
@@ -798,7 +798,7 @@
 # @ stub IsThreadDesktopComposited
 # @ stub IsThreadTSFEventAware
 # @ stub IsTopLevelWindow
-@ stdcall IsTouchWindow(long ptr)
+@ stdcall IsTouchWindow(long ptr) NtUserIsTouchWindow
 @ stdcall IsValidDpiAwarenessContext(long)
 @ stdcall IsWinEventHookInstalled(long)
 @ stdcall IsWindow(long)
@@ -1064,7 +1064,7 @@
 @ stdcall SetMenuItemBitmaps(long long long long long)
 @ stdcall SetMenuItemInfoA(long long long ptr)
 @ stdcall SetMenuItemInfoW(long long long ptr)
-@ stdcall SetMessageExtraInfo(long) NtUserSetMessageExtraInfo
+@ stdcall SetMessageExtraInfo(long)
 @ stdcall SetMessageQueue(long)
 # @ stub SetMirrorRendering
 @ stdcall SetParent(long long) NtUserSetParent
@@ -1139,7 +1139,7 @@
 @ stdcall ShutdownBlockReasonDestroy(long)
 # @ stub ShutdownBlockReasonQuery
 # @ stub SignalRedirectionStartComplete
-# @ stub SkipPointerFrameMessages
+@ stdcall SkipPointerFrameMessages(long)
 # @ stub SoftModalMessageBox
 # @ stub SoundSentry
 @ stdcall SubtractRect(ptr ptr ptr)

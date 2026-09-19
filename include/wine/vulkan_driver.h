@@ -17,6 +17,10 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#if 0
+#pragma makedep install
+#endif
+
 #ifndef __WINE_VULKAN_DRIVER_H
 #define __WINE_VULKAN_DRIVER_H
 
@@ -85,11 +89,12 @@ struct VkDevice_T
 
 #ifdef WINE_UNIX_LIB
 
+#include <pthread.h>
 #include "wine/rbtree.h"
 #include "wine/list.h"
 
 /* Wine internal vulkan driver version, needs to be bumped upon vulkan_funcs changes. */
-#define WINE_VULKAN_DRIVER_VERSION 47
+#define WINE_VULKAN_DRIVER_VERSION 48
 
 struct vulkan_object
 {
@@ -163,6 +168,8 @@ struct vulkan_instance
 
     struct vulkan_physical_device *physical_devices;
     uint32_t physical_device_count;
+
+    pthread_key_t transient_object_handle;
 };
 
 static inline struct vulkan_instance *vulkan_instance_from_handle( VkInstance handle )
@@ -213,10 +220,9 @@ struct vulkan_device
 #undef USE_VK_FUNC
 
     uint64_t queue_count;
-    struct vulkan_queue queues[];
+    struct vulkan_queue *queues;
+    VkQueueFamilyProperties *queue_props;
 };
-
-C_ASSERT( sizeof(struct vulkan_device) == offsetof(struct vulkan_device, queues[0]) );
 
 static inline struct vulkan_device *vulkan_device_from_handle( VkDevice handle )
 {
@@ -340,7 +346,10 @@ struct vulkan_funcs
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR;
     PFN_vkGetPhysicalDeviceSurfaceFormats2KHR p_vkGetPhysicalDeviceSurfaceFormats2KHR;
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR p_vkGetPhysicalDeviceSurfaceFormatsKHR;
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR p_vkGetPhysicalDeviceSurfacePresentModesKHR;
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR p_vkGetPhysicalDeviceSurfaceSupportKHR;
     PFN_vkGetPhysicalDeviceWin32PresentationSupportKHR p_vkGetPhysicalDeviceWin32PresentationSupportKHR;
+    PFN_vkGetSwapchainImagesKHR p_vkGetSwapchainImagesKHR;
     PFN_vkGetSemaphoreWin32HandleKHR p_vkGetSemaphoreWin32HandleKHR;
     PFN_vkImportFenceWin32HandleKHR p_vkImportFenceWin32HandleKHR;
     PFN_vkImportSemaphoreWin32HandleKHR p_vkImportSemaphoreWin32HandleKHR;
@@ -358,7 +367,7 @@ struct vulkan_funcs
 struct client_surface;
 struct vulkan_driver_funcs
 {
-    VkResult (*p_vulkan_surface_create)(HWND, const struct vulkan_instance *, VkSurfaceKHR *, struct client_surface **);
+    VkResult (*p_vulkan_surface_create)(HWND, BOOL, const struct vulkan_instance *, VkSurfaceKHR *, struct client_surface **);
     VkBool32 (*p_get_physical_device_presentation_support)(struct vulkan_physical_device *, uint32_t);
     void (*p_map_instance_extensions)( struct vulkan_instance_extensions *extensions );
     void (*p_map_device_extensions)( struct vulkan_device_extensions *extensions );

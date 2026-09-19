@@ -31,8 +31,101 @@
 #include "waylanddrv.h"
 #include "wine/debug.h"
 #include "wine/server.h"
+#ifdef __OHOS__
+#include "wayland_surface_ohos.h"
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+
+/* WineHua window binding (2026-09-17)
+ *
+ * The native present path (DXVK / CEF Vulkan swapchain) is keyed on the Host
+ * side by (Wayland client pid, wl_surface id).  For a window owned by another
+ * process - the normal CEF layout, where the GPU process presents into the
+ * browser process' HWND - the presenting process creates its own private
+ * surface, so that key identifies the private surface and not the window.
+ *
+ * Publish this window's own wl_surface id as a window property: it is visible
+ * across processes through wineserver, it dies with the HWND, and it lets the
+ * presenting process send (owner pid, owner surface id) instead of guessing
+ * the owner from sizes.  See win32u/vulkan.c:win32u_vkCreateWin32SurfaceKHR.
+ */
+static const WCHAR winehua_window_surface_prop[] = {
+    'W','i','n','e','H','u','a','W','i','n','d','o','w','S','u','r','f','a','c','e','I','d',0
+};
+
+/* WineHua P0-1 Window Identity Probe (2026-09-17) — diagnostics only.
+ * Same field layout as win32u/vulkan.c:winehua_log_window_identity() so the owner
+ * (role=owner, here) and presenter (role=present) lines can be compared. */
+static void winehua_log_window_identity(const char *role, HWND hwnd, uint32_t wl_surface_id,
+                                        HANDLE token, uint32_t private_surface)
+{
+    WCHAR class_buf[128] = {0};
+    WCHAR title_buf[128] = {0};
+    UNICODE_STRING class_name = {0};
+    RECT rect = {0}, client = {0};
+    char class_ascii[128] = {0};
+    char title_ascii[128] = {0};
+    HWND hparent, hroot, hrootowner;
+    uint32_t window_win_pid, window_win_pid2, window_tid;
+    unsigned int i;
+
+    if (!hwnd) return;
+
+    class_name.Buffer = class_buf;
+    class_name.MaximumLength = sizeof(class_buf) - sizeof(WCHAR);
+    NtUserGetClassName( hwnd, FALSE, &class_name );
+    NtUserInternalGetWindowText( hwnd, title_buf, 127 );
+    NtUserGetWindowRect( hwnd, &rect, 0 );
+    NtUserGetClientRect( hwnd, &client, 0 );
+    hparent = NtUserGetParent( hwnd );
+    hroot = NtUserGetAncestor( hwnd, 2 /* GA_ROOT */ );
+    hrootowner = NtUserGetAncestor( hwnd, 3 /* GA_ROOTOWNER */ );
+    window_win_pid = (uint32_t)(ULONG_PTR)NtUserQueryWindow( hwnd, WindowProcess );
+    window_win_pid2 = (uint32_t)(ULONG_PTR)NtUserQueryWindow( hwnd, WindowProcess2 );
+    window_tid = (uint32_t)(ULONG_PTR)NtUserQueryWindow( hwnd, WindowThread );
+
+    for (i = 0; i < class_name.Length / sizeof(WCHAR) && i < sizeof(class_ascii) - 1; i++)
+        class_ascii[i] = (class_buf[i] >= 32 && class_buf[i] < 127) ? (char)class_buf[i] : '.';
+    for (i = 0; i < 127 && title_buf[i]; i++)
+        title_ascii[i] = (title_buf[i] >= 32 && title_buf[i] < 127) ? (char)title_buf[i] : '.';
+
+    fprintf( stderr,
+             "WineHuaWindowIdentity: role=%s hostPid=%u winPid=%u hwnd=0x%llx fullHwnd=0x%llx "
+             "windowWinPid=%u windowWinPid2=%u threadId=%u class=%s title=%s "
+             "rect=%d,%d,%dx%d client=%dx%d parent=0x%llx owner=0x%llx root=0x%llx rootOwner=0x%llx "
+             "style=0x%llx exStyle=0x%llx visible=%d wlSurfaceId=%u token=0x%llx privateSurface=%u\n",
+             role, (uint32_t)getpid(),
+             (uint32_t)(uintptr_t)NtCurrentTeb()->ClientId.UniqueProcess,
+             (unsigned long long)(uintptr_t)hwnd, (unsigned long long)(uintptr_t)hwnd,
+             window_win_pid, window_win_pid2, window_tid, class_ascii, title_ascii,
+             (int)rect.left, (int)rect.top, (int)(rect.right - rect.left), (int)(rect.bottom - rect.top),
+             (int)(client.right - client.left), (int)(client.bottom - client.top),
+             (unsigned long long)(uintptr_t)hparent, (unsigned long long)(uintptr_t)hrootowner,
+             (unsigned long long)(uintptr_t)hroot, (unsigned long long)(uintptr_t)hrootowner,
+             (unsigned long long)(ULONG_PTR)NtUserGetWindowLongPtrW( hwnd, -16 /* GWL_STYLE */ ),
+             (unsigned long long)(ULONG_PTR)NtUserGetWindowLongPtrW( hwnd, -20 /* GWL_EXSTYLE */ ),
+             NtUserIsWindowVisible( hwnd ) ? 1 : 0,
+             wl_surface_id, (unsigned long long)(ULONG_PTR)token, private_surface );
+}
+
+static void winehua_publish_window_surface(HWND hwnd, struct wayland_surface *surface)
+{
+    uint32_t surface_id = 0;
+
+    if (surface && surface->wl_surface)
+        surface_id = wl_proxy_get_id((struct wl_proxy *)surface->wl_surface);
+
+    if (!NtUserSetProp(hwnd, winehua_window_surface_prop, (HANDLE)(uintptr_t)surface_id))
+        WARN("WineHua: failed to publish window surface id for hwnd %p\n", hwnd);
+    else
+        fprintf(stderr, "WineHuaWindowToken: publish hwnd=%p surface_id=%u pid=%u\n",
+                hwnd, surface_id, (unsigned int)getpid());
+
+    /* P0-1 window identity probe (diagnostics only). */
+    winehua_log_window_identity( "owner", hwnd, surface_id,
+                                NtUserGetProp(hwnd, winehua_window_surface_prop), 0 );
+}
 
 static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_surface,
                                          uint32_t serial)
@@ -176,6 +269,20 @@ struct wayland_surface *wayland_surface_create(HWND hwnd)
 
     surface->window.scale = 1.0;
 
+    /* WineHua: expose this window's surface id to other processes (see above).
+     *
+     * 2026-09-17 REGRESSION GUARD: 这段代码在「每次建窗」时调用 NtUserSetProp +
+     * 一串 NtUser* 查询（身份探针），实测会让 guest GL 的 SetPixelFormat
+     * (ChoosePixelFormat/WGL 初始化) 失败 —— opengl-x64/x86 core smoke 从 PASS
+     * 变 FAIL（SetPixelFormat failed: 0）。因此**默认关闭**，仅在显式设置
+     * WINEHUA_WINDOW_TOKEN=1 时才发布；正式的 owner token 通道需换到不干扰
+     * 窗口创建时序的位置（见 docs/WINDOWS_ARCH_SEMANTICS.md §4 / P0-1 记录）。 */
+    {
+        const char *token_env = getenv("WINEHUA_WINDOW_TOKEN");
+        if (token_env && token_env[0] == '1' && !token_env[1])
+            winehua_publish_window_surface(hwnd, surface);
+    }
+
     return surface;
 
 err:
@@ -212,6 +319,10 @@ void wayland_surface_destroy(struct wayland_surface *surface)
 
     wayland_surface_clear_role(surface);
 
+    /* WineHua: withdraw the published window surface id (the HWND may outlive
+     * this surface if it is recreated). */
+    NtUserSetProp(surface->hwnd, winehua_window_surface_prop, NULL);
+
     if (surface->wp_viewport)
     {
         wp_viewport_destroy(surface->wp_viewport);
@@ -242,58 +353,6 @@ void wayland_surface_destroy(struct wayland_surface *surface)
 }
 
 /**********************************************************************
- *          wayland_surface_update_min_max
- *
- * 发送窗口 resize 约束到 compositor, 使不可 resize 的窗口在鸿蒙侧也被禁止 resize。
- *
- * 判断逻辑:
- *   WS_THICKFRAME 且 !WS_DLGFRAME → 可 resize (min=小值, max=0=无限制)
- *   否则 (对话框/message box 等) → 不可 resize (min == max == 当前尺寸)
- *
- * 调用时机: wayland_surface_reconfigure() 中每次窗口状态变化时更新。
- */
-static void wayland_surface_update_min_max(struct wayland_surface *surface)
-{
-    LONG style;
-    int cur_w, cur_h;
-
-    if (!surface->xdg_toplevel) return;
-
-    style = NtUserGetWindowLongW(surface->hwnd, GWL_STYLE);
-
-    /* 当前窗口尺寸 (surface-local) */
-    cur_w = surface->window.rect.right - surface->window.rect.left;
-    cur_h = surface->window.rect.bottom - surface->window.rect.top;
-    wayland_surface_coords_from_window(surface, cur_w, cur_h, &cur_w, &cur_h);
-
-    /* WS_THICKFRAME 且非 WS_DLGFRAME → 可 resize, 否则锁定尺寸 */
-    if ((style & WS_THICKFRAME) && !(style & WS_DLGFRAME))
-    {
-        /* 可 resize: 设一个很小的 min 避免窗口塌陷, max=0 无限制 */
-        surface->min_width = max(1, cur_w / 4);
-        surface->min_height = max(1, cur_h / 4);
-        surface->max_width = 0;
-        surface->max_height = 0;
-    }
-    else
-    {
-        /* 不可 resize (对话框等): min == max, 鸿蒙侧自动禁止用户拖拽 resize */
-        surface->min_width = cur_w;
-        surface->min_height = cur_h;
-        surface->max_width = cur_w;
-        surface->max_height = cur_h;
-    }
-
-    TRACE("hwnd=%p style=0x%x min=%dx%d max=%dx%d\n",
-          surface->hwnd, (unsigned)style,
-          surface->min_width, surface->min_height,
-          surface->max_width, surface->max_height);
-
-    xdg_toplevel_set_min_size(surface->xdg_toplevel, surface->min_width, surface->min_height);
-    xdg_toplevel_set_max_size(surface->xdg_toplevel, surface->max_width, surface->max_height);
-}
-
-/**********************************************************************
  *          wayland_surface_make_toplevel
  *
  * Gives the toplevel role to a plain wayland surface.
@@ -320,7 +379,39 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface)
     xdg_toplevel_add_listener(surface->xdg_toplevel, &xdg_toplevel_listener, surface->hwnd);
 
     if (process_name)
-        xdg_toplevel_set_app_id(surface->xdg_toplevel, process_name);
+    {
+        /* Append window class suffix for known explorer window types,
+         * enabling the compositor to identify desktop root and taskbar
+         * without geometric heuristics.
+         *
+         * Class names as defined in programs/explorer/:
+         *   Shell_TrayWnd — systray.c:150 (taskbar)
+         *   #32769        — desktop.c:40  (DESKTOP_CLASS_ATOM, desktop shell) */
+        static const WCHAR taskbar_class[] = {'S','h','e','l','l','_','T','r','a','y','W','n','d', 0};
+        static const WCHAR desktop_atom[] = {'#','3','2','7','6','9', 0};
+        WCHAR class_buf[256];
+        UNICODE_STRING class_str = {.Buffer = class_buf, .MaximumLength = sizeof(class_buf)};
+        const char *suffix = NULL;
+
+        if (NtUserGetClassName(surface->hwnd, TRUE, &class_str))
+        {
+            if (!wcscmp(class_buf, taskbar_class))
+                suffix = "taskbar";
+            else if (!wcscmp(class_buf, desktop_atom))
+                suffix = "desktop-shell";
+        }
+
+        if (suffix)
+        {
+            char app_id[512];
+            snprintf(app_id, sizeof(app_id), "%s.%s", process_name, suffix);
+            xdg_toplevel_set_app_id(surface->xdg_toplevel, app_id);
+        }
+        else
+        {
+            xdg_toplevel_set_app_id(surface->xdg_toplevel, process_name);
+        }
+    }
 
     if (!NtUserInternalGetWindowText(surface->hwnd, text, ARRAY_SIZE(text)))
         text[0] = 0;
@@ -441,6 +532,7 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
 
     surface->content_width = 0;
     surface->content_height = 0;
+    surface->has_contents = FALSE;
 
     wl_display_flush(process_wayland.wl_display);
 }
@@ -458,7 +550,7 @@ void wayland_surface_attach_shm(struct wayland_surface *surface,
                                 HRGN surface_damage_region)
 {
     RGNDATA *surface_damage;
-    int win_width, win_height;
+    int win_width, win_height, source_width, source_height;
 
     TRACE("surface=%p shm_buffer=%p (%dx%d)\n",
           surface, shm_buffer, shm_buffer->width, shm_buffer->height);
@@ -494,15 +586,20 @@ void wayland_surface_attach_shm(struct wayland_surface *surface,
      * is partially or completely outside of the wl_buffe.
      * 0 is also an invalid width / height value so use 1x1 instead.
      */
-    win_width = max(1, min(win_width, shm_buffer->width));
-    win_height = max(1, min(win_height, shm_buffer->height));
+    source_width = max(1, min(win_width, shm_buffer->width));
+    source_height = max(1, min(win_height, shm_buffer->height));
 
     wp_viewport_set_source(surface->wp_viewport, 0, 0,
-                           wl_fixed_from_int(win_width),
-                           wl_fixed_from_int(win_height));
+                           wl_fixed_from_int(source_width),
+                           wl_fixed_from_int(source_height));
 
+    /* content_width/height describe the logical destination configured by
+     * wayland_surface_reconfigure_size(), not the clamped buffer source.
+     * Otherwise every Vulkan present sees a false size mismatch and submits
+     * another decoration dummy buffer. */
     surface->content_width = win_width;
     surface->content_height = win_height;
+    surface->has_contents = TRUE;
 }
 
 /**********************************************************************
@@ -609,15 +706,18 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
 
     if (!IsRectEmpty(&rect))
     {
-        // PAD_MODE: 传递窗口在虚拟桌面中的位置，使 compositor 能正确合成
-        // surface->window.rect 是相对于虚拟桌面的屏幕坐标
-        // CW_USEDEFAULT (0x80000000) 会被 bounds check 过滤掉
+        /* desktop mode: forward screen coords; standalone: use (0,0) relative */
         int geo_x = 0, geo_y = 0;
-#ifdef PAD_MODE
-        if (surface->window.rect.left > -32768 && surface->window.rect.left < 32768)
-            geo_x = surface->window.rect.left;
-        if (surface->window.rect.top > -32768 && surface->window.rect.top < 32768)
-            geo_y = surface->window.rect.top;
+#ifdef __OHOS__
+        if (getenv("WINEHUA_DESKTOP_MODE") && atoi(getenv("WINEHUA_DESKTOP_MODE")))
+        {
+            if (surface->window.rect.left > WINEHUA_DESKTOP_COORD_MIN &&
+                surface->window.rect.left < WINEHUA_DESKTOP_COORD_MAX)
+                geo_x = surface->window.rect.left;
+            if (surface->window.rect.top > WINEHUA_DESKTOP_COORD_MIN &&
+                surface->window.rect.top < WINEHUA_DESKTOP_COORD_MAX)
+                geo_y = surface->window.rect.top;
+        }
 #endif
         xdg_surface_set_window_geometry(surface->xdg_surface,
                                         geo_x, geo_y,
@@ -790,7 +890,9 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
         if (!surface->xdg_surface) break; /* surface role has been cleared */
         if (!wayland_surface_reconfigure_xdg(surface, width, height)) return FALSE;
+#ifdef __OHOS__
         wayland_surface_update_min_max(surface);
+#endif
         break;
     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
         if (!surface->wl_subsurface) break; /* surface role has been cleared */
@@ -938,32 +1040,6 @@ err:
 }
 
 /***********************************************************************
- *           copy_rectangle_into_center_of_square
- *
- * Copies non-square rectangle src to the center of square dest.
- */
-static void copy_rectangle_into_center_of_square(const unsigned int *src,
-                                                 int src_w, int src_h,
-                                                 unsigned int *dest)
-{
-    int dest_length;
-
-    if (src_w > src_h)
-    {
-        dest += src_w * (src_w - src_h) / 2;
-        dest_length = src_w;
-    }
-    else
-    {
-        dest += (src_h - src_w) / 2;
-        dest_length = src_h;
-    }
-
-    for (int h = 0; h < src_h; h++, dest += dest_length, src += src_w)
-        memcpy(dest, src, src_w * 4);
-}
-
-/***********************************************************************
  *           wayland_shm_buffer_from_color_bitmaps
  *
  * Create a wayland_shm_buffer for a color bitmap.
@@ -971,8 +1047,7 @@ static void copy_rectangle_into_center_of_square(const unsigned int *src,
  * Adapted from wineandroid.drv code.
  */
 struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMAP color,
-                                                                 HBITMAP mask,
-                                                                 BOOL allow_padding)
+                                                                 HBITMAP mask)
 {
     struct wayland_shm_buffer *shm_buffer = NULL;
     char buffer[FIELD_OFFSET(BITMAPINFO, bmiColors[256])];
@@ -980,10 +1055,15 @@ struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMA
     BITMAP bm;
     unsigned int *ptr, *bits = NULL;
     unsigned char *mask_bits = NULL;
-    int i, j, square_length;
-    BOOL has_alpha = FALSE, use_padding = FALSE;
+    int i, j;
+    BOOL has_alpha = FALSE;
 
     if (!NtGdiExtGetObjectW(color, sizeof(bm), &bm)) goto failed;
+
+    shm_buffer = wayland_shm_buffer_create(bm.bmWidth, bm.bmHeight,
+                                           WL_SHM_FORMAT_ARGB8888);
+    if (!shm_buffer) goto failed;
+    bits = shm_buffer->map_data;
 
     info->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     info->bmiHeader.biWidth = bm.bmWidth;
@@ -996,24 +1076,6 @@ struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMA
     info->bmiHeader.biYPelsPerMeter = 0;
     info->bmiHeader.biClrUsed = 0;
     info->bmiHeader.biClrImportant = 0;
-
-    use_padding = allow_padding && bm.bmWidth != bm.bmHeight;
-
-    if (use_padding)
-    {
-        square_length = max(bm.bmWidth, bm.bmHeight);
-        shm_buffer = wayland_shm_buffer_create(square_length, square_length,
-                                               WL_SHM_FORMAT_ARGB8888);
-        if (!shm_buffer) goto failed;
-        if (!(bits = malloc(info->bmiHeader.biSizeImage))) goto failed;
-    }
-    else
-    {
-        shm_buffer = wayland_shm_buffer_create(bm.bmWidth, bm.bmHeight,
-                                               WL_SHM_FORMAT_ARGB8888);
-        if (!shm_buffer) goto failed;
-        bits = shm_buffer->map_data;
-    }
 
     if (!NtGdiGetDIBitsInternal(hdc, color, 0, bm.bmHeight, bits, info,
                                 DIB_RGB_COLORS, 0, 0))
@@ -1044,16 +1106,8 @@ struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMA
         free(mask_bits);
     }
 
-    if (use_padding)
-    {
-        copy_rectangle_into_center_of_square(bits, bm.bmWidth,
-                                             bm.bmHeight, shm_buffer->map_data);
-        free(bits);
-        bits = shm_buffer->map_data;
-    }
-
     /* Wayland requires pre-multiplied alpha values */
-    for (ptr = bits, i = 0; i < shm_buffer->width * shm_buffer->height; ptr++, i++)
+    for (ptr = bits, i = 0; i < bm.bmWidth * bm.bmHeight; ptr++, i++)
     {
         unsigned char alpha = *ptr >> 24;
         if (alpha == 0)
@@ -1073,7 +1127,6 @@ struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMA
 
 failed:
     if (shm_buffer) wayland_shm_buffer_unref(shm_buffer);
-    if (use_padding) free(bits);
     free(mask_bits);
     return NULL;
 }
@@ -1280,7 +1333,8 @@ static const struct wl_buffer_listener dummy_buffer_listener =
  * Ensure that the wayland surface has up-to-date contents, by committing
  * a dummy buffer if necessary.
  */
-void wayland_surface_ensure_contents(struct wayland_surface *surface)
+void wayland_surface_ensure_contents(struct wayland_surface *surface,
+                                     struct wayland_shm_buffer *window_contents)
 {
     struct wayland_shm_buffer *dummy_shm_buffer;
     HRGN damage;
@@ -1290,7 +1344,8 @@ void wayland_surface_ensure_contents(struct wayland_surface *surface)
     width = surface->window.rect.right - surface->window.rect.left;
     height = surface->window.rect.bottom - surface->window.rect.top;
     needs_contents = surface->window.visible &&
-                     (surface->content_width != width ||
+                     (!surface->has_contents ||
+                      surface->content_width != width ||
                       surface->content_height != height);
 
     TRACE("surface=%p hwnd=%p needs_contents=%d\n",
@@ -1310,6 +1365,15 @@ void wayland_surface_ensure_contents(struct wayland_surface *surface)
 
     if (!(damage = NtGdiCreateRectRgn(0, 0, width, height)))
         WARN("Failed to create damage region for dummy buffer\n");
+
+    /*
+     * The client subsurface covers only the Win32 client area. Preserve the
+     * latest GDI caption and borders while still attaching a correctly sized
+     * parent buffer. Skipping this attach leaves resize/configure state
+     * incomplete and can stall a Vulkan client after its first present.
+     */
+    if (damage && window_contents)
+        wayland_shm_buffer_copy(window_contents, dummy_shm_buffer, damage);
 
     if (wayland_surface_reconfigure(surface))
     {
@@ -1365,7 +1429,7 @@ void wayland_surface_set_icon_buffer(struct wayland_surface *surface, UINT type,
     TRACE("surface=%p type=%x ii=%p\n", surface, type, ii);
 
     hDC = NtGdiCreateCompatibleDC(0);
-    icon_buf = wayland_shm_buffer_from_color_bitmaps(hDC, ii->hbmColor, ii->hbmMask, TRUE);
+    icon_buf = wayland_shm_buffer_from_color_bitmaps(hDC, ii->hbmColor, ii->hbmMask);
     NtGdiDeleteObjectApp(hDC);
 
     if (surface->big_icon_buffer && type == ICON_BIG)

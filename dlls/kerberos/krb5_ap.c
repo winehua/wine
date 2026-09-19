@@ -24,6 +24,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winnls.h"
@@ -69,6 +70,7 @@ static const SecPkgInfoW infoW =
     kerberos_comment_W
 };
 
+static ULONG kerberos_package_id;
 static LSA_DISPATCH_TABLE lsa_dispatch;
 
 struct cred_handle
@@ -134,6 +136,7 @@ static NTSTATUS NTAPI kerberos_LsaApInitializePackage(ULONG package_id, PLSA_DIS
             ERR( "no Kerberos support, expect problems\n" );
     }
 
+    kerberos_package_id = package_id;
     lsa_dispatch = *dispatch;
 
     kerberos_name = lsa_dispatch.AllocateLsaHeap(sizeof(MICROSOFT_KERBEROS_NAME_A));
@@ -474,8 +477,7 @@ static NTSTATUS NTAPI kerberos_SpInitLsaModeContext( LSA_SEC_HANDLE credential, 
 {
     static const ULONG supported = ISC_REQ_CONFIDENTIALITY | ISC_REQ_INTEGRITY | ISC_REQ_SEQUENCE_DETECT |
                                    ISC_REQ_REPLAY_DETECT | ISC_REQ_MUTUAL_AUTH | ISC_REQ_USE_DCE_STYLE |
-                                   ISC_REQ_IDENTIFY | ISC_REQ_CONNECTION | ISC_REQ_DELEGATE | ISC_REQ_ALLOCATE_MEMORY |
-                                   ISC_REQ_EXTENDED_ERROR;
+                                   ISC_REQ_IDENTIFY | ISC_REQ_CONNECTION | ISC_REQ_DELEGATE | ISC_REQ_ALLOCATE_MEMORY;
     char *target = NULL;
     NTSTATUS status;
     ULONG exptime;

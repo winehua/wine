@@ -37,7 +37,7 @@ static const struct wined3d_parent_ops ddraw_view_wined3d_parent_ops;
 
 static BOOL surface_attachable_for_flip(struct ddraw_surface *surface)
 {
-    return surface->version == 1 && !surface->is_implicit
+    return surface->version == 1 && surface->is_root
             && !(surface->surface_desc.ddsCaps.dwCaps & (DDSCAPS_ZBUFFER | DDSCAPS_TEXTURE | DDSCAPS_OVERLAY));
 }
 
@@ -76,6 +76,7 @@ HRESULT ddraw_surface_update_frontbuffer(struct ddraw_surface *surface,
     struct wined3d_texture *dst_texture, *wined3d_texture;
     struct ddraw *ddraw = surface->ddraw;
     HDC surface_dc, screen_dc;
+    HWND dest_window = NULL;
     int x, y, w, h;
     HRESULT hr;
     BOOL ret;
@@ -177,7 +178,9 @@ HRESULT ddraw_surface_update_frontbuffer(struct ddraw_surface *surface,
     if (surface->palette)
         wined3d_palette_apply_to_dc(surface->palette->wined3d_palette, surface_dc);
 
-    if (!(screen_dc = GetDC(NULL)))
+    if (ddraw->cooperative_level & DDSCL_EXCLUSIVE && ddraw->dest_window)
+        dest_window = ddraw->dest_window;
+    if (!(screen_dc = GetDCEx(dest_window, NULL, DCX_WINDOW | DCX_CACHE)))
     {
         wined3d_texture_release_dc(wined3d_texture, surface->sub_resource_idx, surface_dc);
         ERR("Failed to get screen DC.\n");
@@ -191,7 +194,7 @@ HRESULT ddraw_surface_update_frontbuffer(struct ddraw_surface *surface,
         ret = BitBlt(screen_dc, x, y, w, h,
                 surface_dc, x, y, SRCCOPY);
 
-    ReleaseDC(NULL, screen_dc);
+    ReleaseDC(dest_window, screen_dc);
     wined3d_texture_release_dc(wined3d_texture, surface->sub_resource_idx, surface_dc);
 
     if (!ret)
@@ -603,7 +606,7 @@ static void ddraw_surface_cleanup(struct ddraw_surface *surface)
             break;
 
         surf = surface->complex_array[i];
-        while (surf && !surf->is_implicit && !surf->is_flip_chain_start)
+        while (surf && surf->is_root && !surf->is_chain_start)
         {
             if (FAILED(ddraw_surface_delete_attached_surface(surface, surf, surf->attached_iface)))
             {
@@ -616,7 +619,7 @@ static void ddraw_surface_cleanup(struct ddraw_surface *surface)
             continue;
 
         surface->complex_array[i] = NULL;
-        if (surf->is_implicit)
+        if (!surf->is_root)
         {
             struct ddraw_texture *texture = wined3d_texture_get_parent(surf->wined3d_texture);
             struct wined3d_device *wined3d_device = texture->wined3d_device;
@@ -666,7 +669,7 @@ static ULONG ddraw_surface_release_iface(struct ddraw_surface *This)
 
         /* Complex attached surfaces are destroyed implicitly when the root is released */
         wined3d_mutex_lock();
-        if (This->is_implicit)
+        if (!This->is_root)
         {
             WARN("(%p) Attempt to destroy a surface that is not a complex root\n", This);
             wined3d_mutex_unlock();
@@ -1668,7 +1671,14 @@ static HRESULT ddraw_surface_blt_clipped(struct ddraw_surface *dst_surface, cons
         SetRectEmpty(&src_rect);
     }
 
-    if (!dst_surface->clipper)
+    if (dst_surface->clipper && !ddraw_clipper_is_valid(dst_surface->clipper))
+    {
+        FIXME("Attempting to blit with an invalid clipper.\n");
+        return DDERR_INVALIDPARAMS;
+    }
+
+    if (!dst_surface->clipper || (dst_surface->ddraw->cooperative_level & DDSCL_EXCLUSIVE
+            && dst_surface->clipper->window))
     {
         if (src_surface && src_surface->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE)
             hr = ddraw_surface_update_frontbuffer(src_surface, &src_rect, TRUE, 0);
@@ -1678,12 +1688,6 @@ static HRESULT ddraw_surface_blt_clipped(struct ddraw_surface *dst_surface, cons
             hr = ddraw_surface_update_frontbuffer(dst_surface, &dst_rect, FALSE, 0);
 
         return hr;
-    }
-
-    if (!ddraw_clipper_is_valid(dst_surface->clipper))
-    {
-        FIXME("Attempting to blit with an invalid clipper.\n");
-        return DDERR_INVALIDPARAMS;
     }
 
     scale_x = (float)(src_rect.right - src_rect.left) / (float)(dst_rect.right - dst_rect.left);
@@ -1981,22 +1985,6 @@ static HRESULT WINAPI DECLSPEC_HOTPATCH ddraw_surface2_Blt(IDirectDrawSurface2 *
             src ? &src->IDirectDrawSurface_iface : NULL, src_rect, flags, fx);
 }
 
-static void surface_update_backbuffer_count(struct ddraw_surface *surface, int inc)
-{
-    struct ddraw_surface *s;
-
-    s = surface;
-    do
-    {
-        if (!s->is_implicit && s->surface_desc.dwFlags & DDSD_BACKBUFFERCOUNT)
-        {
-            s->surface_desc.dwBackBufferCount += inc;
-            break;
-        }
-        s = s->complex_array[0];
-    } while (s != surface);
-}
-
 /*****************************************************************************
  * IDirectDrawSurface7::AddAttachedSurface
  *
@@ -2018,10 +2006,9 @@ static void surface_update_backbuffer_count(struct ddraw_surface *surface, int i
  * the surface that the app requested, not the complex root. See
  * GetAttachedSurface for a description how surfaces are found.
  *
- * Attachments forming a flip chain can only be explicitly attached on ddraw
- * v1. That is implemented by inserting those into the complex_array[] chain
- * so that they appear the same way as implicitly created back buffers in the
- * attachment structure.
+ * Attachments forming flip chain can only be explicitly attached on ddraw v1. That
+ * is implemented by inserting those into complex_array chain so that appear
+ * the same way as auto created back buffers in the attachment structure.
  *
  * This is how the current implementation works, and it was coded by looking
  * at the needs of the applications.
@@ -2074,30 +2061,24 @@ static HRESULT ddraw_surface_attach_surface(struct ddraw_surface *This, struct d
             wined3d_mutex_unlock();
             return DDERR_CANNOTATTACHSURFACE;
         }
-        Surf->attach_saved_caps = Surf->surface_desc.ddsCaps.dwCaps & ~DDSCAPS_FRONTBUFFER;
-        Surf->is_flip_chain_start = 0;
         Surf->surface_desc.ddsCaps.dwCaps |= DDSCAPS_FLIP;
+        This->surface_desc.ddsCaps.dwCaps |= DDSCAPS_FLIP;
+        if (!(This->surface_desc.ddsCaps.dwCaps & (DDSCAPS_FRONTBUFFER | DDSCAPS_BACKBUFFER)))
+        {
+            This->surface_desc.ddsCaps.dwCaps |= DDSCAPS_FRONTBUFFER;
+            Surf->surface_desc.ddsCaps.dwCaps |= DDSCAPS_BACKBUFFER;
+            Surf->surface_desc.ddsCaps.dwCaps &= ~DDSCAPS_FRONTBUFFER;
+        }
         if (!This->complex_array[0])
-        {
-            This->is_flip_chain_start = 1;
-            This->complex_array[0] = Surf;
-            Surf->complex_array[0] = This;
-            This->attach_saved_caps = This->surface_desc.ddsCaps.dwCaps & ~DDSCAPS_FRONTBUFFER;
-            This->surface_desc.ddsCaps.dwCaps |= DDSCAPS_FLIP;
-            if (!(This->surface_desc.ddsCaps.dwCaps & (DDSCAPS_FRONTBUFFER | DDSCAPS_BACKBUFFER)))
-                This->surface_desc.ddsCaps.dwCaps |= DDSCAPS_FRONTBUFFER;
-
-            if (This->surface_desc.ddsCaps.dwCaps & DDSCAPS_BACKBUFFER)
-                Surf->surface_desc.ddsCaps.dwCaps |= DDSCAPS_FRONTBUFFER;
-            else
-                Surf->surface_desc.ddsCaps.dwCaps |= DDSCAPS_BACKBUFFER;
-        }
-        else
-        {
-            Surf->complex_array[0] = This->complex_array[0];
-            This->complex_array[0] = Surf;
-        }
-        surface_update_backbuffer_count(This, 1);
+            This->is_chain_start = 1;
+        Surf->is_chain_start = 0;
+        Surf->complex_array[0] = This->complex_array[0] ? This->complex_array[0] : This;
+        This->complex_array[0] = Surf;
+        Surf = This;
+        while (!Surf->is_chain_start)
+            Surf = Surf->complex_array[0];
+        if (Surf->surface_desc.dwFlags & DDSD_BACKBUFFERCOUNT)
+            ++Surf->surface_desc.dwBackBufferCount;
         wined3d_mutex_unlock();
         return DD_OK;
     }
@@ -2278,53 +2259,46 @@ static HRESULT ddraw_surface_delete_attached_surface(struct ddraw_surface *surfa
 
     TRACE("surface %p, attachment %p, detach_iface %p.\n", surface, attachment, detach_iface);
 
-    if (!attachment)
-        return DDERR_CANNOTDETACHSURFACE;
-
     wined3d_mutex_lock();
 
-    if (surface_attachable_for_flip(attachment))
+    if (attachment->surface_desc.ddsCaps.dwCaps & DDSCAPS_FLIP)
     {
-        struct ddraw_surface *next;
+        struct ddraw_surface *surf = surface;
+
         if (surface->version != 1 || surface->complex_array[0] != attachment)
         {
             WARN("backbuffer %p is not attached to %p.\n", attachment, surface);
             wined3d_mutex_unlock();
             return DDERR_SURFACENOTATTACHED;
         }
-        if (attachment->is_implicit || attachment->is_flip_chain_start)
+        if (!attachment->is_root || attachment->is_chain_start)
         {
             wined3d_mutex_unlock();
             WARN("trying to detach non-root attachment %p.\n", attachment);
             return DDERR_CANNOTDETACHSURFACE;
         }
         assert(attachment->complex_array[0]);
-        surface_update_backbuffer_count(surface, -1);
-        next = surface->complex_array[0] = attachment->complex_array[0];
-        if (next == surface)
-        {
-            surface->is_flip_chain_start = 0;
-            surface->complex_array[0] = NULL;
-            surface->surface_desc.ddsCaps.dwCaps = surface->attach_saved_caps;
-        }
-        else
-        {
-            next->surface_desc.ddsCaps.dwCaps &= ~(DDSCAPS_FRONTBUFFER | DDSCAPS_BACKBUFFER);
-            if (attachment->surface_desc.ddsCaps.dwCaps & DDSCAPS_FRONTBUFFER)
-            {
-                surface->surface_desc.ddsCaps.dwCaps |= DDSCAPS_BACKBUFFER;
-                next->surface_desc.ddsCaps.dwCaps |= DDSCAPS_FRONTBUFFER;
-            }
-            else
-            {
-                next->surface_desc.ddsCaps.dwCaps |= DDSCAPS_BACKBUFFER;
-            }
-        }
-        attachment->surface_desc.ddsCaps.dwCaps = attachment->attach_saved_caps;
+        while (!surf->is_chain_start)
+            surf = surf->complex_array[0];
+        if (surf->surface_desc.dwFlags & DDSD_BACKBUFFERCOUNT)
+            --surf->surface_desc.dwBackBufferCount;
+        surface->complex_array[0] = attachment->complex_array[0];
+        attachment->surface_desc.ddsCaps.dwCaps &= ~DDSCAPS_FLIP;
         attachment->complex_array[0] = NULL;
         IUnknown_Release(detach_iface);
-        attachment->attached_iface = NULL;
+        if (surface->complex_array[0] == surface)
+        {
+            attachment->surface_desc.ddsCaps.dwCaps &= ~(DDSCAPS_FRONTBUFFER | DDSCAPS_BACKBUFFER);
+            surface->is_chain_start = 0;
+            surface->complex_array[0] = NULL;
+            surface->surface_desc.ddsCaps.dwCaps &= ~DDSCAPS_FLIP;
+        }
+        else if (!(surface->complex_array[0]->surface_desc.ddsCaps.dwCaps & (DDSCAPS_FRONTBUFFER | DDSCAPS_BACKBUFFER)))
+        {
+            surface->complex_array[0]->surface_desc.ddsCaps.dwCaps |= DDSCAPS_BACKBUFFER;
+        }
 
+        attachment->attached_iface = NULL;
         wined3d_mutex_unlock();
         return DD_OK;
     }
@@ -2799,9 +2773,9 @@ static HRESULT WINAPI ddraw_surface7_GetPriority(IDirectDrawSurface7 *iface, DWO
         WARN("Called on offscreenplain surface, returning DDERR_INVALIDOBJECT.\n");
         hr = DDERR_INVALIDOBJECT;
     }
-    else if (!(surface->surface_desc.ddsCaps.dwCaps2 & managed) || surface->is_implicit)
+    else if (!(surface->surface_desc.ddsCaps.dwCaps2 & managed) || !surface->is_root)
     {
-        WARN("Called on non-managed texture implicit surface, returning DDERR_INVALIDPARAMS.\n");
+        WARN("Called on non-managed texture or non-root surface, returning DDERR_INVALIDPARAMS.\n");
         hr = DDERR_INVALIDPARAMS;
     }
     else
@@ -4781,13 +4755,11 @@ static HRESULT WINAPI ddraw_surface7_SetClipper(IDirectDrawSurface7 *iface,
     if (old_clipper && ddraw_clipper_is_valid(old_clipper))
         IDirectDrawClipper_Release(&old_clipper->IDirectDrawClipper_iface);
 
-    if ((This->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE) && This->ddraw->wined3d_swapchain
-            && !(This->ddraw->cooperative_level & DDSCL_EXCLUSIVE))
+    if ((This->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE) && This->ddraw->wined3d_swapchain)
     {
         clipWindow = NULL;
-        if(clipper) {
+        if (clipper && !(This->ddraw->cooperative_level & DDSCL_EXCLUSIVE))
             IDirectDrawClipper_GetHWnd(iclipper, &clipWindow);
-        }
 
         if (clipWindow)
         {
@@ -4800,7 +4772,6 @@ static HRESULT WINAPI ddraw_surface7_SetClipper(IDirectDrawSurface7 *iface,
             ddraw_set_swapchain_window(This->ddraw, This->ddraw->dest_window);
         }
     }
-
     wined3d_mutex_unlock();
 
     return DD_OK;
@@ -5313,7 +5284,7 @@ static HRESULT ddraw_surface_set_color_key(struct ddraw_surface *surface, DWORD 
         }
     }
 
-    if (!surface->is_implicit)
+    if (surface->is_root)
         hr = ddraw_surface_set_wined3d_textures_colour_key(surface, flags,
                 color_key ? (struct wined3d_color_key *)&fixed_color_key : NULL);
 
@@ -5514,6 +5485,15 @@ static HRESULT WINAPI ddraw_gamma_control_SetGammaRamp(IDirectDrawGammaControl *
     {
         WARN("Invalid gamma_ramp passed.\n");
         return DDERR_INVALIDPARAMS;
+    }
+
+    {
+        const char *sgi = getenv("SteamGameId");
+        if (sgi && !strcmp(sgi, "3600700"))
+        {
+            FIXME("HACK: not applying gamma.\n");
+            return DD_OK;
+        }
     }
 
     wined3d_mutex_lock();
@@ -6257,7 +6237,6 @@ static void ddraw_surface_init(struct ddraw_surface *surface, struct ddraw *ddra
     surface->iface_count = 1;
     surface->version = version;
     surface->ddraw = ddraw;
-    surface->is_implicit = 1;
 
     if (version == 7)
     {
@@ -6348,11 +6327,9 @@ static HRESULT ddraw_surface_reserve_memory(struct wined3d_texture *wined3d_text
     return hr;
 }
 
-static bool is_render_target(struct ddraw *ddraw, DWORD caps, unsigned int surface_version)
+static BOOL force_3ddevice(struct ddraw *ddraw, const DDSURFACEDESC2 *desc, unsigned int surface_version)
 {
-    if (caps & DDSCAPS_3DDEVICE)
-        return true;
-    return surface_version == 1 && caps & DDSCAPS_PRIMARYSURFACE && !(ddraw->flags & DDRAW_NO3D);
+    return surface_version == 1 && desc->ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE && !(ddraw->flags & DDRAW_NO3D);
 }
 
 static void wined3d_resource_desc_from_ddraw(struct ddraw *ddraw,
@@ -6360,6 +6337,9 @@ static void wined3d_resource_desc_from_ddraw(struct ddraw *ddraw,
 {
     DWORD caps = desc->ddsCaps.dwCaps;
     const DWORD caps2 = desc->ddsCaps.dwCaps2;
+
+    if (force_3ddevice(ddraw, desc, version))
+        caps |= DDSCAPS_3DDEVICE;
 
     wined3d_desc->resource_type = WINED3D_RTYPE_TEXTURE_2D;
     wined3d_desc->format = wined3dformat_from_ddrawformat(&desc->ddpfPixelFormat);
@@ -6378,7 +6358,7 @@ static void wined3d_resource_desc_from_ddraw(struct ddraw *ddraw,
     wined3d_desc->bind_flags |= WINED3D_BIND_SHADER_RESOURCE;
     if (caps & DDSCAPS_ZBUFFER)
         wined3d_desc->bind_flags |= WINED3D_BIND_DEPTH_STENCIL;
-    else if (is_render_target(ddraw, caps, version))
+    else if (caps & DDSCAPS_3DDEVICE)
         wined3d_desc->bind_flags |= WINED3D_BIND_RENDER_TARGET;
 
     if ((caps & DDSCAPS_SYSTEMMEMORY) && !(caps2 & (DDSCAPS2_TEXTUREMANAGE | DDSCAPS2_D3DTEXTUREMANAGE)))
@@ -6396,7 +6376,7 @@ static void wined3d_resource_desc_from_ddraw(struct ddraw *ddraw,
         else if (caps & DDSCAPS_VIDEOMEMORY)
         {
             /* Dynamic resources can't be written by the GPU. */
-            if (!(caps & DDSCAPS_ZBUFFER) && !is_render_target(ddraw, caps, version))
+            if (!(caps & (DDSCAPS_3DDEVICE | DDSCAPS_ZBUFFER)))
                 wined3d_desc->usage |= WINED3DUSAGE_DYNAMIC;
         }
     }
@@ -7004,7 +6984,7 @@ HRESULT ddraw_surface_create(struct ddraw *ddraw, const DDSURFACEDESC2 *surface_
 
             if (desc->ddsCaps.dwCaps & DDSCAPS_ZBUFFER)
                 bind_flags |= WINED3D_BIND_DEPTH_STENCIL;
-            else if (is_render_target(ddraw, desc->ddsCaps.dwCaps, version))
+            else if ((desc->ddsCaps.dwCaps & DDSCAPS_3DDEVICE) || force_3ddevice(ddraw, desc, version))
                 bind_flags |= WINED3D_BIND_RENDER_TARGET;
 
             if (!(ddraw->flags & DDRAW_NO3D) && SUCCEEDED(hr = wined3d_check_device_format(ddraw->wined3d,
@@ -7127,14 +7107,14 @@ HRESULT ddraw_surface_create(struct ddraw *ddraw, const DDSURFACEDESC2 *surface_
     }
 
     root = texture->root;
-    root->is_implicit = 0;
+    root->is_root = TRUE;
 
     if (desc->dwFlags & DDSD_BACKBUFFERCOUNT)
     {
         unsigned int count = desc->dwBackBufferCount;
         struct ddraw_surface *last = root;
 
-        root->is_flip_chain_start = 1;
+        root->is_chain_start = 1;
         attach = &last->complex_array[0];
         for (i = 0; i < count; ++i)
         {

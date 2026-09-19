@@ -23,6 +23,7 @@
 #include <math.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winternl.h"
@@ -45,6 +46,9 @@
 
 #include "wine/debug.h"
 #include "wine/hid.h"
+
+#define VID_LOGITECH 0x046D
+#define PID_LOGITECH_G920 0xC262
 
 WINE_DEFAULT_DEBUG_CHANNEL(dinput);
 
@@ -144,6 +148,7 @@ static HRESULT insert_cache_entry( DIDEVICEINSTANCEW *instance, DWORD joy_id, co
                    debugstr_w( path ), next->joy_id );
             next->instance = *instance;
             wcscpy( next->path, path );
+            CharLowerW( next->path );
             return S_OK;
         }
     }
@@ -416,6 +421,8 @@ struct pid_effect_state
 struct hid_joystick
 {
     struct dinput_device base;
+    BOOL wgi_device;
+    BOOL is_gamepad;
 
     HANDLE device;
     OVERLAPPED read_ovl;
@@ -788,6 +795,8 @@ static BOOL enum_objects( struct hid_joystick *impl, const DIPROPHEADER *filter,
     struct hid_collection_node *node, *node_end;
     WORD version = impl->base.dinput->dwVersion;
     BOOL ret, seen_axis[6] = {0};
+    const GUID *hack_guid;
+    const WCHAR *hack_name;
     const WCHAR *tmp;
 
     button_ofs += impl->caps.NumberInputValueCaps * sizeof(LONG);
@@ -807,6 +816,8 @@ static BOOL enum_objects( struct hid_joystick *impl, const DIPROPHEADER *filter,
             value_ofs += (caps->usage_max - caps->usage_min + 1) * sizeof(LONG);
         else for (j = caps->usage_min; j <= caps->usage_max; ++j)
         {
+            hack_name = NULL;
+            hack_guid = NULL;
             instance.dwOfs = value_ofs;
             switch (MAKELONG(j, caps->usage_page))
             {
@@ -816,7 +827,38 @@ static BOOL enum_objects( struct hid_joystick *impl, const DIPROPHEADER *filter,
             case MAKELONG(HID_USAGE_GENERIC_RX, HID_USAGE_PAGE_GENERIC):
             case MAKELONG(HID_USAGE_GENERIC_RY, HID_USAGE_PAGE_GENERIC):
             case MAKELONG(HID_USAGE_GENERIC_RZ, HID_USAGE_PAGE_GENERIC):
-                set_axis_type( &instance, seen_axis, j - HID_USAGE_GENERIC_X, &axis );
+                if (!impl->wgi_device && impl->attrs.VendorID == VID_LOGITECH && impl->attrs.ProductID == PID_LOGITECH_G920)
+                {
+                    if (j == HID_USAGE_GENERIC_X)
+                    {
+                        set_axis_type( &instance, seen_axis, 0, &axis );
+                        hack_guid = &GUID_XAxis;
+                        hack_name = L"Wheel axis";
+                    }
+                    else if (j == HID_USAGE_GENERIC_Y)
+                    {
+                        set_axis_type( &instance, seen_axis, 2, &axis );
+                        hack_guid = &GUID_YAxis;
+                        hack_name = L"Accelerator";
+                    }
+                    else if (j == HID_USAGE_GENERIC_Z)
+                    {
+                        set_axis_type( &instance, seen_axis, 5, &axis );
+                        hack_guid = &GUID_RzAxis;
+                        hack_name = L"Brake";
+                    }
+                    else if (j == HID_USAGE_GENERIC_RZ)
+                    {
+                        instance.dwType = DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE( 6 + axis++ );
+                        hack_guid = &GUID_Slider;
+                        hack_name = L"Clutch";
+                    }
+                    else WARN("unknown axis usage page %x usage %lx for Logitech G920\n", caps->usage_page, j);
+                }
+                else
+                {
+                    set_axis_type( &instance, seen_axis, j - HID_USAGE_GENERIC_X, &axis );
+                }
                 instance.dwFlags = DIDOI_ASPECTPOSITION;
                 break;
             case MAKELONG(HID_USAGE_SIMULATION_STEERING, HID_USAGE_PAGE_SIMULATION):
@@ -853,12 +895,16 @@ static BOOL enum_objects( struct hid_joystick *impl, const DIPROPHEADER *filter,
             }
             instance.wUsagePage = caps->usage_page;
             instance.wUsage = j;
-            instance.guidType = *object_usage_to_guid( instance.wUsagePage, instance.wUsage );
+            if (hack_guid)
+                instance.guidType = *hack_guid;
+            else
+                instance.guidType = *object_usage_to_guid( instance.wUsagePage, instance.wUsage );
             instance.wReportId = caps->report_id;
             instance.wCollectionNumber = caps->link_collection;
             instance.dwDimension = caps->units;
             instance.wExponent = caps->units_exp;
-            if ((tmp = object_usage_to_string( &instance ))) lstrcpynW( instance.tszName, tmp, MAX_PATH );
+            if (hack_name) lstrcpynW( instance.tszName, hack_name, MAX_PATH );
+            else if ((tmp = object_usage_to_string( &instance ))) lstrcpynW( instance.tszName, tmp, MAX_PATH );
             else swprintf( instance.tszName, MAX_PATH, L"Unknown %u", DIDFT_GETINSTANCE( instance.dwType ) );
             check_pid_effect_axis_caps( impl, &instance );
             ret = enum_object( impl, filter, flags, callback, object, caps, &instance, data );
@@ -1057,6 +1103,16 @@ static HRESULT hid_joystick_get_property( IDirectInputDevice8W *iface, DWORD pro
     {
         DIPROPGUIDANDPATH *value = (DIPROPGUIDANDPATH *)header;
         value->guidClass = GUID_DEVCLASS_HIDCLASS;
+
+        /* CW-Bug-Id: #23185 Emulate Steam Input native hooks for native SDL */
+        if (impl->attrs.VendorID == 0x28de && impl->attrs.ProductID == 0x11ff)
+        {
+            const WCHAR *tmp;
+            if ((tmp = wcschr( impl->device_path, '#' ))) tmp = wcschr( tmp + 1, '#' );
+            lstrcpynW( value->wszPath, impl->device_path, tmp - impl->device_path + 1 );
+            return DI_OK;
+        }
+
         lstrcpynW( value->wszPath, impl->device_path, MAX_PATH );
         return DI_OK;
     }
@@ -1370,6 +1426,7 @@ struct parse_device_state_params
 {
     BYTE old_state[DEVICE_STATE_MAX_SIZE];
     BYTE buttons[128];
+    BOOL reset_state;
     DWORD time;
     DWORD seq;
 };
@@ -1385,6 +1442,8 @@ static BOOL check_device_state_button( struct dinput_device *device, UINT index,
 
     value = params->buttons[instance->wUsage - 1];
     old_value = params->old_state[instance->dwOfs];
+    if (params->reset_state) value = 0;
+
     device->device_state[instance->dwOfs] = value;
     if (old_value != value) queue_event( iface, index, value, params->time, params->seq );
 
@@ -1470,6 +1529,23 @@ static BOOL read_device_state_value( struct dinput_device *device, UINT index, s
     if (instance->dwType & DIDFT_AXIS) value = scale_axis_value( logical_value, properties );
     else value = scale_value( logical_value, properties );
 
+    if (params->reset_state)
+    {
+        if (instance->dwType & DIDFT_POV) value = -1;
+        else if (instance->dwType & DIDFT_AXIS)
+        {
+            if (!properties->range_min)
+            {
+                if (impl->is_gamepad && instance->wUsagePage == HID_USAGE_PAGE_GENERIC &&
+                        (instance->wUsage == HID_USAGE_GENERIC_Z || instance->wUsage == HID_USAGE_GENERIC_RZ))
+                    value = properties->range_min;
+                else
+                    value = properties->range_max / 2;
+            }
+            else value = round( (properties->range_min + properties->range_max) / 2.0 );
+        }
+    }
+
     old_value = *(LONG *)(params->old_state + instance->dwOfs);
     *(LONG *)(impl->base.device_state + instance->dwOfs) = value;
     if (old_value != value) queue_event( iface, index, value, params->time, params->seq );
@@ -1498,6 +1574,11 @@ static HRESULT hid_joystick_read( IDirectInputDevice8W *iface )
     BOOL ret;
 
     ret = GetOverlappedResult( impl->device, &impl->read_ovl, &count, FALSE );
+
+    if (WaitForSingleObject(steam_overlay_event, 0) == WAIT_OBJECT_0) /* steam overlay is enabled */
+        params.reset_state = TRUE;
+    else
+        params.reset_state = FALSE;
 
     EnterCriticalSection( &impl->base.crit );
     while (ret)
@@ -1844,6 +1925,9 @@ static HRESULT hid_joystick_device_try_open( WCHAR *path, HANDLE *device, PHIDP_
         type |= (DI8DEVTYPEFLIGHT_STICK << 8);
         break;
     }
+
+    if (attrs->VendorID == VID_LOGITECH && attrs->ProductID == PID_LOGITECH_G920)
+        type = DI8DEVTYPE_DRIVING | (DI8DEVTYPEDRIVING_DUALPEDALS << 8);
 
     instance->dwDevType = device_type_for_version( type, version ) | DIDEVTYPE_HID;
     TRACE("detected device type %#lx\n", instance->dwDevType);
@@ -2266,6 +2350,16 @@ static BOOL init_pid_caps( struct dinput_device *device, UINT index, struct hid_
     return DIENUM_CONTINUE;
 }
 
+static BOOL hid_joystick_is_gamepad(DWORD type, DWORD version)
+{
+    const DWORD joystick_type = DIDEVTYPE_JOYSTICK | (DIDEVTYPEJOYSTICK_GAMEPAD << 8) | DIDEVTYPE_HID;
+
+    if (version >= 0x0800)
+        return (GET_DIDEVICE_TYPE(type) == DI8DEVTYPE_GAMEPAD);
+
+    return type == joystick_type;
+}
+
 HRESULT hid_joystick_create_device( struct dinput *dinput, const GUID *guid, IDirectInputDevice8W **out )
 {
     static const DIPROPHEADER filter =
@@ -2305,6 +2399,7 @@ HRESULT hid_joystick_create_device( struct dinput *dinput, const GUID *guid, IDi
     impl->base.dwCoopLevel = DISCL_NONEXCLUSIVE | DISCL_BACKGROUND;
     impl->base.read_event = CreateEventW( NULL, TRUE, FALSE, NULL );
     wcscpy( impl->device_path, device_path );
+    impl->wgi_device = !memcmp( device_path_guid.Data4, guid->Data4, sizeof(device_path_guid.Data4) );
 
     hr = hid_joystick_device_try_open( impl->device_path, &impl->device, &impl->preparsed, &attrs,
                                        &impl->caps, &impl->base.instance, dinput->dwVersion );
@@ -2312,6 +2407,7 @@ HRESULT hid_joystick_create_device( struct dinput *dinput, const GUID *guid, IDi
 
     impl->base.instance.guidInstance = instance.guidInstance; /* use the instance GUID from the cache */
     impl->base.caps.dwDevType = impl->base.instance.dwDevType;
+    impl->is_gamepad = hid_joystick_is_gamepad(impl->base.caps.dwDevType, dinput->dwVersion);
     impl->attrs = attrs;
     list_init( &impl->effect_list );
 

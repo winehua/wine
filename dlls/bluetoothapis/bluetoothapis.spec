@@ -34,7 +34,7 @@
 @ stub BluetoothGATTAbortReliableWrite
 @ stub BluetoothGATTBeginReliableWrite
 @ stub BluetoothGATTEndReliableWrite
-@ stdcall BluetoothGATTGetCharacteristicValue(ptr ptr long ptr ptr long)
+@ stub BluetoothGATTGetCharacteristicValue
 @ stdcall BluetoothGATTGetCharacteristics(ptr ptr long ptr ptr long)
 @ stub BluetoothGATTGetDescriptorValue
 @ stub BluetoothGATTGetDescriptors

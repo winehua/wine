@@ -39,6 +39,8 @@ SOURCES = \
 	menu.c \
 	message.c \
 	opengl.c \
+	opengl_diag.c \
+	winehua_gl_proc_trace.c \
 	opentype.c \
 	painting.c \
 	palette.c \

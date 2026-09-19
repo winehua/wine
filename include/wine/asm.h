@@ -109,27 +109,24 @@
 #define __ASM_GLOBAL_FUNC(name,code) __ASM_DEFINE_FUNC(__ASM_NAME(#name),code)
 
 #ifdef _WIN64
-#define __ASM_DEFINE_POINTER(sec,decl,value)  \
+#define __ASM_GLOBAL_POINTER(name,value) \
     __ASM_BLOCK_BEGIN(__LINE__) \
-    asm( sec "\n\t" \
+    asm( ".data\n\t" \
          ".balign 8\n\t" \
-         decl \
+         __ASM_GLOBL(name) "\n\t" \
          ".quad " value "\n\t" \
-         ".text" ); \
+         ".text" );
     __ASM_BLOCK_END
 #else
-#define __ASM_DEFINE_POINTER(sec,decl,value)  \
+#define __ASM_GLOBAL_POINTER(name,value) \
     __ASM_BLOCK_BEGIN(__LINE__) \
-    asm( sec "\n\t" \
+    asm( ".data\n\t" \
          ".balign 4\n\t" \
-         decl \
+         __ASM_GLOBL(name) "\n\t" \
          ".long " value "\n\t" \
-         ".text" ); \
+         ".text" );
     __ASM_BLOCK_END
 #endif
-
-#define __ASM_GLOBAL_POINTER(name,value) __ASM_DEFINE_POINTER(".data",__ASM_GLOBL(name) "\n\t",value)
-#define __ASM_SECTION_POINTER(sec,value) __ASM_DEFINE_POINTER(sec,"",__ASM_NAME(#value))
 
 /* import variables */
 

@@ -29,6 +29,7 @@
 #include "config.h"
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "macdrv.h"
 #include "winuser.h"
 #include "shellapi.h"
@@ -578,8 +579,8 @@ static CPTABLEINFO *get_ansi_cp(void)
     static CPTABLEINFO cp;
     if (!cp.CodePage)
     {
-        if (RtlGetCurrentPeb()->AnsiCodePageData)
-            RtlInitCodePageTable(RtlGetCurrentPeb()->AnsiCodePageData, &cp);
+        if (NtCurrentTeb()->Peb->AnsiCodePageData)
+            RtlInitCodePageTable(NtCurrentTeb()->Peb->AnsiCodePageData, &cp);
         else
             RtlInitCodePageTable(utf8_hdr, &cp);
     }

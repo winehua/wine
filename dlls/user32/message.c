@@ -20,6 +20,7 @@
  */
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "user_private.h"
 #include "controls.h"
 #include "dde.h"
@@ -671,7 +672,7 @@ BOOL WINAPI InSendMessage(void)
  */
 DWORD WINAPI InSendMessageEx( LPVOID reserved )
 {
-    return NtUserGetThreadState( UserThreadStateInSendMessage );
+    return NtUserGetThreadInfo()->receive_flags;
 }
 
 
@@ -894,6 +895,34 @@ LRESULT WINAPI DECLSPEC_HOTPATCH DispatchMessageW( const MSG* msg )
 
 
 /***********************************************************************
+ *		GetMessagePos (USER.119)
+ *		GetMessagePos (USER32.@)
+ *
+ * The GetMessagePos() function returns a long value representing a
+ * cursor position, in screen coordinates, when the last message
+ * retrieved by the GetMessage() function occurs. The x-coordinate is
+ * in the low-order word of the return value, the y-coordinate is in
+ * the high-order word. The application can use the MAKEPOINT()
+ * macro to obtain a POINT structure from the return value.
+ *
+ * For the current cursor position, use GetCursorPos().
+ *
+ * RETURNS
+ *
+ * Cursor position of last message on success, zero on failure.
+ *
+ * CONFORMANCE
+ *
+ * ECMA-234, Win32
+ *
+ */
+DWORD WINAPI GetMessagePos(void)
+{
+    return NtUserGetThreadInfo()->message_pos;
+}
+
+
+/***********************************************************************
  *		GetMessageTime (USER.120)
  *		GetMessageTime (USER32.@)
  *
@@ -921,6 +950,18 @@ LONG WINAPI GetMessageTime(void)
 LPARAM WINAPI GetMessageExtraInfo(void)
 {
     return NtUserGetThreadState( UserThreadStateExtraInfo );
+}
+
+
+/***********************************************************************
+ *		SetMessageExtraInfo (USER32.@)
+ */
+LPARAM WINAPI SetMessageExtraInfo(LPARAM lParam)
+{
+    struct ntuser_thread_info *thread_info = NtUserGetThreadInfo();
+    LONG old_value = thread_info->message_extra;
+    thread_info->message_extra = lParam;
+    return old_value;
 }
 
 

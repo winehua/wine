@@ -2807,8 +2807,7 @@ static void STDMETHODCALLTYPE d2d_effect_SetInput(ID2D1Effect *iface, UINT32 ind
     if (index >= effect->input_count)
         return;
 
-    if (input)
-        ID2D1Image_AddRef(input);
+    ID2D1Image_AddRef(input);
     if (effect->inputs[index])
         ID2D1Image_Release(effect->inputs[index]);
     effect->inputs[index] = input;

@@ -30,7 +30,7 @@
 @ stub MFCreateByteCacheFile
 @ stub MFCreateCacheManager
 @ stub MFCreateCredentialCache
-@ stdcall MFCreateDeviceSource(ptr ptr)
+@ stub MFCreateDeviceSource
 @ stub MFCreateDeviceSourceActivate
 @ stub MFCreateDrmNetNDSchemePlugin
 @ stub MFCreateFileBlockMap

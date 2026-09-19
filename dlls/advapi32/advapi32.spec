@@ -25,7 +25,7 @@
 @ stdcall -import AddAuditAccessAce(ptr long long ptr long long)
 @ stdcall -import AddAuditAccessAceEx(ptr long long long ptr long long)
 @ stdcall -import AddAuditAccessObjectAce(ptr long long long ptr ptr ptr long long)
-@ stdcall AddConditionalAce(ptr long long long long ptr wstr ptr)
+# @ stub AddConditionalAce
 @ stdcall -import AddMandatoryAce(ptr long long long ptr)
 # @ stub AddUsersToEncryptedFile
 # @ stub AddUsersToEncryptedFileEx
@@ -726,7 +726,7 @@
 # @ stub SaferiChangeRegistryScope
 # @ stub SaferiCompareTokenLevels
 # @ stub SaferiIsDllAllowed
-@ stdcall SaferiIsExecutableFileType(wstr long)
+# @ stub SaferiIsExecutableFileType
 # @ stub SaferiPopulateDefaultsInRegistry
 # @ stub SaferiRecordEventLogEntry
 # @ stub SaferiReplaceProcessThreadTokens
@@ -837,7 +837,7 @@
 # @ stub UsePinForEncryptedFilesW
 # @ stub WaitServiceState
 @ stub WdmWmiServiceMain
-@ stdcall WmiCloseBlock(long)
+@ stub WmiCloseBlock
 # @ stub WmiCloseTraceWithCursor
 # @ stub WmiConvertTimestamp
 # @ stub WmiDevInstToInstanceNameA

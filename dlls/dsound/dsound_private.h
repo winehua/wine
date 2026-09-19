@@ -32,7 +32,7 @@
 
 #include "wine/list.h"
 
-#define DS_MAX_CHANNELS 8
+#define DS_MAX_CHANNELS 6
 
 extern int ds_hel_buflen;
 
@@ -70,13 +70,14 @@ typedef struct DSFilter {
  */
 struct DirectSoundDevice
 {
+    LONG                        ref;
+
     GUID                        guid;
     DSCAPS                      drvcaps;
     DWORD                       priolevel, sleeptime;
     PWAVEFORMATEX               pwfx, primary_pwfx;
     LPBYTE                      buffer;
     DWORD                       writelead, buflen, ac_frames, frag_frames, playpos, pad, stopped;
-    LONG                        terminated;
     int                         nrofbuffers;
     IDirectSoundBufferImpl**    buffers;
     SRWLOCK                     buffer_list_lock;
@@ -105,6 +106,7 @@ struct DirectSoundDevice
     IAudioRenderClient *render;
 
     HANDLE sleepev, thread;
+    struct list entry;
 };
 
 /* reference counted buffer memory for duplicated buffer memory */
@@ -144,9 +146,11 @@ struct IDirectSoundBufferImpl
     DSVOLUMEPAN                 volpan;
     DSBUFFERDESC                dsbd;
     /* used for frequency conversion (PerfectPitch) */
+    ULONG                       freqneeded;
+    DWORD                       firstep;
     float                       firgain;
-    DWORD                       freqAdjustNum,freqAdjustDen;
-    DWORD                       freqAccNum;
+    LONG64                      freqAdjustNum,freqAdjustDen;
+    LONG64                      freqAccNum;
     /* used for mixing */
     DWORD                       sec_mixpos;
     /* Holds a copy of the next 'writelead' bytes, to be used for mixing. This makes it
@@ -182,6 +186,10 @@ void put_stereo2surround51(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD c
 void put_surround512stereo(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
 void put_surround712stereo(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
 void put_quad2stereo(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
+void put_stereo2surround71(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
+void put_mono2surround71(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
+void put_quad2surround71(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
+void put_surround512surround71(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
 
 HRESULT secondarybuffer_create(DirectSoundDevice *device, const DSBUFFERDESC *dsbd,
         IDirectSoundBuffer **buffer);
@@ -205,7 +213,6 @@ HRESULT IKsPrivatePropertySetImpl_Create(REFIID riid, void **ppv);
 HRESULT DSOUND_Create(REFIID riid, void **ppv);
 HRESULT DSOUND_Create8(REFIID riid, void **ppv);
 HRESULT IDirectSoundImpl_Create(IUnknown *outer_unk, REFIID riid, void **ppv, BOOL has_ds8);
-void DSOUND_ParseSpeakerConfig(DirectSoundDevice *device);
 
 /* primary.c */
 
@@ -248,6 +255,9 @@ HRESULT IDirectSoundCaptureImpl_Create(IUnknown *outer_unk, REFIID riid, void **
 #define STATE_PLAYING   2
 #define STATE_CAPTURING 2
 #define STATE_STOPPING  3
+
+extern CRITICAL_SECTION DSOUND_renderers_lock;
+extern struct list DSOUND_renderers;
 
 extern GUID *DSOUND_renderer_guids;
 extern GUID *DSOUND_capture_guids;

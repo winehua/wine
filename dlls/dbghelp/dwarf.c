@@ -792,7 +792,7 @@ static BOOL dwarf2_fill_in_variant(struct module *module, VARIANT *v, const stru
         return FALSE;
     }
     /* native always stores in the shortest format in variant */
-    if (bt == btChar || bt == btInt || bt == btLong || bt == btBool)
+    if (bt == btChar || bt == btInt || bt == btLong)
     {
         if (sinteger == (signed char)sinteger)
         {
@@ -2449,7 +2449,7 @@ static struct symt* dwarf2_parse_subprogram(dwarf2_debug_info_t* di)
         return NULL;
     }
 
-    subpgm.top_func = symt_new_function(di->unit_ctx->module_ctx->module, symt_ptr_to_symref(&di->unit_ctx->compiland->symt),
+    subpgm.top_func = symt_new_function(di->unit_ctx->module_ctx->module, di->unit_ctx->compiland,
                                         dwarf2_get_cpp_name(di, name.u.string),
                                         addr_ranges[0].low, addr_ranges[0].high - addr_ranges[0].low,
                                         symt_ptr_to_symref(dwarf2_parse_subroutine_type(di)), 0);
@@ -3063,7 +3063,7 @@ static BOOL dwarf2_parse_compilation_unit(dwarf2_parse_context_t* ctx)
             ctx->language = language.u.uvalue;
 
             tmp = source_build_path(comp_dir.u.string, name.u.string);
-            ctx->compiland = symt_new_compiland(ctx->module_ctx->module, symt_ptr_to_symref(&ctx->module_ctx->module->top->symt), tmp);
+            ctx->compiland = symt_new_compiland(ctx->module_ctx->module, tmp);
             HeapFree(GetProcessHeap(), 0, tmp);
             ctx->compiland->address = ctx->module_ctx->load_offset + low_pc.u.uvalue;
             dwarf2_cache_cuhead(ctx->module_ctx->module, ctx->module_ctx->module->format_info[DFI_DWARF]->u.dwarf2_info, ctx->compiland, &ctx->head);

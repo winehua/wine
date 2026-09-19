@@ -104,6 +104,7 @@ classes[] =
     {L"ComboBoxEx32", COMBOEX_Register},
     {L"ComboLBox", COMBOLBOX_Register},
     {L"Edit", EDIT_Register},
+    {L"flatsb_class32", FLATSB_Register},
     {L"ListBox", LISTBOX_Register},
     {L"msctls_hotkey32", HOTKEY_Register},
     {L"msctls_progress32", PROGRESS_Register},
@@ -127,6 +128,7 @@ classes[] =
     {L"tooltips_class32", TOOLTIPS_Register},
 #else
     {L"ComboBoxEx32", COMBOEX_Register},
+    {L"flatsb_class32", FLATSB_Register},
     {L"msctls_hotkey32", HOTKEY_Register},
     {L"msctls_progress32", PROGRESS_Register},
     {L"msctls_statusbar32", STATUS_Register},
@@ -164,7 +166,7 @@ static void unregister_classes(void)
     }
 }
 
-BOOLEAN WINAPI RegisterClassNameW(const WCHAR *class)
+BOOL WINAPI RegisterClassNameW(const WCHAR *class)
 {
     int min = 0, max = ARRAY_SIZE(classes) - 1;
 
@@ -3198,24 +3200,4 @@ BOOL COMCTL32_IsThemed(HWND hwnd)
 #else
     return FALSE;
 #endif
-}
-
-HRGN set_control_clipping( HDC hdc, const RECT *rect )
-{
-    RECT rc = *rect;
-    HRGN hrgn = CreateRectRgn( 0, 0, 0, 0 );
-
-    if (GetClipRgn( hdc, hrgn ) != 1)
-    {
-        DeleteObject( hrgn );
-        hrgn = 0;
-    }
-    DPtoLP( hdc, (POINT *)&rc, 2 );
-    if (GetLayout( hdc ) & LAYOUT_RTL)  /* compensate for the shifting done by IntersectClipRect */
-    {
-        rc.left++;
-        rc.right++;
-    }
-    IntersectClipRect( hdc, rc.left, rc.top, rc.right, rc.bottom );
-    return hrgn;
 }

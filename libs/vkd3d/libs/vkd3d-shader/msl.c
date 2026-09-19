@@ -34,7 +34,7 @@ struct msl_src
 
 struct msl_dst
 {
-    const struct vsir_dst_operand *vsir;
+    const struct vkd3d_shader_dst_param *vsir;
     struct vkd3d_string_buffer *register_name;
     struct vkd3d_string_buffer *mask;
 };
@@ -71,17 +71,15 @@ struct msl_resource_type_info
 };
 
 static void msl_print_subscript(struct vkd3d_string_buffer *buffer, struct msl_generator *gen,
-        const struct vsir_src_operand *rel_addr, unsigned int offset);
+        const struct vkd3d_shader_src_param *rel_addr, unsigned int offset);
 
-#define msl_compiler_error(gen, error, ...) \
-        msl_compiler_error_(gen, error, __FUNCTION__, __VA_ARGS__)
-static void VKD3D_PRINTF_FUNC(4, 5) msl_compiler_error_(struct msl_generator *gen,
-        enum vkd3d_shader_error error, const char *function, const char *fmt, ...)
+static void VKD3D_PRINTF_FUNC(3, 4) msl_compiler_error(struct msl_generator *gen,
+        enum vkd3d_shader_error error, const char *fmt, ...)
 {
     va_list args;
 
     va_start(args, fmt);
-    vkd3d_shader_verror(gen->message_context, &gen->location, error, function, fmt, args);
+    vkd3d_shader_verror(gen->message_context, &gen->location, error, fmt, args);
     va_end(args);
     gen->failed = true;
 }
@@ -309,7 +307,7 @@ static void msl_print_uav_name(struct vkd3d_string_buffer *buffer, struct msl_ge
 }
 
 static enum msl_data_type msl_print_register_name(struct vkd3d_string_buffer *buffer,
-        struct msl_generator *gen, const struct vsir_operand *reg)
+        struct msl_generator *gen, const struct vkd3d_shader_register *reg)
 {
     const struct vkd3d_shader_descriptor_info1 *descriptor;
     unsigned int binding, cbv_id, cbv_idx;
@@ -460,14 +458,6 @@ static enum msl_data_type msl_print_register_name(struct vkd3d_string_buffer *bu
             vkd3d_string_buffer_printf(buffer, "v_local_thread_index");
             return MSL_DATA_UNION;
 
-        case VKD3DSPR_OUTSTENCILREF:
-            if (gen->program->shader_version.type != VKD3D_SHADER_TYPE_PIXEL)
-                msl_compiler_error(gen, VKD3D_SHADER_ERROR_MSL_INTERNAL,
-                        "Internal compiler error: Unhandled stencil reference output in shader type #%x.",
-                        gen->program->shader_version.type);
-            vkd3d_string_buffer_printf(buffer, "o_stencil_ref");
-            return MSL_DATA_UNION;
-
         case VKD3DSPR_UNDEF:
             switch (reg->dimension)
             {
@@ -564,9 +554,9 @@ static void msl_print_bitcast(struct vkd3d_string_buffer *dst, struct msl_genera
 }
 
 static void msl_print_src_with_type(struct vkd3d_string_buffer *buffer, struct msl_generator *gen,
-    const struct vsir_src_operand *vsir_src, uint32_t mask, enum vsir_data_type data_type)
+    const struct vkd3d_shader_src_param *vsir_src, uint32_t mask, enum vsir_data_type data_type)
 {
-    const struct vsir_operand *reg = &vsir_src->reg;
+    const struct vkd3d_shader_register *reg = &vsir_src->reg;
     struct vkd3d_string_buffer *register_name;
     enum msl_data_type src_data_type;
 
@@ -583,7 +573,7 @@ static void msl_print_src_with_type(struct vkd3d_string_buffer *buffer, struct m
 }
 
 static void msl_src_init(struct msl_src *msl_src, struct msl_generator *gen,
-        const struct vsir_src_operand *vsir_src, uint32_t mask)
+        const struct vkd3d_shader_src_param *vsir_src, uint32_t mask)
 {
     msl_src->str = vkd3d_string_buffer_get(&gen->string_buffers);
     msl_print_src_with_type(msl_src->str, gen, vsir_src, mask, vsir_src->reg.data_type);
@@ -596,7 +586,7 @@ static void msl_dst_cleanup(struct msl_dst *dst, struct vkd3d_string_buffer_cach
 }
 
 static uint32_t msl_dst_init(struct msl_dst *msl_dst, struct msl_generator *gen,
-        const struct vkd3d_shader_instruction *ins, const struct vsir_dst_operand *vsir_dst)
+        const struct vkd3d_shader_instruction *ins, const struct vkd3d_shader_dst_param *vsir_dst)
 {
     uint32_t write_mask = vsir_dst->write_mask;
     enum msl_data_type dst_data_type;
@@ -622,7 +612,7 @@ static uint32_t msl_dst_init(struct msl_dst *msl_dst, struct msl_generator *gen,
 }
 
 static void msl_print_subscript(struct vkd3d_string_buffer *buffer, struct msl_generator *gen,
-        const struct vsir_src_operand *rel_addr, unsigned int offset)
+        const struct vkd3d_shader_src_param *rel_addr, unsigned int offset)
 {
     struct msl_src r;
 
@@ -813,7 +803,7 @@ static void msl_begin_block(struct msl_generator *gen)
 }
 
 static void msl_print_condition(struct vkd3d_string_buffer *buffer, struct msl_generator *gen,
-        enum vkd3d_shader_conditional_op op, const struct vsir_src_operand *arg)
+        enum vkd3d_shader_conditional_op op, const struct vkd3d_shader_src_param *arg)
 {
     const char *condition;
     struct msl_src src;
@@ -1038,9 +1028,9 @@ static void msl_sample(struct msl_generator *gen, const struct vkd3d_shader_inst
 {
     bool bias, compare, comparison_sampler, dynamic_offset, gather, grad, lod, lod_zero, offset;
     const struct msl_resource_type_info *resource_type_info;
+    const struct vkd3d_shader_src_param *resource, *sampler;
     unsigned int resource_id, resource_idx, resource_space;
     unsigned int sampler_id, sampler_idx, sampler_space;
-    const struct vsir_src_operand *resource, *sampler;
     unsigned int srv_binding = 0, sampler_binding = 0;
     const struct vkd3d_shader_descriptor_info1 *d;
     enum vkd3d_shader_resource_type resource_type;
@@ -1967,12 +1957,6 @@ static void msl_generate_output_struct_declarations(struct msl_generator *gen)
         vkd3d_string_buffer_printf(buffer, "uint shader_out_mask [[sample_mask]];\n");
     }
 
-    if (bitmap_is_set(gen->program->io_dcls, VKD3DSPR_OUTSTENCILREF))
-    {
-        msl_print_indent(gen->buffer, 1);
-        vkd3d_string_buffer_printf(buffer, "uint shader_out_stencil_ref [[stencil]];\n");
-    }
-
     vkd3d_string_buffer_printf(buffer, "};\n\n");
 }
 
@@ -2148,8 +2132,6 @@ static void msl_generate_entrypoint_epilogue(struct msl_generator *gen)
 
     if (bitmap_is_set(gen->program->io_dcls, VKD3DSPR_SAMPLEMASK))
         vkd3d_string_buffer_printf(gen->buffer, "    output.shader_out_mask = o_mask.u;\n");
-    if (bitmap_is_set(gen->program->io_dcls, VKD3DSPR_OUTSTENCILREF))
-        vkd3d_string_buffer_printf(gen->buffer, "    output.shader_out_stencil_ref = o_stencil_ref.u;\n");
 }
 
 static void msl_generate_entrypoint(struct msl_generator *gen)
@@ -2238,8 +2220,6 @@ static void msl_generate_entrypoint(struct msl_generator *gen)
         vkd3d_string_buffer_printf(gen->buffer, "    vkd3d_vec4 v_local_thread_id;\n");
     if (bitmap_is_set(gen->program->io_dcls, VKD3DSPR_LOCALTHREADINDEX))
         vkd3d_string_buffer_printf(gen->buffer, "    vkd3d_vec4 v_local_thread_index;\n");
-    if (bitmap_is_set(gen->program->io_dcls, VKD3DSPR_OUTSTENCILREF))
-        vkd3d_string_buffer_printf(gen->buffer, "    vkd3d_scalar o_stencil_ref;\n");
     vkd3d_string_buffer_printf(gen->buffer, "\n");
 
     msl_generate_entrypoint_prologue(gen);
@@ -2259,8 +2239,6 @@ static void msl_generate_entrypoint(struct msl_generator *gen)
         vkd3d_string_buffer_printf(gen->buffer, ", v_local_thread_id");
     if (bitmap_is_set(gen->program->io_dcls, VKD3DSPR_LOCALTHREADINDEX))
         vkd3d_string_buffer_printf(gen->buffer, ", v_local_thread_index");
-    if (bitmap_is_set(gen->program->io_dcls, VKD3DSPR_OUTSTENCILREF))
-        vkd3d_string_buffer_printf(gen->buffer, ", o_stencil_ref");
     if (gen->program->descriptors.descriptor_count)
         vkd3d_string_buffer_printf(gen->buffer, ", descriptors");
     vkd3d_string_buffer_printf(gen->buffer, ");\n\n");
@@ -2274,14 +2252,8 @@ static void msl_generate_entrypoint(struct msl_generator *gen)
 
 static int msl_generator_generate(struct msl_generator *gen, struct vkd3d_shader_code *out)
 {
-    enum vsir_global_flags flags = gen->program->global_flags;
     struct vkd3d_shader_instruction *ins;
     struct vsir_program_iterator it;
-
-    static const uint64_t ignored_flags = VKD3DSGF_REFACTORING_ALLOWED
-            | VKD3DSGF_FORCE_EARLY_DEPTH_STENCIL
-            | VKD3DSGF_BIND_FOR_DURATION
-            | VKD3DSGF_ENABLE_STENCIL_REF;
 
     MESSAGE("Generating a MSL shader. This is unsupported; you get to keep all the pieces if it breaks.\n");
 
@@ -2289,24 +2261,9 @@ static int msl_generator_generate(struct msl_generator *gen, struct vkd3d_shader
     vkd3d_string_buffer_printf(gen->buffer, "#include <metal_stdlib>\n");
     vkd3d_string_buffer_printf(gen->buffer, "using namespace metal;\n\n");
 
-    if (flags & ignored_flags)
-    {
-        TRACE("Ignoring global flags %#"PRIx64".\n", flags & ignored_flags);
-        flags &= ~ignored_flags;
-    }
-
-    if (flags)
+    if (gen->program->global_flags & ~(VKD3DSGF_REFACTORING_ALLOWED | VKD3DSGF_FORCE_EARLY_DEPTH_STENCIL))
         msl_compiler_error(gen, VKD3D_SHADER_ERROR_MSL_INTERNAL,
-                "Internal compiler error: Unhandled global flags %#"PRIx64".", (uint64_t)flags);
-
-    if (gen->program->f16_denormal_mode != VKD3D_SHADER_DENORMAL_MODE_ANY
-            || gen->program->f32_denormal_mode != VKD3D_SHADER_DENORMAL_MODE_ANY
-            || gen->program->f64_denormal_mode != VKD3D_SHADER_DENORMAL_MODE_ANY)
-    {
-        msl_compiler_error(gen, VKD3D_SHADER_ERROR_MSL_UNSUPPORTED,
-                "Cannot emit denormal modes. The target environment does not support float controls.");
-        return VKD3D_ERROR;
-    }
+                "Internal compiler error: Unhandled global flags %#"PRIx64".", (uint64_t)gen->program->global_flags);
 
     vkd3d_string_buffer_printf(gen->buffer, "union vkd3d_scalar\n{\n");
     vkd3d_string_buffer_printf(gen->buffer, "    uint u;\n");
@@ -2363,8 +2320,6 @@ static int msl_generator_generate(struct msl_generator *gen, struct vkd3d_shader
         vkd3d_string_buffer_printf(gen->buffer, ", thread vkd3d_vec4 &v_local_thread_id");
     if (bitmap_is_set(gen->program->io_dcls, VKD3DSPR_LOCALTHREADINDEX))
         vkd3d_string_buffer_printf(gen->buffer, ", thread vkd3d_vec4 &v_local_thread_index");
-    if (bitmap_is_set(gen->program->io_dcls, VKD3DSPR_OUTSTENCILREF))
-        vkd3d_string_buffer_printf(gen->buffer, ", thread vkd3d_scalar &o_stencil_ref");
     if (gen->program->descriptors.descriptor_count)
         vkd3d_string_buffer_printf(gen->buffer, ", constant descriptor *descriptors");
     vkd3d_string_buffer_printf(gen->buffer, ")\n{\n");
@@ -2446,8 +2401,8 @@ int msl_compile(struct vsir_program *program, uint64_t config_flags,
         return ret;
 
     VKD3D_ASSERT(program->normalisation_level == VSIR_NORMALISED_SM6);
-    VKD3D_ASSERT(program->normalisation_flags.has_descriptor_info);
-    VKD3D_ASSERT(program->normalisation_flags.has_no_modifiers);
+    VKD3D_ASSERT(program->has_descriptor_info);
+    VKD3D_ASSERT(program->has_no_modifiers);
 
     if ((ret = msl_generator_init(&generator, program, compile_info, message_context)) < 0)
         return ret;

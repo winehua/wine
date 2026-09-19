@@ -29,15 +29,8 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(scroll);
 
-static struct scroll_info *get_control_state( HWND hwnd )
-{
-    return (struct scroll_info *)NtUserGetPrivateData( hwnd, 0, sizeof(struct scroll_info *) );
-}
 
-static struct scroll_info *set_control_state( HWND hwnd, struct scroll_info *state )
-{
-    return (struct scroll_info *)NtUserSetPrivateData( hwnd, 0, sizeof(struct scroll_info *), (LONG_PTR)state );
-}
+#define SCROLLBAR_MAGIC 0x5c6011ba
 
 /* Minimum size of the rectangle between the arrows */
 #define SCROLL_MIN_RECT  4
@@ -79,6 +72,8 @@ struct win_scroll_bar_info
     struct scroll_info vert;
 };
 
+#define SCROLLBAR_MAGIC 0x5c6011ba
+
 
 static struct scroll_info *get_scroll_info_ptr( HWND hwnd, int bar, BOOL alloc )
 {
@@ -96,7 +91,12 @@ static struct scroll_info *get_scroll_info_ptr( HWND hwnd, int bar, BOOL alloc )
         if (win->pScroll) info = &win->pScroll->vert;
         break;
     case SB_CTL:
-        if (!(info = get_control_state( hwnd ))) WARN( "window is not a scrollbar control\n" );
+        if (win->cbWndExtra >= sizeof(struct scroll_bar_win_data))
+        {
+            struct scroll_bar_win_data *data = (struct scroll_bar_win_data *)win->wExtra;
+            if (data->magic == SCROLLBAR_MAGIC) info = &data->info;
+        }
+        if (!info) WARN( "window is not a scrollbar control\n" );
         break;
     case SB_BOTH:
         WARN( "with SB_BOTH\n" );
@@ -168,6 +168,16 @@ static BOOL show_scroll_bar( HWND hwnd, int bar, BOOL show_horz, BOOL show_vert 
         /* frame has been changed, let the window redraw itself */
         NtUserSetWindowPos( hwnd, 0, 0, 0, 0, 0,
                             SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED );
+
+        if ((set_bits & WS_HSCROLL) && !(old_style & WS_HSCROLL))
+            NtUserNotifyWinEvent( EVENT_OBJECT_SHOW, hwnd, OBJID_HSCROLL, 0 );
+        if ((set_bits & WS_VSCROLL) && !(old_style & WS_VSCROLL))
+            NtUserNotifyWinEvent( EVENT_OBJECT_SHOW, hwnd, OBJID_VSCROLL, 0 );
+        if ((clear_bits & WS_HSCROLL) && (old_style & WS_HSCROLL))
+            NtUserNotifyWinEvent( EVENT_OBJECT_HIDE, hwnd, OBJID_HSCROLL, 0 );
+        if ((clear_bits & WS_VSCROLL) && (old_style & WS_VSCROLL))
+            NtUserNotifyWinEvent( EVENT_OBJECT_HIDE, hwnd, OBJID_VSCROLL, 0 );
+
         return TRUE;
     }
     return FALSE; /* no frame changes */
@@ -871,7 +881,13 @@ BOOL get_scroll_info( HWND hwnd, int bar, SCROLLINFO *info )
     struct scroll_info *scroll;
 
     /* handle invalid data structure */
-    if (!validate_scroll_info( info ) || !(scroll = get_scroll_info_ptr( hwnd, bar, FALSE )))
+    if (!validate_scroll_info( info ))
+        return FALSE;
+
+    if (bar != SB_CTL && !is_current_thread_window( hwnd ))
+        return send_message( hwnd, WM_WINE_GETSCROLLINFO, (WPARAM)bar, (LPARAM)info );
+
+    if (!(scroll = get_scroll_info_ptr( hwnd, bar, FALSE )))
         return FALSE;
 
     /* fill in the desired scroll info structure */
@@ -894,11 +910,14 @@ BOOL get_scroll_info( HWND hwnd, int bar, SCROLLINFO *info )
     return (info->fMask & SIF_ALL) != 0;
 }
 
-static int set_scroll_info( HWND hwnd, int bar, const SCROLLINFO *info, BOOL redraw )
+int set_scroll_info( HWND hwnd, int bar, const SCROLLINFO *info, BOOL redraw )
 {
     struct scroll_info *scroll;
     UINT new_flags;
     int action = 0, ret = 0;
+
+    if (bar != SB_CTL && !is_current_thread_window( hwnd ))
+        return send_message( hwnd, WM_WINE_SETSCROLLINFO, MAKEWPARAM(bar, redraw), (LPARAM)info );
 
     /* handle invalid data structure */
     if (!validate_scroll_info( info ) ||
@@ -1045,7 +1064,7 @@ done:
     return ret; /* Return current position */
 }
 
-static BOOL get_scroll_bar_info( HWND hwnd, LONG id, SCROLLBARINFO *info )
+BOOL get_scroll_bar_info( HWND hwnd, LONG id, SCROLLBARINFO *info )
 {
     struct scroll_info *scroll;
     int bar, dummy;
@@ -1063,6 +1082,9 @@ static BOOL get_scroll_bar_info( HWND hwnd, LONG id, SCROLLBARINFO *info )
 
     /* handle invalid data structure */
     if (info->cbSize != sizeof(*info)) return FALSE;
+
+    if (bar != SB_CTL && !is_current_thread_window( hwnd ))
+        return send_message( hwnd, WM_WINE_GETSCROLLBARINFO, (WPARAM)id, (LPARAM)info );
 
     get_scroll_bar_rect( hwnd, bar, &info->rcScrollBar, &dummy,
                          &info->dxyLineButton, &info->xyThumbTop );
@@ -1130,13 +1152,21 @@ static BOOL get_scroll_bar_info( HWND hwnd, LONG id, SCROLLBARINFO *info )
 
 static void create_scroll_bar( HWND hwnd, CREATESTRUCTW *create )
 {
-    struct scroll_info *info;
+    struct scroll_info *info = NULL;
+    WND *win;
 
     TRACE( "hwnd=%p create=%p\n", hwnd, create );
 
-    if (!(info = calloc( 1, sizeof(*info) ))) return;
-    NtUserSetWindowFNID( hwnd, MAKE_FNID(NTUSER_WNDPROC_SCROLLBAR) );
-    set_control_state( hwnd, info );
+    win = get_win_ptr( hwnd );
+    if (win->cbWndExtra >= sizeof(struct scroll_bar_win_data))
+    {
+        struct scroll_bar_win_data *data = (struct scroll_bar_win_data *)win->wExtra;
+        data->magic = SCROLLBAR_MAGIC;
+        info = &data->info;
+    }
+    else WARN( "Not enough extra data\n" );
+    release_win_ptr( win );
+    if (!info) return;
 
     if (create->style & WS_DISABLED)
     {
@@ -1298,11 +1328,6 @@ LRESULT scroll_bar_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             }
         }
         return 0;
-
-    case WM_GETOBJECT:
-        if ((LONG)lparam == OBJID_QUERYCLASSNAMEIDX)
-            return 0x1000a;
-        return default_window_proc( hwnd, msg, wparam, lparam, ansi );
 
     case WM_SETFOCUS:
         {

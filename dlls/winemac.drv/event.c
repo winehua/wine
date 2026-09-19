@@ -29,6 +29,7 @@
 #include <poll.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "macdrv.h"
 #include "oleidl.h"
 

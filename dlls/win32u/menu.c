@@ -160,16 +160,6 @@ static BOOL exit_menu = FALSE;
 static SIZE menucharsize;
 static UINT od_item_height; /* default owner drawn item height */
 
-static HMENU get_control_menu( HWND hwnd )
-{
-    return (HMENU)NtUserGetPrivateData( hwnd, 0, sizeof(HMENU) );
-}
-
-static HMENU set_control_menu( HWND hwnd, HMENU menu )
-{
-    return (HMENU)NtUserSetPrivateData( hwnd, 0, sizeof(HMENU), (LONG_PTR)menu );
-}
-
 /**********************************************************************
  *           NtUserCopyAcceleratorTable   (win32u.@)
  */
@@ -2919,7 +2909,7 @@ LRESULT popup_menu_window_proc( HWND hwnd, UINT message, WPARAM wparam, LPARAM l
     case WM_CREATE:
         {
             CREATESTRUCTW *cs = (CREATESTRUCTW *)lparam;
-            set_control_menu( hwnd, cs->lpCreateParams );
+            NtUserSetWindowLongPtr( hwnd, 0, (LONG_PTR)cs->lpCreateParams, FALSE );
             return 0;
         }
 
@@ -2930,14 +2920,14 @@ LRESULT popup_menu_window_proc( HWND hwnd, UINT message, WPARAM wparam, LPARAM l
         {
             PAINTSTRUCT ps;
             NtUserBeginPaint( hwnd, &ps );
-            draw_popup_menu( hwnd, ps.hdc, get_control_menu( hwnd ) );
+            draw_popup_menu( hwnd, ps.hdc, (HMENU)get_window_long_ptr( hwnd, 0, FALSE ));
             NtUserEndPaint( hwnd, &ps );
             return 0;
         }
 
     case WM_PRINTCLIENT:
         {
-            draw_popup_menu( hwnd, (HDC)wparam, get_control_menu( hwnd ) );
+            draw_popup_menu( hwnd, (HDC)wparam, (HMENU)get_window_long_ptr( hwnd, 0, FALSE ));
             return 0;
         }
 
@@ -2954,16 +2944,17 @@ LRESULT popup_menu_window_proc( HWND hwnd, UINT message, WPARAM wparam, LPARAM l
         break;
 
     case WM_SHOWWINDOW:
-        if (!wparam) NtUserSetPrivateData( hwnd, 0, sizeof(LONG_PTR), 0 );
-        else if (!get_control_menu( hwnd )) ERR( "no menu to display\n" );
+        if (wparam)
+        {
+            if (!get_window_long_ptr( hwnd, 0, FALSE )) ERR( "no menu to display\n" );
+        }
+        else
+            NtUserSetWindowLongPtr( hwnd, 0, 0, FALSE );
         break;
 
     case MN_GETHMENU:
-        return (LRESULT)get_control_menu( hwnd );
+        return get_window_long_ptr( hwnd, 0, FALSE );
 
-    case WM_NCCREATE:
-        NtUserSetWindowFNID( hwnd, MAKE_FNID(NTUSER_WNDPROC_MENU) );
-        /* fallthrough */
     default:
         return default_window_proc( hwnd, message, wparam, lparam, ansi );
     }
@@ -4608,7 +4599,7 @@ BOOL WINAPI NtUserGetMenuBarInfo( HWND hwnd, LONG id, LONG item, MENUBARINFO *in
             return FALSE;
         }
 
-        hmenu = get_control_menu( hwnd );
+        hmenu = (HMENU)get_window_long_ptr( hwnd, 0, FALSE );
         break;
     case OBJID_MENU:
         hmenu = get_menu( hwnd );

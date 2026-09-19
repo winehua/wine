@@ -21,6 +21,7 @@
 #include <stdarg.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "ntgdi.h"
@@ -1552,7 +1553,7 @@ BOOL SYSCALL_API NtUserGetCaretPos( POINT *pt )
 }
 
 ATOM SYSCALL_API NtUserGetClassInfoEx( HINSTANCE instance, UNICODE_STRING *name, WNDCLASSEXW *wc,
-                                       struct client_menu_name **menu_name, BOOL ansi )
+                                       struct client_menu_name *menu_name, BOOL ansi )
 {
     SYSCALL_FUNC( NtUserGetClassInfoEx );
 }
@@ -1720,11 +1721,6 @@ BOOL SYSCALL_API NtUserGetMessage( MSG *msg, HWND hwnd, UINT first, UINT last )
     SYSCALL_FUNC( NtUserGetMessage );
 }
 
-DWORD SYSCALL_API NtUserGetMessagePos(void)
-{
-    SYSCALL_FUNC( NtUserGetMessagePos );
-}
-
 int SYSCALL_API NtUserGetMouseMovePointsEx( UINT size, MOUSEMOVEPOINT *ptin, MOUSEMOVEPOINT *ptout,
                                             int count, DWORD resolution )
 {
@@ -1833,6 +1829,11 @@ BOOL SYSCALL_API NtUserGetTitleBarInfo( HWND hwnd, TITLEBARINFO *info )
     SYSCALL_FUNC( NtUserGetTitleBarInfo );
 }
 
+BOOL SYSCALL_API NtUserGetTouchInputInfo( HTOUCHINPUT handle, UINT count, TOUCHINPUT *ptr, int size )
+{
+    SYSCALL_FUNC( NtUserGetTouchInputInfo );
+}
+
 BOOL SYSCALL_API NtUserGetUpdateRect( HWND hwnd, RECT *rect, BOOL erase )
 {
     SYSCALL_FUNC( NtUserGetUpdateRect );
@@ -1928,6 +1929,11 @@ BOOL SYSCALL_API NtUserIsClipboardFormatAvailable( UINT format )
 BOOL SYSCALL_API NtUserIsMouseInPointerEnabled(void)
 {
     SYSCALL_FUNC( NtUserIsMouseInPointerEnabled );
+}
+
+BOOL SYSCALL_API NtUserIsTouchWindow( HWND hwnd, ULONG *flags )
+{
+    SYSCALL_FUNC( NtUserIsTouchWindow );
 }
 
 BOOL SYSCALL_API NtUserKillSystemTimer( HWND hwnd, UINT_PTR id )
@@ -2080,7 +2086,8 @@ BOOL SYSCALL_API NtUserRedrawWindow( HWND hwnd, const RECT *rect, HRGN hrgn, UIN
 }
 
 ATOM SYSCALL_API NtUserRegisterClassExWOW( const WNDCLASSEXW *wc, UNICODE_STRING *name, UNICODE_STRING *version,
-                                           struct client_menu_name *menu_name, DWORD fnid, DWORD flags, DWORD *wow )
+                                           struct client_menu_name *client_menu_name, DWORD fnid,
+                                           DWORD flags, DWORD *wow )
 {
     SYSCALL_FUNC( NtUserRegisterClassExWOW );
 }
@@ -2269,11 +2276,6 @@ BOOL SYSCALL_API NtUserSetMenuDefaultItem( HMENU handle, UINT item, UINT bypos )
     SYSCALL_FUNC( NtUserSetMenuDefaultItem );
 }
 
-LPARAM SYSCALL_API NtUserSetMessageExtraInfo( LPARAM lp )
-{
-    SYSCALL_FUNC( NtUserSetMessageExtraInfo );
-}
-
 BOOL SYSCALL_API NtUserSetObjectInformation( HANDLE handle, INT index, void *info, DWORD len )
 {
     SYSCALL_FUNC( NtUserSetObjectInformation );
@@ -2359,11 +2361,6 @@ HWINEVENTHOOK SYSCALL_API NtUserSetWinEventHook( DWORD event_min, DWORD event_ma
 BOOL SYSCALL_API NtUserSetWindowContextHelpId( HWND hwnd, DWORD id )
 {
     SYSCALL_FUNC( NtUserSetWindowContextHelpId );
-}
-
-BOOL SYSCALL_API NtUserSetWindowFNID( HWND hwnd, WORD fnid )
-{
-    SYSCALL_FUNC( NtUserSetWindowFNID );
 }
 
 LONG SYSCALL_API NtUserSetWindowLong( HWND hwnd, INT offset, LONG newval, BOOL ansi )
@@ -2500,7 +2497,8 @@ BOOL SYSCALL_API NtUserUnhookWindowsHookEx( HHOOK handle )
     SYSCALL_FUNC( NtUserUnhookWindowsHookEx );
 }
 
-BOOL SYSCALL_API NtUserUnregisterClass( UNICODE_STRING *name, HINSTANCE instance, struct client_menu_name **menu_name )
+BOOL SYSCALL_API NtUserUnregisterClass( UNICODE_STRING *name, HINSTANCE instance,
+                                        struct client_menu_name *client_menu_name )
 {
     SYSCALL_FUNC( NtUserUnregisterClass );
 }
@@ -2590,7 +2588,7 @@ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, void *reserved )
         LdrGetDllHandle( NULL, 0, &ntdll_name, &ntdll );
         dispatcher_ptr = RtlFindExportedRoutineByName( ntdll, "__wine_syscall_dispatcher" );
         __wine_syscall_dispatcher = *dispatcher_ptr;
-        __wine_init_unix_call();
+        if (!__wine_init_unix_call()) WINE_UNIX_CALL( 0, NULL );
         break;
     }
     return TRUE;

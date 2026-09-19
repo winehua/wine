@@ -180,11 +180,24 @@ static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
 
 static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor);
 
+/* WINEWAYLAND_ENTER_SILENT: 相对模式下 enter 静默校准 (方向 A) 的启用开关。
+ * 由 host 显式注入, 只有 "1" 才启用; 未设置/其他值 = 不启用 (原硬件路径):
+ *   - "1": 静默 SetCursorPos — 只更新 wineserver 光标位置, 不产生硬件输入
+ *     记录 (GetCursorPos 读到新值, dinput 增量差分通道不受污染: 读绝对
+ *     位置的老游戏与真 dinput 视角游戏同时正常)
+ *   - 未设置/"0": 硬件绝对移动 (原行为) */
+static BOOL enter_silent(void)
+{
+    const char *s = getenv("WINEWAYLAND_ENTER_SILENT");
+    return s && s[0] == '1';
+}
+
 static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
                                  uint32_t serial, struct wl_surface *wl_surface,
                                  wl_fixed_t sx, wl_fixed_t sy)
 {
     struct wayland_pointer *pointer = &process_wayland.pointer;
+    struct wayland_surface *surface;
     HWND hwnd;
 
     InterlockedExchange(&process_wayland.input_serial, serial);
@@ -208,7 +221,37 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
     /* Handle the enter as a motion, to account for cases where the
      * window first appears beneath the pointer and won't get a separate
      * motion event. */
-    pointer_handle_motion_internal(sx, sy);
+    if (pointer->zwp_relative_pointer_v1 && enter_silent())
+    {
+        /* 方向 A: 相对模式下 enter 只静默校准光标位置, 不发硬件输入。
+         * 相对模式丢弃绝对 motion (光标位置 = 基线 + 增量累积), 读
+         * GetCursorPos 的老游戏 (红警2/模拟邻居) 需要 enter 校准基线;
+         * 但硬件绝对移动会被 dinput 差分出巨大增量 (真 dinput 视角
+         * PAL2 瞬移)。NtUserSetCursorPos 只更新 server 光标位置, 不进
+         * 硬件输入队列 (不触发 LL 钩子/raw input) — 与 Windows 语义
+         * 一致: SetCursorPos 只动位置、零增量。 */
+        struct wayland_win_data *data;
+        if ((data = wayland_win_data_get(hwnd)) && data->wayland_surface)
+        {
+            RECT *window_rect = &data->wayland_surface->window.rect;
+            int screen_x, screen_y;
+
+            wayland_surface_coords_to_window(data->wayland_surface,
+                                             wl_fixed_to_double(sx),
+                                             wl_fixed_to_double(sy),
+                                             &screen_x, &screen_y);
+            screen_x += window_rect->left;
+            screen_y += window_rect->top;
+            wayland_win_data_release(data);
+            TRACE("silent cursor pos hwnd=%p screen_xy=%d,%d\n", hwnd, screen_x, screen_y);
+            NtUserSetCursorPos(screen_x, screen_y);
+        }
+        else if (data) wayland_win_data_release(data);
+    }
+    else
+    {
+        pointer_handle_motion_internal(sx, sy);
+    }
 }
 
 static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
@@ -291,8 +334,8 @@ static void pointer_handle_axis_stop(void *data, struct wl_pointer *wl_pointer,
 {
 }
 
-static void pointer_handle_axis_value120(void *data, struct wl_pointer *wl_pointer,
-                                         uint32_t axis, int32_t value120)
+static void pointer_handle_axis_discrete(void *data, struct wl_pointer *wl_pointer,
+                                         uint32_t axis, int32_t discrete)
 {
     INPUT input = {0};
     HWND hwnd;
@@ -305,24 +348,18 @@ static void pointer_handle_axis_value120(void *data, struct wl_pointer *wl_point
     {
     case WL_POINTER_AXIS_VERTICAL_SCROLL:
         input.mi.dwFlags = MOUSEEVENTF_WHEEL;
-        input.mi.mouseData = -value120;
+        input.mi.mouseData = -WHEEL_DELTA * discrete;
         break;
     case WL_POINTER_AXIS_HORIZONTAL_SCROLL:
         input.mi.dwFlags = MOUSEEVENTF_HWHEEL;
-        input.mi.mouseData = value120;
+        input.mi.mouseData = WHEEL_DELTA * discrete;
         break;
     default: break;
     }
 
-    TRACE("hwnd=%p axis=%u value120=%d\n", hwnd, axis, value120);
+    TRACE("hwnd=%p axis=%u discrete=%d\n", hwnd, axis, discrete);
 
     NtUserSendHardwareInput(hwnd, 0, &input, 0);
-}
-
-static void pointer_handle_axis_discrete(void *data, struct wl_pointer *wl_pointer,
-                                         uint32_t axis, int32_t discrete)
-{
-    pointer_handle_axis_value120(data, wl_pointer, axis, WHEEL_DELTA * discrete);
 }
 
 static const struct wl_pointer_listener pointer_listener =
@@ -335,10 +372,7 @@ static const struct wl_pointer_listener pointer_listener =
     pointer_handle_frame,
     pointer_handle_axis_source,
     pointer_handle_axis_stop,
-    pointer_handle_axis_discrete,
-#ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION
-    pointer_handle_axis_value120
-#endif
+    pointer_handle_axis_discrete
 };
 
 /**********************************************************************
@@ -554,7 +588,7 @@ static void wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
     {
         HDC hdc = NtGdiCreateCompatibleDC(0);
         cursor->shm_buffer =
-            wayland_shm_buffer_from_color_bitmaps(hdc, info.hbmColor, info.hbmMask, FALSE);
+            wayland_shm_buffer_from_color_bitmaps(hdc, info.hbmColor, info.hbmMask);
         NtGdiDeleteObjectApp(hdc);
     }
     else
@@ -1070,22 +1104,7 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
     pthread_mutex_lock(&pointer->mutex);
     if (wl_surface && pointer->pending_warp)
     {
-        if (process_wayland.wp_pointer_warp_v1)
-        {
-            wp_pointer_warp_v1_warp_pointer(
-                    process_wayland.wp_pointer_warp_v1,
-                    wl_surface,
-                    pointer->wl_pointer,
-                    wl_fixed_from_int(warp_x),
-                    wl_fixed_from_int(warp_y),
-                    pointer->enter_serial);
-            TRACE("warp_pointer hwnd=%p wayland_xy=%d,%d screen_xy=%d,%d\n",
-                    hwnd, warp_x, warp_y, cursor_pos.x, cursor_pos.y);
-        }
-        else
-        {
-            wayland_pointer_update_constraint(wl_surface, NULL, FALSE, TRUE);
-        }
+        wayland_pointer_update_constraint(wl_surface, NULL, FALSE, TRUE);
         pointer->pending_warp = FALSE;
     }
 

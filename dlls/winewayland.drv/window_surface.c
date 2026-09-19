@@ -326,9 +326,9 @@ static void wayland_shm_buffer_copy_data(struct wayland_shm_buffer *buffer,
     copy_pixel_region(bits, rect, buffer->map_data, &buffer_rect, region, force_opaque);
 }
 
-static void wayland_shm_buffer_copy(struct wayland_shm_buffer *src,
-                                    struct wayland_shm_buffer *dst,
-                                    HRGN region)
+void wayland_shm_buffer_copy(struct wayland_shm_buffer *src,
+                             struct wayland_shm_buffer *dst,
+                             HRGN region)
 {
     RECT src_rect = {0, 0, src->width, src->height};
     RECT dst_rect = {0, 0, dst->width, dst->height};

@@ -28,6 +28,7 @@
 #include <stdlib.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "ntgdi_private.h"
 #include "ntuser_private.h"
 #include "wine/winbase16.h"
@@ -287,10 +288,9 @@ static INT nulldrv_GetDeviceCaps( PHYSDEV dev, INT cap )
     }
 }
 
-static BOOL nulldrv_GetDeviceGammaRamp( PHYSDEV dev, void *ramp )
+static UINT nulldrv_GetDeviceGammaRamp( PHYSDEV dev, void *ramp )
 {
-    RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
-    return FALSE;
+    return -1; /* use default implementation */
 }
 
 static DWORD nulldrv_GetFontData( PHYSDEV dev, DWORD table, DWORD offset, LPVOID buffer, DWORD length )
@@ -482,14 +482,13 @@ static COLORREF nulldrv_SetDCPenColor( PHYSDEV dev, COLORREF color )
     return color;
 }
 
-static void nulldrv_SetDeviceClipping( PHYSDEV dev, HRGN rgn )
+static void nulldrv_SetDeviceClipping( PHYSDEV dev, HRGN rgn, HRGN monitor_rgn )
 {
 }
 
-static BOOL nulldrv_SetDeviceGammaRamp( PHYSDEV dev, void *ramp )
+static UINT nulldrv_SetDeviceGammaRamp( PHYSDEV dev, void *ramp )
 {
-    RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
-    return FALSE;
+    return -1; /* use default implementation */
 }
 
 static COLORREF nulldrv_SetPixel( PHYSDEV dev, INT x, INT y, COLORREF color )
@@ -671,9 +670,9 @@ static void nulldrv_ReleaseKbdTables( const KBDTABLES *tables )
 {
 }
 
-static UINT nulldrv_ImeToAsciiEx( UINT vkey, UINT vsc, const BYTE *state, HIMC himc )
+static UINT nulldrv_ImeProcessKey( HIMC himc, UINT wparam, UINT lparam, const BYTE *state )
 {
-    return STATUS_NOT_IMPLEMENTED;
+    return 0;
 }
 
 static void nulldrv_NotifyIMEStatus( HWND hwnd, UINT status )
@@ -766,7 +765,7 @@ static BOOL nodrv_CreateWindow( HWND hwnd )
     HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
 
     /* HWND_MESSAGE windows don't need a graphics driver */
-    if (!parent || parent == get_user_thread_info()->msg_window) return TRUE;
+    if (!parent || parent == UlongToHandle( NtUserGetThreadInfo()->msg_window )) return TRUE;
     if (warned++) return FALSE;
 
     ERR_(winediag)( "Application tried to create a window, but no driver could be loaded.\n" );
@@ -785,6 +784,11 @@ static void nulldrv_DestroyWindow( HWND hwnd )
 
 static void nulldrv_FlashWindowEx( FLASHWINFO *info )
 {
+}
+
+static BOOL nulldrv_HasWindowManager( const char *name )
+{
+    return FALSE;
 }
 
 static void nulldrv_GetDC( HDC hdc, HWND hwnd, HWND top_win, const RECT *win_rect,
@@ -1034,7 +1038,11 @@ static void load_display_driver(void)
         winstation = NtUserGetProcessWindowStation();
         if (!NtUserGetObjectInformation( winstation, UOI_FLAGS, &flags, sizeof(flags), NULL )
             || (flags.dwFlags & WSF_VISIBLE))
+#ifdef __OHOS__
             null_user_driver.pCreateWindow = nulldrv_CreateWindow;
+#else
+            null_user_driver.pCreateWindow = nodrv_CreateWindow;
+#endif
 
         __wine_set_user_driver( &null_user_driver, WINE_GDI_DRIVER_VERSION );
     }
@@ -1117,9 +1125,9 @@ static void loaderdrv_ReleaseKbdTables( const KBDTABLES *tables )
     return load_driver()->pReleaseKbdTables( tables );
 }
 
-static UINT loaderdrv_ImeToAsciiEx( UINT vkey, UINT vsc,const BYTE *state, HIMC himc )
+static UINT loaderdrv_ImeProcessKey( HIMC himc, UINT wparam, UINT lparam, const BYTE *state )
 {
-    return load_driver()->pImeToAsciiEx( vkey, vsc, state, himc );
+    return load_driver()->pImeProcessKey( himc, wparam, lparam, state );
 }
 
 static void loaderdrv_NotifyIMEStatus( HWND hwnd, UINT status )
@@ -1224,6 +1232,11 @@ static void loaderdrv_FlashWindowEx( FLASHWINFO *info )
     load_driver()->pFlashWindowEx( info );
 }
 
+static BOOL loaderdrv_HasWindowManager( const char *name )
+{
+    return load_driver()->pHasWindowManager( name );
+}
+
 static void loaderdrv_SetDesktopWindow( HWND hwnd )
 {
     load_driver()->pSetDesktopWindow( hwnd );
@@ -1274,7 +1287,7 @@ static const struct user_driver_funcs lazy_load_driver =
     loaderdrv_VkKeyScanEx,
     loaderdrv_KbdLayerDescriptor,
     loaderdrv_ReleaseKbdTables,
-    loaderdrv_ImeToAsciiEx,
+    loaderdrv_ImeProcessKey,
     loaderdrv_NotifyIMEStatus,
     loaderdrv_SetIMECompositionRect,
     /* cursor/icon functions */
@@ -1302,6 +1315,7 @@ static const struct user_driver_funcs lazy_load_driver =
     nulldrv_DesktopWindowProc,
     nulldrv_DestroyWindow,
     loaderdrv_FlashWindowEx,
+    loaderdrv_HasWindowManager,
     loaderdrv_GetDC,
     nulldrv_ProcessEvents,
     nulldrv_ReleaseDC,
@@ -1378,7 +1392,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(VkKeyScanEx);
     SET_USER_FUNC(KbdLayerDescriptor);
     SET_USER_FUNC(ReleaseKbdTables);
-    SET_USER_FUNC(ImeToAsciiEx);
+    SET_USER_FUNC(ImeProcessKey);
     SET_USER_FUNC(NotifyIMEStatus);
     SET_USER_FUNC(SetIMECompositionRect);
     SET_USER_FUNC(DestroyCursorIcon);
@@ -1401,6 +1415,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(DesktopWindowProc);
     SET_USER_FUNC(DestroyWindow);
     SET_USER_FUNC(FlashWindowEx);
+    SET_USER_FUNC(HasWindowManager);
     SET_USER_FUNC(GetDC);
     SET_USER_FUNC(ProcessEvents);
     SET_USER_FUNC(ReleaseDC);

@@ -23,6 +23,7 @@
 
 #include "config.h"
 #include <time.h>
+#include <unistd.h>
 
 #include "vulkan_private.h"
 #include "wine/vulkan_driver.h"
@@ -64,6 +65,12 @@ static void append_debug_utils_object(const VkDebugUtilsObjectNameInfoEXT *objec
     dst->object_type = object->objectType;
     dst->object_handle = object->objectHandle;
     dst->object_name_len = append_string(object->pObjectName, strings, strings_len);
+}
+
+static uint64_t get_transient_handle(struct vulkan_instance *instance)
+{
+    uint64_t *handle = pthread_getspecific(instance->transient_object_handle);
+    return handle && *handle;
 }
 
 static VkBool32 debug_utils_callback_conversion(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
@@ -148,6 +155,8 @@ static VkBool32 debug_utils_callback_conversion(VkDebugUtilsMessageSeverityFlagB
         if (wine_vk_is_type_wrapped(objects[i].object_type))
         {
             objects[i].object_handle = object->instance->p_client_handle_from_host(object->instance, objects[i].object_handle);
+            if (!objects[i].object_handle)
+                objects[i].object_handle = get_transient_handle(object->instance);
             if (!objects[i].object_handle)
             {
                 WARN("handle conversion failed 0x%s\n", wine_dbgstr_longlong(callback_data->pObjects[i].objectHandle));
@@ -309,6 +318,18 @@ static struct vulkan_physical_device *vulkan_instance_get_physical_device(struct
     return NULL;
 }
 
+static BOOL winehua_frame_assoc_trace_enabled(void)
+{
+    static int enabled = -1;
+    const char *value;
+
+    if (enabled >= 0) return enabled;
+
+    value = getenv("WINEHUA_DXVK_TRACE_CAMERA");
+    enabled = value && value[0] == '1' && !value[1];
+    return enabled;
+}
+
 VkResult wine_vkAllocateCommandBuffers(VkDevice client_device, const VkCommandBufferAllocateInfo *allocate_info,
                                        VkCommandBuffer *buffers )
 {
@@ -353,6 +374,11 @@ VkResult wine_vkAllocateCommandBuffers(VkDevice client_device, const VkCommandBu
 
         vulkan_object_init_ptr(&buffer->obj, (UINT_PTR)host_command_buffer, &client_command_buffer->obj);
         buffer->device = device;
+
+        if (winehua_frame_assoc_trace_enabled())
+            fprintf(stderr,
+                    "WineHuaWineFrameAssoc: unixPid=%d command-buffer clientCmd=%p guestCmd=%p\n",
+                    getpid(), client_command_buffer, host_command_buffer);
         instance->p_insert_object(instance, &buffer->obj);
     }
 
@@ -470,12 +496,13 @@ void wine_vkFreeCommandBuffers(VkDevice client_device, VkCommandPool command_poo
     wine_vk_free_command_buffers(device, pool, count, buffers);
 }
 
-VkResult wine_vkCreateCommandPool(VkDevice client_device, const VkCommandPoolCreateInfo *info, const VkAllocationCallbacks *allocator,
-                                  VkCommandPool *client_command_pool_ptr)
+VkResult wine_vkCreateCommandPool(VkDevice client_device, const VkCommandPoolCreateInfo *info,
+                                  const VkAllocationCallbacks *allocator, VkCommandPool *command_pool,
+                                  void *client_ptr)
 {
-    struct vk_command_pool *client_command_pool = command_pool_from_handle(*client_command_pool_ptr);
     struct vulkan_device *device = vulkan_device_from_handle(client_device);
     struct vulkan_instance *instance = device->physical_device->instance;
+    struct vk_command_pool *client_command_pool = client_ptr;
     VkCommandPool host_command_pool;
     struct wine_cmd_pool *object;
     VkResult res;
@@ -496,6 +523,7 @@ VkResult wine_vkCreateCommandPool(VkDevice client_device, const VkCommandPoolCre
     vulkan_object_init_ptr(&object->obj, host_command_pool, &client_command_pool->obj);
     instance->p_insert_object(instance, &object->obj);
 
+    *command_pool = object->client.command_pool;
     return VK_SUCCESS;
 }
 

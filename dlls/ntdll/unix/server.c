@@ -72,6 +72,7 @@
 #endif
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winnt.h"
 #include "winioctl.h"
@@ -80,8 +81,12 @@
 #include "unix_private.h"
 #include "ddk/wdm.h"
 
+#include "fsync.h"
+
 WINE_DEFAULT_DEBUG_CHANNEL(server);
 WINE_DECLARE_DEBUG_CHANNEL(syscall);
+WINE_DECLARE_DEBUG_CHANNEL(client);
+WINE_DECLARE_DEBUG_CHANNEL(ftrace);
 
 #ifndef MSG_CMSG_CLOEXEC
 #define MSG_CMSG_CLOEXEC 0
@@ -179,8 +184,10 @@ static DECLSPEC_NORETURN void server_protocol_perror( const char *err )
  *
  * Send a request to the server.
  */
-static unsigned int send_request( int request_fd, const struct __server_request_info *req )
+static unsigned int send_request( const struct __server_request_info *req )
 {
+    int request_fd = ntdll_get_thread_data()->request_fd;
+
     if (!req->u.req.request_header.request_size)
     {
         data_size_t to_write = sizeof(req->u.req);
@@ -243,13 +250,13 @@ static unsigned int send_request( int request_fd, const struct __server_request_
  *
  * Read data from the reply buffer; helper for wait_reply.
  */
-static void read_reply_data( int reply_fd, void *buffer, size_t size )
+static void read_reply_data( void *buffer, size_t size )
 {
     int ret;
 
     for (;;)
     {
-        if ((ret = read( reply_fd, buffer, size )) > 0)
+        if ((ret = read( ntdll_get_thread_data()->reply_fd, buffer, size )) > 0)
         {
             if (!(size -= ret)) return;
             buffer = (char *)buffer + ret;
@@ -270,11 +277,11 @@ static void read_reply_data( int reply_fd, void *buffer, size_t size )
  *
  * Wait for a reply from the server.
  */
-static inline unsigned int wait_reply( int reply_fd, struct __server_request_info *req )
+static inline unsigned int wait_reply( struct __server_request_info *req )
 {
-    read_reply_data( reply_fd, &req->u.reply, sizeof(req->u.reply) );
+    read_reply_data( &req->u.reply, sizeof(req->u.reply) );
     if (req->u.reply.reply_header.reply_size)
-        read_reply_data( reply_fd, req->reply_data, req->u.reply.reply_header.reply_size );
+        read_reply_data( req->reply_data, req->u.reply.reply_header.reply_size );
     return req->u.reply.reply_header.error;
 }
 
@@ -284,12 +291,16 @@ static inline unsigned int wait_reply( int reply_fd, struct __server_request_inf
  */
 unsigned int server_call_unlocked( void *req_ptr )
 {
-    struct thread_data *data = get_thread_data();
     struct __server_request_info * const req = req_ptr;
     unsigned int ret;
 
-    if ((ret = send_request( data->request_fd, req ))) return ret;
-    return wait_reply( data->reply_fd, req );
+    FTRACE_BLOCK_START("req %s", req->name)
+    TRACE_(client)("%s start\n", req->name); \
+    if (!(ret = send_request( req )))
+        ret = wait_reply( req );
+    TRACE_(client)("%s end\n", req->name);
+    FTRACE_BLOCK_END()
+    return ret;
 }
 
 
@@ -346,25 +357,24 @@ void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigse
  *
  * Wait for a reply on the waiting pipe of the current thread.
  */
-static int wait_select_reply( int wait_fd[2], void *cookie )
+static int wait_select_reply( void *cookie )
 {
     int signaled;
     struct wake_up_reply reply;
-
     for (;;)
     {
         int ret;
-        ret = read( wait_fd[0], &reply, sizeof(reply) );
+        ret = read( ntdll_get_thread_data()->wait_fd[0], &reply, sizeof(reply) );
         if (ret == sizeof(reply))
         {
             if (!reply.cookie) abort_thread( reply.signaled );  /* thread got killed */
             if (wine_server_get_ptr(reply.cookie) == cookie) return reply.signaled;
             /* we stole another reply, wait for the real one */
-            signaled = wait_select_reply( wait_fd, cookie );
+            signaled = wait_select_reply( cookie );
             /* and now put the wrong one back in the pipe */
             for (;;)
             {
-                ret = write( wait_fd[1], &reply, sizeof(reply) );
+                ret = write( ntdll_get_thread_data()->wait_fd[1], &reply, sizeof(reply) );
                 if (ret == sizeof(reply)) break;
                 if (ret >= 0) server_protocol_error( "partial wakeup write %d\n", ret );
                 if (errno == EINTR) continue;
@@ -545,7 +555,7 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
         if ((ULONG_PTR)addr == call->virtual_flush.addr && size == call->virtual_flush.size)
         {
             result->virtual_flush.status = NtFlushVirtualMemory( NtCurrentProcess(),
-                                                                 (const void **)&addr, &size, NULL );
+                                                                 (const void **)&addr, &size, 0 );
             result->virtual_flush.addr = wine_server_client_ptr( addr );
             result->virtual_flush.size = size;
         }
@@ -720,7 +730,6 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
 {
     unsigned int ret;
     int cookie;
-    struct thread_data *data = get_thread_data();
     obj_handle_t apc_handle = 0;
     BOOL suspend_context = !!context;
     union apc_result result;
@@ -774,7 +783,9 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
         pthread_sigmask( SIG_SETMASK, &old_set, NULL );
         if (signaled) break;
 
-        ret = wait_select_reply( data->wait_fd, &cookie );
+        FTRACE_BLOCK_START("select_reply")
+        ret = wait_select_reply( &cookie );
+        FTRACE_BLOCK_END()
     }
     while (ret == STATUS_USER_APC || ret == STATUS_KERNEL_APC);
 
@@ -1321,22 +1332,22 @@ static const char *init_server_dir( dev_t dev, ino_t ino )
  */
 static int setup_config_dir(void)
 {
-    char *p, *dir;
+    char *p;
     struct stat st;
     int fd_cwd = open( ".", O_RDONLY );
 
     if (chdir( config_dir ) == -1)
     {
         if (errno != ENOENT) fatal_perror( "cannot use directory %s", config_dir );
-        dir = strdup( config_dir );
-        if ((p = strrchr( dir, '/' )) && p != dir)
+        if ((p = strrchr( config_dir, '/' )) && p != config_dir)
         {
-            while (p > dir + 1 && p[-1] == '/') p--;
+            while (p > config_dir + 1 && p[-1] == '/') p--;
             *p = 0;
-            if (!stat( dir, &st ) && st.st_uid != getuid())
-                fatal_error( "'%s' is not owned by you, refusing to create a configuration directory there\n", dir );
+            if (!stat( config_dir, &st ) && st.st_uid != getuid())
+                fatal_error( "'%s' is not owned by you, refusing to create a configuration directory there\n",
+                             config_dir );
+            *p = '/';
         }
-        free( dir );
         mkdir( config_dir, 0777 );
         if (chdir( config_dir ) == -1) fatal_perror( "chdir to %s", config_dir );
         MESSAGE( "wine: created the configuration directory '%s'\n", config_dir );
@@ -1415,8 +1426,6 @@ static int server_connect(void)
     /* chdir to the server directory */
     if (chdir( server_dir ) == -1)
     {
-        MESSAGE( "[OHOS-LOADER] server_connect chdir(%s) failed errno=%d (ENOENT=%d), calling start_server\n",
-                 server_dir, errno, ENOENT );
         if (errno != ENOENT) fatal_perror( "chdir to %s", server_dir );
         start_server( TRACE_ON(server) );
         if (chdir( server_dir ) == -1) fatal_perror( "chdir to %s", server_dir );
@@ -1433,14 +1442,11 @@ static int server_connect(void)
         if (retry)
         {
             usleep( 100000 * retry * retry );
-            MESSAGE( "[OHOS-LOADER] server_connect retry=%d, calling start_server\n", retry );
             start_server( TRACE_ON(server) );
             if (lstat( SOCKETNAME, &st ) == -1) continue;  /* still no socket, wait a bit more */
         }
         else if (lstat( SOCKETNAME, &st ) == -1) /* check for an already existing socket */
         {
-            MESSAGE( "[OHOS-LOADER] server_connect no socket at %s/%s, errno=%d, calling start_server\n",
-                     server_dir, SOCKETNAME, errno );
             if (errno != ENOENT) fatal_perror( "lstat %s/%s", server_dir, SOCKETNAME );
             start_server( TRACE_ON(server) );
             if (lstat( SOCKETNAME, &st ) == -1) continue;  /* still no socket, wait a bit more */
@@ -1564,34 +1570,22 @@ static int get_unix_tid(void)
  *
  * Create the server->client communication pipe.
  */
-static int init_thread_pipe( struct thread_data *data )
+static int init_thread_pipe(void)
 {
     int reply_pipe[2];
     stack_t ss;
 
-    ss.ss_sp    = data->signal_stack;
+    ss.ss_sp    = get_signal_stack();
     ss.ss_size  = signal_stack_size;
     ss.ss_flags = 0;
     sigaltstack( &ss, NULL );
 
     if (server_pipe( reply_pipe ) == -1) server_protocol_perror( "pipe" );
-    if (server_pipe( data->wait_fd ) == -1) server_protocol_perror( "pipe" );
+    if (server_pipe( ntdll_get_thread_data()->wait_fd ) == -1) server_protocol_perror( "pipe" );
     wine_server_send_fd( reply_pipe[1] );
-    wine_server_send_fd( data->wait_fd[1] );
-    data->reply_fd = reply_pipe[0];
+    wine_server_send_fd( ntdll_get_thread_data()->wait_fd[1] );
+    ntdll_get_thread_data()->reply_fd = reply_pipe[0];
     return reply_pipe[1];
-}
-
-
-/***********************************************************************
- *           init_teb_data
- */
-static void init_teb_data( struct thread_data *data )
-{
-    struct teb_data *teb_data = get_teb_data( data );
-
-    teb_data->syscall_table = KeServiceDescriptorTable;
-    teb_data->syscall_trace = TRACE_ON(syscall);
 }
 
 
@@ -1614,58 +1608,52 @@ void process_exit_wrapper( int status )
  */
 size_t server_init_process(void)
 {
+    struct cpu_topology_override *cpu_override;
     const char *arch = getenv( "WINEARCH" );
     const char *env_socket = getenv( "WINESERVERSOCKET" );
-    struct thread_data *data = get_thread_data();
+    struct ntdll_thread_data *data = ntdll_get_thread_data();
     obj_handle_t version;
     unsigned int i;
     int ret, reply_pipe;
     struct sigaction sig_act;
     size_t info_size;
+    DWORD pid, tid;
 
     server_pid = -1;
     if (env_socket)
     {
-        MESSAGE( "[OHOS-LOADER] server_init WINESERVERSOCKET=%s, using fd directly\n", env_socket );
         fd_socket = atoi( env_socket );
 
-#ifdef PAD_MODE
-        /* PAD_MODE: wineserver 可能在进程间传递 fd 期间退出。
-         * recv(MSG_PEEK|MSG_DONTWAIT) 检测: 对方关闭返回 0，存活且无数据
-         * 返回 -1/EAGAIN，有数据返回 >0（MSG_PEEK 不消耗）。 */
+#ifdef __OHOS__
+        /* OHOS: wineserver 可能在进程间传递 fd 期间退出。
+         * recv(MSG_PEEK|MSG_DONTWAIT) 检测存活状态。 */
         {
             char dummy;
             ssize_t peek = recv( fd_socket, &dummy, 1, MSG_PEEK | MSG_DONTWAIT );
             if (peek == 0 || (peek == -1 && errno != EAGAIN && errno != EWOULDBLOCK))
             {
-                MESSAGE( "[OHOS-LOADER] server_init WINESERVERSOCKET fd=%d dead (peek=%zd errno=%d), "
-                         "falling back to server_connect\n",
-                         fd_socket, peek, peek == -1 ? errno : 0 );
                 close( fd_socket );
-                goto server_connect_fallback;
+                env_socket = NULL;  /* dead socket → fall through to connect */
             }
         }
 #endif
-
+    }
+    if (env_socket)
+    {
         if (fcntl( fd_socket, F_SETFD, FD_CLOEXEC ) == -1)
             fatal_perror( "Bad server socket %d", fd_socket );
         unsetenv( "WINESERVERSOCKET" );
     }
     else
     {
-    server_connect_fallback:
-        MESSAGE( "[OHOS-LOADER] server_init NO WINESERVERSOCKET, calling server_connect()\n" );
-        {
-            const char *arch = getenv( "WINEARCH" );
+        const char *arch = getenv( "WINEARCH" );
 
-            if (is_win64 && arch && !strcmp( arch, "win32" ))
-                fatal_error( "WINEARCH is set to 'win32' but this is not supported in wow64 mode.\n" );
-            if (arch && strcmp( arch, "win32" ) && strcmp( arch, "win64" ) && strcmp( arch, "wow64" ))
-                fatal_error( "WINEARCH set to invalid value '%s', it must be win32, win64, or wow64.\n", arch );
+        if (is_win64 && arch && !strcmp( arch, "win32" ))
+            fatal_error( "WINEARCH is set to 'win32' but this is not supported in wow64 mode.\n" );
+        if (arch && strcmp( arch, "win32" ) && strcmp( arch, "win64" ) && strcmp( arch, "wow64" ))
+            fatal_error( "WINEARCH set to invalid value '%s', it must be win32, win64, or wow64.\n", arch );
 
-            fd_socket = server_connect();
-            MESSAGE( "[OHOS-LOADER] server_connect returned fd=%d\n", fd_socket );
-        }
+        fd_socket = server_connect();
     }
 
     /* setup the signal mask */
@@ -1674,7 +1662,6 @@ size_t server_init_process(void)
     sigaddset( &server_block_set, SIGIO );
     sigaddset( &server_block_set, SIGINT );
     sigaddset( &server_block_set, SIGHUP );
-    sigaddset( &server_block_set, SIGQUIT );
     sigaddset( &server_block_set, SIGUSR1 );
     sigaddset( &server_block_set, SIGUSR2 );
     sigaddset( &server_block_set, SIGCHLD );
@@ -1709,27 +1696,36 @@ size_t server_init_process(void)
     sigemptyset( &sig_act.sa_mask );
     sigaction( SIGPIPE, &sig_act, NULL );
 
-    reply_pipe = init_thread_pipe( data );
+    reply_pipe = init_thread_pipe();
+
+    fill_cpu_override();
+    cpu_override = get_cpu_topology_override();
 
     SERVER_START_REQ( init_first_thread )
     {
+        if (cpu_override)
+            wine_server_add_data( req, cpu_override, sizeof(*cpu_override) );
         req->unix_pid    = getpid();
         req->unix_tid    = get_unix_tid();
         req->reply_fd    = reply_pipe;
         req->wait_fd     = data->wait_fd[1];
         req->debug_level = (TRACE_ON(server) != 0);
-        req->page_size   = get_host_page_size();
         wine_server_set_reply( req, supported_machines, sizeof(supported_machines) );
         if (!(ret = wine_server_call( req )))
         {
             obj_handle_t handle;
             pid               = reply->pid;
-            data->tid         = reply->tid;
+            tid               = reply->tid;
             peb->SessionId    = reply->session_id;
             info_size         = reply->info_size;
             server_start_time = reply->server_start;
             supported_machines_count = wine_server_reply_size( reply ) / sizeof(*supported_machines);
-            if (reply->inproc_device)
+            if (reply->inproc_device == FSYNC_USED_BY_SERVER)
+            {
+                inproc_device_fd = FSYNC_USED_BY_SERVER;
+                fsync_init( pid );
+            }
+            else if (reply->inproc_device)
             {
                 inproc_device_fd = wine_server_receive_fd( &handle );
                 assert( handle == reply->inproc_device );
@@ -1751,8 +1747,8 @@ size_t server_init_process(void)
         if (arch && !strcmp( arch, "win32" ))
             fatal_error( "WINEARCH set to win32 but '%s' is a 64-bit installation.\n", config_dir );
 #ifndef _WIN64
-        data->teb->GdiBatchCount = PtrToUlong( (char *)data->teb - teb_offset );
-        data->teb->WowTebOffset  = -teb_offset;
+        NtCurrentTeb()->GdiBatchCount = PtrToUlong( (char *)NtCurrentTeb() - teb_offset );
+        NtCurrentTeb()->WowTebOffset  = -teb_offset;
         wow_peb = (PEB64 *)((char *)peb - page_size);
 #endif
     }
@@ -1764,7 +1760,7 @@ size_t server_init_process(void)
             fatal_error( "WINEARCH set to %s but '%s' is a 32-bit installation.\n", arch, config_dir );
     }
 
-    set_thread_id( data );
+    set_thread_id( NtCurrentTeb(), pid, tid );
 
     for (i = 0; i < supported_machines_count; i++)
         if (supported_machines[i] == current_machine) return info_size;
@@ -1778,10 +1774,11 @@ size_t server_init_process(void)
  */
 void server_init_process_done(void)
 {
+    void *teb;
     unsigned int status;
+    int suspend;
     FILE_FS_DEVICE_INFORMATION info;
-    struct thread_data *data = get_thread_data();
-    TEB64 *teb64 = get_teb64( data->teb );
+    struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
 
     if (!get_device_info( initial_cwd, &info ) && (info.Characteristics & FILE_REMOVABLE_MEDIA))
         chdir( "/" );
@@ -1794,20 +1791,38 @@ void server_init_process_done(void)
     /* Install signal handlers; this cannot be done earlier, since we cannot
      * send exceptions to the debugger before the create process event that
      * is sent by init_process_done */
-    signal_init_process( data->teb );
-    init_teb_data( data );
+    signal_init_process();
+    thread_data->syscall_table = KeServiceDescriptorTable;
+    thread_data->syscall_trace = TRACE_ON(syscall);
+
+    /* always send the native TEB */
+    if (!(teb = NtCurrentTeb64())) teb = NtCurrentTeb();
+
     /* Signal the parent process to continue */
     SERVER_START_REQ( init_process_done )
     {
-        req->teb = wine_server_client_ptr( teb64 ? (void *)teb64 : (void *)data->teb );
-        req->peb = teb64 ? teb64->Peb : wine_server_client_ptr( peb );
+        req->teb = wine_server_client_ptr( teb );
+        req->peb = NtCurrentTeb64() ? NtCurrentTeb64()->Peb : wine_server_client_ptr( peb );
         status = wine_server_call( req );
-        data->suspend = reply->suspend;
+        suspend = reply->suspend;
     }
     SERVER_END_REQ;
 
     assert( !status );
-    signal_start_thread( main_image_info.TransferAddress, peb, data->teb );
+    if (peb->BeingDebugged)
+    {
+        peb->ProcessParameters->Flags &= ~PROCESS_PARAMS_IMAGE_KEY_MISSING;
+        if (wow_peb)
+        {
+#ifdef _WIN64
+            RTL_USER_PROCESS_PARAMETERS32 *wow64_params = ULongToPtr(wow_peb->ProcessParameters);
+#else
+            RTL_USER_PROCESS_PARAMETERS64 *wow64_params = ULongToPtr(wow_peb->ProcessParameters);
+#endif
+            wow64_params->Flags &= ~PROCESS_PARAMS_IMAGE_KEY_MISSING;
+        }
+    }
+    signal_start_thread( main_image_info.TransferAddress, peb, suspend, NtCurrentTeb() );
 }
 
 
@@ -1816,39 +1831,26 @@ void server_init_process_done(void)
  *
  * Send an init thread request.
  */
-void server_init_thread( struct thread_data *data )
+void server_init_thread( void *entry_point, BOOL *suspend )
 {
-    int reply_pipe;
-    TEB64 *teb64 = get_teb64( data->teb );
+    void *teb;
+    int reply_pipe = init_thread_pipe();
 
-    data->pthread_id = pthread_self();
-    pthread_setspecific( thread_data_key, data );
+    /* always send the native TEB */
+    if (!(teb = NtCurrentTeb64())) teb = NtCurrentTeb();
 
-    reply_pipe = init_thread_pipe( data );
     SERVER_START_REQ( init_thread )
     {
         req->unix_tid  = get_unix_tid();
-        req->teb       = wine_server_client_ptr( teb64 ? (void *)teb64 : (void *)data->teb );
+        req->teb       = wine_server_client_ptr( teb );
+        req->entry     = wine_server_client_ptr( entry_point );
         req->reply_fd  = reply_pipe;
-        req->wait_fd   = data->wait_fd[1];
-        if (data->teb) req->entry = wine_server_client_ptr( data->start );
+        req->wait_fd   = ntdll_get_thread_data()->wait_fd[1];
         wine_server_call( req );
-        data->suspend = reply->suspend;
+        *suspend = reply->suspend;
     }
     SERVER_END_REQ;
     close( reply_pipe );
-
-    if (data->teb)
-    {
-        init_teb_data( data );
-        signal_start_thread( data->start, data->param, data->teb );
-    }
-    else
-    {
-        void (*entry)(void *) = data->start;
-        entry( data->param );
-        PsTerminateSystemThread( 1 );
-    }
 }
 
 NTSTATUS WINAPI NtAllocateReserveObject( HANDLE *handle, const OBJECT_ATTRIBUTES *attr,
@@ -2010,10 +2012,8 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     if (!peb->BeingDebugged) return ret;
     if (!NtQueryInformationProcess( NtCurrentProcess(), ProcessDebugPort, &port, sizeof(port), NULL) && port)
     {
-        struct thread_data *data = get_thread_data();
-        if (!data->teb) return ret;
-        data->teb->ExceptionCode = ret;
-        call_raise_user_exception_dispatcher( data );
+        NtCurrentTeb()->ExceptionCode = ret;
+        call_raise_user_exception_dispatcher();
     }
     return ret;
 }

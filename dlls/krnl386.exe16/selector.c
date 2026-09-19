@@ -150,8 +150,7 @@ BOOL ldt_get_entry( WORD sel, LDT_ENTRY *entry )
  */
 void ldt_set_entry( WORD sel, LDT_ENTRY entry )
 {
-    union { LDT_ENTRY entry; ULONG ul[2]; } e = { .entry = entry };
-    NtSetLdtEntries( sel, e.ul[0], e.ul[1], 0, 0, 0 );
+    NtSetLdtEntries( sel, entry, 0, null_entry );
 }
 
 /***********************************************************************

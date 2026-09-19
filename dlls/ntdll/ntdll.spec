@@ -6,9 +6,6 @@
 @ stdcall A_SHAFinal(ptr ptr)
 @ stdcall A_SHAInit(ptr)
 @ stdcall A_SHAUpdate(ptr ptr long)
-@ stdcall AlpcGetHeaderSize(long)
-@ stdcall AlpcInitializeMessageAttribute(long ptr long ptr)
-@ stdcall AlpcGetMessageAttribute(ptr long)
 @ stdcall ApiSetQueryApiSetPresence(ptr ptr)
 @ stdcall ApiSetQueryApiSetPresenceEx(ptr ptr ptr)
 @ stub CsrAllocateCaptureBuffer
@@ -155,12 +152,6 @@
 @ stdcall -syscall NtAllocateUuids(ptr ptr ptr ptr)
 @ stdcall -syscall=0x0018 NtAllocateVirtualMemory(long ptr long ptr long long)
 @ stdcall -syscall NtAllocateVirtualMemoryEx(long ptr ptr long long ptr long)
-@ stdcall -syscall NtAlpcAcceptConnectPort(ptr ptr long ptr ptr ptr ptr ptr long)
-@ stdcall -syscall NtAlpcConnectPort(ptr ptr ptr ptr long ptr ptr ptr ptr ptr ptr)
-@ stdcall -syscall NtAlpcCreatePort(ptr ptr ptr)
-@ stdcall -syscall NtAlpcDisconnectPort(ptr long)
-@ stdcall -syscall NtAlpcImpersonateClientOfPort(ptr ptr ptr)
-@ stdcall -syscall NtAlpcSendWaitReceivePort(ptr long ptr ptr ptr ptr ptr ptr)
 @ stub -syscall=0x004c NtApphelpCacheControl
 @ stdcall -syscall NtAreMappedFilesTheSame(ptr ptr)
 @ stdcall -syscall NtAssignProcessToJobObject(long long)
@@ -239,7 +230,7 @@
 @ stdcall -syscall NtFlushInstructionCache(long ptr long)
 @ stdcall -syscall NtFlushKey(long)
 @ stdcall -syscall NtFlushProcessWriteBuffers()
-@ stdcall -syscall NtFlushVirtualMemory(long ptr ptr ptr)
+@ stdcall -syscall NtFlushVirtualMemory(long ptr ptr long)
 # @ stub NtFlushWriteBuffer
 # @ stub NtFreeUserPhysicalPages
 @ stdcall -syscall=0x001e NtFreeVirtualMemory(long ptr ptr long)
@@ -412,7 +403,7 @@
 @ stdcall -syscall NtSetIntervalProfile(long long)
 @ stdcall -syscall NtSetIoCompletion(ptr long long long long)
 @ stdcall -syscall NtSetIoCompletionEx(ptr ptr long long long long)
-@ stdcall -syscall NtSetLdtEntries(long long long long long long)
+@ stdcall -syscall NtSetLdtEntries(long int64 long int64)
 # @ stub NtSetLowEventPair
 # @ stub NtSetLowWaitHighEventPair
 # @ stub NtSetQuotaInformationFile
@@ -459,12 +450,12 @@
 # @ stub NtWaitHighEventPair
 # @ stub NtWaitLowEventPair
 @ stdcall -syscall=0x0001 NtWorkerFactoryWorkerReady(ptr)
-@ stdcall -syscall -arch=win32 NtWow64AllocateVirtualMemory64(long ptr long long ptr long long)
+@ stdcall -syscall -arch=win32 NtWow64AllocateVirtualMemory64(long ptr int64 ptr long long)
 @ stdcall -syscall -arch=win32 NtWow64GetNativeSystemInformation(long ptr long ptr)
 @ stdcall -syscall -arch=win32 NtWow64IsProcessorFeaturePresent(long)
 @ stdcall -syscall -arch=win32 NtWow64QueryInformationProcess64(long long ptr long ptr)
-@ stdcall -syscall -arch=win32 NtWow64ReadVirtualMemory64(long long long ptr long long ptr)
-@ stdcall -syscall -arch=win32 NtWow64WriteVirtualMemory64(long long long ptr long long ptr)
+@ stdcall -syscall -arch=win32 NtWow64ReadVirtualMemory64(long int64 ptr int64 ptr)
+@ stdcall -syscall -arch=win32 NtWow64WriteVirtualMemory64(long int64 ptr int64 ptr)
 @ stdcall -syscall=0x0008 NtWriteFile(long long ptr ptr ptr ptr long ptr ptr)
 @ stdcall -syscall=0x001b NtWriteFileGather(long long ptr ptr ptr ptr long ptr ptr)
 @ stdcall -syscall=0x0057 NtWriteRequestData(long ptr long ptr long ptr)
@@ -1150,6 +1141,7 @@
 @ stdcall -arch=win64 RtlWow64PushCrossProcessWorkOntoWorkList(ptr ptr ptr)
 @ stdcall -arch=win64 RtlWow64RequestCrossProcessHeavyFlush(ptr)
 @ stdcall -arch=win64 RtlWow64SetThreadContext(long ptr)
+@ stdcall -arch=win64 RtlWow64SuspendThread(long ptr)
 @ stub RtlWriteMemoryStream
 @ stdcall RtlWriteRegistryValue(long ptr wstr long ptr long)
 @ stub RtlZeroHeap
@@ -1235,12 +1227,6 @@
 @ stdcall -private ZwAllocateUuids(ptr ptr ptr ptr) NtAllocateUuids
 @ stdcall -private ZwAllocateVirtualMemory(long ptr long ptr long long) NtAllocateVirtualMemory
 @ stdcall -private ZwAllocateVirtualMemoryEx(long ptr ptr long long ptr long) NtAllocateVirtualMemoryEx
-@ stdcall -private ZwAlpcAcceptConnectPort(ptr ptr long ptr ptr ptr ptr ptr long) NtAlpcAcceptConnectPort
-@ stdcall -private ZwAlpcConnectPort(ptr ptr ptr ptr long ptr ptr ptr ptr ptr ptr) NtAlpcConnectPort
-@ stdcall -private ZwAlpcCreatePort(ptr ptr ptr) NtAlpcCreatePort
-@ stdcall -private ZwAlpcDisconnectPort(ptr long) NtAlpcDisconnectPort
-@ stdcall -private ZwAlpcImpersonateClientOfPort(ptr ptr ptr) NtAlpcImpersonateClientOfPort
-@ stdcall -private ZwAlpcSendWaitReceivePort(ptr long ptr ptr ptr ptr ptr ptr) NtAlpcSendWaitReceivePort
 @ stdcall -private ZwApphelpCacheControl() NtApphelpCacheControl
 @ stdcall -private ZwAreMappedFilesTheSame(ptr ptr) NtAreMappedFilesTheSame
 @ stdcall -private ZwAssignProcessToJobObject(long long) NtAssignProcessToJobObject
@@ -1318,7 +1304,7 @@
 @ stdcall -private ZwFlushInstructionCache(long ptr long) NtFlushInstructionCache
 @ stdcall -private ZwFlushKey(long) NtFlushKey
 @ stdcall -private ZwFlushProcessWriteBuffers() NtFlushProcessWriteBuffers
-@ stdcall -private ZwFlushVirtualMemory(long ptr ptr ptr) NtFlushVirtualMemory
+@ stdcall -private ZwFlushVirtualMemory(long ptr ptr long) NtFlushVirtualMemory
 # @ stub ZwFlushWriteBuffer
 # @ stub ZwFreeUserPhysicalPages
 @ stdcall -private ZwFreeVirtualMemory(long ptr ptr long) NtFreeVirtualMemory
@@ -1490,7 +1476,7 @@
 @ stdcall -private ZwSetIntervalProfile(long long) NtSetIntervalProfile
 @ stdcall -private ZwSetIoCompletion(ptr long long long long) NtSetIoCompletion
 @ stdcall -private ZwSetIoCompletionEx(ptr ptr long long long long) NtSetIoCompletionEx
-@ stdcall -private ZwSetLdtEntries(long long long long long long) NtSetLdtEntries
+@ stdcall -private ZwSetLdtEntries(long int64 long int64) NtSetLdtEntries
 # @ stub ZwSetLowEventPair
 # @ stub ZwSetLowWaitHighEventPair
 # @ stub ZwSetQuotaInformationFile
@@ -1537,12 +1523,12 @@
 # @ stub ZwWaitHighEventPair
 # @ stub ZwWaitLowEventPair
 @ stdcall -private ZwWorkerFactoryWorkerReady(ptr) NtWorkerFactoryWorkerReady
-@ stdcall -private -arch=win32 ZwWow64AllocateVirtualMemory64(long ptr long long ptr long long) NtWow64AllocateVirtualMemory64
+@ stdcall -private -arch=win32 ZwWow64AllocateVirtualMemory64(long ptr int64 ptr long long) NtWow64AllocateVirtualMemory64
 @ stdcall -private -arch=win32 ZwWow64GetNativeSystemInformation(long ptr long ptr) NtWow64GetNativeSystemInformation
 @ stdcall -private -arch=win32 ZwWow64IsProcessorFeaturePresent(long) NtWow64IsProcessorFeaturePresent
 @ stdcall -private -arch=win32 ZwWow64QueryInformationProcess64(long long ptr long ptr) NtWow64QueryInformationProcess64
-@ stdcall -private -arch=win32 ZwWow64ReadVirtualMemory64(long long long ptr long long ptr) NtWow64ReadVirtualMemory64
-@ stdcall -private -arch=win32 ZwWow64WriteVirtualMemory64(long long long ptr long long ptr) NtWow64WriteVirtualMemory64
+@ stdcall -private -arch=win32 ZwWow64ReadVirtualMemory64(long int64 ptr int64 ptr) NtWow64ReadVirtualMemory64
+@ stdcall -private -arch=win32 ZwWow64WriteVirtualMemory64(long int64 ptr int64 ptr) NtWow64WriteVirtualMemory64
 @ stdcall -private ZwWriteFile(long long ptr ptr ptr ptr long ptr ptr) NtWriteFile
 @ stdcall -private ZwWriteFileGather(long long ptr ptr ptr ptr long ptr ptr) NtWriteFileGather
 @ stdcall -private ZwWriteRequestData(long ptr long ptr long ptr) NtWriteRequestData
@@ -1762,12 +1748,16 @@
 @ cdecl wine_server_handle_to_fd(long long ptr ptr)
 
 # Unix interface
+@ stdcall __wine_unix_call(int64 long ptr) compat___wine_unix_call
 @ stdcall __wine_unix_spawnvp(long ptr)
 @ stdcall __wine_ctrl_routine(ptr)
 @ extern -private __wine_syscall_dispatcher
 @ extern -private __wine_unix_call_dispatcher
 @ extern -private -arch=arm64ec __wine_unix_call_dispatcher_arm64ec
 @ extern -private __wine_unixlib_handle
+@ stdcall __wine_get_unix_env(ptr ptr long)
+@ stdcall __wine_set_unix_env(ptr ptr)
+@ stdcall wine_nt_to_unix_file_name(ptr ptr ptr long) compat_wine_nt_to_unix_file_name
 
 # Debugging
 @ stdcall -norelay __wine_dbg_write(ptr long)
@@ -1775,6 +1765,7 @@
 @ cdecl -norelay __wine_dbg_header(long long str)
 @ cdecl -norelay __wine_dbg_output(str)
 @ cdecl -norelay __wine_dbg_strdup(str)
+@ stdcall -norelay __wine_dbg_ftrace(ptr long long)
 
 # Version
 @ cdecl wine_get_version()

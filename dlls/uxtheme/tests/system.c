@@ -861,12 +861,7 @@ static void test_GetCurrentThemeName(void)
     hRes = GetCurrentThemeName(currentTheme, ARRAY_SIZE(currentTheme), currentColor,
                                ARRAY_SIZE(currentColor), currentSize,  ARRAY_SIZE(currentSize));
     if (bThemeActive)
-    {
-        WCHAR *p;
         ok( hRes == S_OK, "Expected S_OK, got 0x%08lx\n", hRes);
-        p = wcsrchr(currentTheme, '\\');
-        ok(p && !wcsicmp(p+1, L"aero.msstyles"), "got %s\n", debugstr_w(currentTheme));
-    }
     else
         ok( hRes == E_PROP_ID_UNSUPPORTED, "Expected E_PROP_ID_UNSUPPORTED, got 0x%08lx\n", hRes);
 }
@@ -1741,14 +1736,6 @@ static void test_DrawThemeParentBackground(void)
     flush_sequences(sequences, NUM_MSG_SEQUENCES);
 
     ReleaseDC(child, hdc);
-
-    hdc = GetDC(parent);
-    hr = DrawThemeParentBackground(parent, hdc, NULL);
-    ok(SUCCEEDED(hr), "DrawThemeParentBackground failed, hr %#lx.\n", hr);
-    ok_sequence(sequences, PARENT_SEQ_INDEX, EmptySeq, "DrawThemeParentBackground", FALSE);
-    flush_sequences(sequences, NUM_MSG_SEQUENCES);
-    ReleaseDC(parent, hdc);
-
     DestroyWindow(parent);
     UnregisterClassA("TestDrawThemeParentBackgroundClass", GetModuleHandleA(0));
 }

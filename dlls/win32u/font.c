@@ -32,6 +32,7 @@
 #include <pthread.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "winerror.h"
 #include "windef.h"
 #include "winbase.h"
@@ -54,6 +55,7 @@ struct font_physdev
 {
     struct gdi_physdev dev;
     struct gdi_font   *font;
+    UINT               aa_flags;
 };
 
 static inline struct font_physdev *get_font_dev( PHYSDEV dev )
@@ -1018,9 +1020,9 @@ static BOOL enum_fallbacks( DWORD pitch_and_family, int index, WCHAR buffer[LF_F
     {
         const char * const *defaults;
 
-        if ((pitch_and_family & FIXED_PITCH) || (pitch_and_family & 0xf0) == FF_MODERN)
+        if ((pitch_and_family & FIXED_PITCH) || (pitch_and_family & 0x70) == FF_MODERN)
             defaults = default_fixed_list;
-        else if ((pitch_and_family & 0xf0) == FF_ROMAN)
+        else if ((pitch_and_family & 0x70) == FF_ROMAN)
             defaults = default_serif_list;
         else
             defaults = default_sans_list;
@@ -1577,6 +1579,14 @@ static const WCHAR ms_minchoW[] =
     {'M','S',' ','M','i','n','c','h','o',0};
 static const WCHAR ms_p_minchoW[] =
     {'M','S',' ','P','M','i','n','c','h','o',0};
+static const WCHAR arialW[] =
+    {'A','r','i','a','l',0};
+static const WCHAR arial_boldW[] =
+    {'A','r','i','a','l',' ','B','o','l','d',0};
+static const WCHAR courier_newW[] =
+    {'C','o','u','r','i','e','r',' ','N','e','w',0};
+static const WCHAR courier_new_boldW[] =
+    {'C','o','u','r','i','e','r',' ','N','e','w',' ','B','o','l','d',0};
 
 static const WCHAR * const font_links_list[] =
 {
@@ -3022,6 +3032,10 @@ static void update_font_system_link_info(void)
             }
             set_multi_value_key(hkey, link_reg->font_name, link, len);
         }
+        set_multi_value_key(hkey, arialW, link, len);
+        set_multi_value_key(hkey, arial_boldW, link, len);
+        set_multi_value_key(hkey, courier_newW, link, len);
+        set_multi_value_key(hkey, courier_new_boldW, link, len);
         NtClose( hkey );
     }
 }
@@ -3046,12 +3060,12 @@ static void update_codepage( UINT screen_dpi )
         font_dpi = *(DWORD *)info->Data;
 
     RtlInitCodePageTable( utf8_hdr, &utf8_cp );
-    if (RtlGetCurrentPeb()->AnsiCodePageData)
-        RtlInitCodePageTable( RtlGetCurrentPeb()->AnsiCodePageData, &ansi_cp );
+    if (NtCurrentTeb()->Peb->AnsiCodePageData)
+        RtlInitCodePageTable( NtCurrentTeb()->Peb->AnsiCodePageData, &ansi_cp );
     else
         ansi_cp = utf8_cp;
-    if (RtlGetCurrentPeb()->OemCodePageData)
-        RtlInitCodePageTable( RtlGetCurrentPeb()->OemCodePageData, &oem_cp );
+    if (NtCurrentTeb()->Peb->OemCodePageData)
+        RtlInitCodePageTable( NtCurrentTeb()->Peb->OemCodePageData, &oem_cp );
     else
         oem_cp = utf8_cp;
     snprintf( cpbuf, sizeof(cpbuf), "%u,%u", ansi_cp.CodePage, oem_cp.CodePage );
@@ -3060,7 +3074,13 @@ static void update_codepage( UINT screen_dpi )
     if (query_reg_ascii_value( wine_fonts_key, "Codepages", info, sizeof(value_buffer) ))
     {
         cp_match = !wcscmp( (const WCHAR *)info->Data, cpbufW );
-        if (cp_match && screen_dpi == font_dpi) return;  /* already set correctly */
+        if (cp_match && screen_dpi == font_dpi)
+        {
+            /* already set correctly, but, as a HACK, update font link
+               info anyway, so that old Proton prefixes are fixed */
+            update_font_system_link_info();
+            return;
+        }
         TRACE( "updating registry, codepages/logpixels changed %s/%u -> %u,%u/%u\n",
                debugstr_w((const WCHAR *)info->Data), font_dpi, ansi_cp.CodePage, oem_cp.CodePage, screen_dpi );
     }
@@ -3756,7 +3776,7 @@ static UINT get_glyph_index_linked( struct gdi_font **font, UINT glyph )
 
 static DWORD get_glyph_outline( struct gdi_font *font, UINT glyph, UINT format,
                                 GLYPHMETRICS *gm_ret, ABC *abc_ret, DWORD buflen, void *buf,
-                                const MAT2 *mat )
+                                const MAT2 *mat, UINT aa_flags )
 {
     GLYPHMETRICS gm;
     ABC abc;
@@ -3790,7 +3810,7 @@ static DWORD get_glyph_outline( struct gdi_font *font, UINT glyph, UINT format,
     if (format == GGO_METRICS && !mat && get_gdi_font_glyph_metrics( font, index, &gm, &abc ))
         goto done;
 
-    ret = font_funcs->get_glyph_outline( font, index, format, &gm, &abc, buflen, buf, mat, tategaki );
+    ret = font_funcs->get_glyph_outline( font, index, format, &gm, &abc, buflen, buf, mat, tategaki, aa_flags );
     if (ret == GDI_ERROR) return ret;
 
     if (format == GGO_METRICS && !mat)
@@ -3839,7 +3859,7 @@ static BOOL font_GetCharABCWidths( PHYSDEV dev, UINT first, UINT count, WCHAR *c
     for (i = 0; i < count; i++)
     {
         c = chars ? chars[i] : first + i;
-        get_glyph_outline( physdev->font, c, GGO_METRICS, NULL, &buffer[i], 0, NULL, NULL );
+        get_glyph_outline( physdev->font, c, GGO_METRICS, NULL, &buffer[i], 0, NULL, NULL, physdev->aa_flags );
     }
     pthread_mutex_unlock( &font_lock );
     return TRUE;
@@ -3865,7 +3885,7 @@ static BOOL font_GetCharABCWidthsI( PHYSDEV dev, UINT first, UINT count, WORD *g
     pthread_mutex_lock( &font_lock );
     for (c = 0; c < count; c++, buffer++)
         get_glyph_outline( physdev->font, gi ? gi[c] : first + c, GGO_METRICS | GGO_GLYPH_INDEX,
-                           NULL, buffer, 0, NULL, NULL );
+                           NULL, buffer, 0, NULL, NULL, physdev->aa_flags );
     pthread_mutex_unlock( &font_lock );
     return TRUE;
 }
@@ -3892,7 +3912,7 @@ static BOOL font_GetCharWidth( PHYSDEV dev, UINT first, UINT count, const WCHAR 
     for (i = 0; i < count; i++)
     {
         c = chars ? chars[i] : i + first;
-        if (get_glyph_outline( physdev->font, c, GGO_METRICS, NULL, &abc, 0, NULL, NULL ) == GDI_ERROR)
+        if (get_glyph_outline( physdev->font, c, GGO_METRICS, NULL, &abc, 0, NULL, NULL, physdev->aa_flags ) == GDI_ERROR)
             buffer[i] = 0;
         else
             buffer[i] = abc.abcA + abc.abcB + abc.abcC;
@@ -4071,7 +4091,7 @@ static DWORD font_GetGlyphOutline( PHYSDEV dev, UINT glyph, UINT format,
         return dev->funcs->pGetGlyphOutline( dev, glyph, format, gm, buflen, buf, mat );
     }
     pthread_mutex_lock( &font_lock );
-    ret = get_glyph_outline( physdev->font, glyph, format, gm, NULL, buflen, buf, mat );
+    ret = get_glyph_outline( physdev->font, glyph, format, gm, NULL, buflen, buf, mat, physdev->aa_flags );
     pthread_mutex_unlock( &font_lock );
     return ret;
 }
@@ -4251,7 +4271,7 @@ static BOOL font_GetTextExtentExPoint( PHYSDEV dev, const WCHAR *str, INT count,
     pthread_mutex_lock( &font_lock );
     for (i = pos = 0; i < count; i++)
     {
-        get_glyph_outline( physdev->font, str[i], GGO_METRICS, NULL, &abc, 0, NULL, NULL );
+        get_glyph_outline( physdev->font, str[i], GGO_METRICS, NULL, &abc, 0, NULL, NULL, physdev->aa_flags );
         pos += abc.abcA + abc.abcB + abc.abcC;
         dxs[i] = pos;
     }
@@ -4281,7 +4301,7 @@ static BOOL font_GetTextExtentExPointI( PHYSDEV dev, const WORD *indices, INT co
     for (i = pos = 0; i < count; i++)
     {
         get_glyph_outline( physdev->font, indices[i], GGO_METRICS | GGO_GLYPH_INDEX,
-                           NULL, &abc, 0, NULL, NULL );
+                           NULL, &abc, 0, NULL, NULL, physdev->aa_flags );
         pos += abc.abcA + abc.abcB + abc.abcC;
         dxs[i] = pos;
     }
@@ -4595,6 +4615,7 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
                     *aa_flags = font_smoothing;
             }
             *aa_flags = font_funcs->get_aa_flags( font, *aa_flags, antialias_fakes );
+            physdev->aa_flags = *aa_flags;
         }
         TRACE( "%p %s %d aa %x\n", hfont, debugstr_w(lf.lfFaceName), lf.lfHeight, *aa_flags );
         pthread_mutex_unlock( &font_lock );
@@ -5240,7 +5261,12 @@ BOOL WINAPI NtGdiGetTextExtentExW( HDC hdc, const WCHAR *str, INT count, INT max
     if (count < 0) return FALSE;
 
     dc = get_dc_ptr(hdc);
-    if (!dc) return FALSE;
+    if (!dc)
+    {
+        /* TEMP-DIAG(TEXTEXTENT): VGUI2's "Couldn't get string length" lands here. */
+        MESSAGE( "[textextent] FAIL no-dc hdc=%p count=%d flags=%x\n", hdc, count, flags );
+        return FALSE;
+    }
 
     if (!dxs)
     {
@@ -5257,6 +5283,12 @@ BOOL WINAPI NtGdiGetTextExtentExW( HDC hdc, const WCHAR *str, INT count, INT max
         ret = get_char_positions_indices( dc, str, count, pos, size );
     else
         ret = get_char_positions( dc, str, count, pos, size );
+    if (!ret)
+    {
+        WCHAR c0 = count > 0 ? str[0] : 0, c1 = count > 1 ? str[1] : 0, c2 = count > 2 ? str[2] : 0;
+        MESSAGE( "[textextent] FAIL positions hdc=%p count=%d flags=%x chars=%04x,%04x,%04x\n",
+                 hdc, count, flags, c0, c1, c2 );
+    }
     if (ret)
     {
         if (dxs || nfit)
@@ -5805,11 +5837,12 @@ BOOL WINAPI NtGdiExtTextOutW( HDC hdc, INT x, INT y, UINT flags, const RECT *lpr
     INT char_extra;
     SIZE sz;
     RECT rc;
-    POINT *deltas = NULL, width = {0, 0};
+    POINT *deltas = NULL, width = {0, 0}, text_box_dim[2] = {{ 0 }};
     DC * dc = get_dc_ptr( hdc );
     PHYSDEV physdev;
     INT breakRem;
     static int quietfixme = 0;
+    INT fill_extra_left = 0, fill_extra_right = 0;
 
     if (!dc) return FALSE;
     if (count > INT_MAX) return FALSE;
@@ -5962,12 +5995,22 @@ BOOL WINAPI NtGdiExtTextOutW( HDC hdc, INT x, INT y, UINT flags, const RECT *lpr
             deltas[i].y = desired[1].y - width.y;
 
             width = desired[1];
+            text_box_dim[1] = width;
         }
         flags |= ETO_PDY;
     }
     else
     {
         POINT desired[2];
+        ULONG abc_flags = NTGDI_GETCHARABCWIDTHS_INT;
+        BOOL mirror_x = FALSE, mirror_y = FALSE;
+        ABC abc;
+
+        if (dc->attr->graphics_mode == GM_COMPATIBLE && dc->vport2WorldValid)
+        {
+            mirror_x = dc->xformWorld2Vport.eM11 < 0;
+            mirror_y = dc->xformWorld2Vport.eM22 < 0;
+        }
 
         NtGdiGetTextExtentExW( hdc, str, count, 0, NULL, NULL, &sz, !!(flags & ETO_GLYPH_INDEX) );
         desired[0].x = desired[0].y = 0;
@@ -5977,13 +6020,31 @@ BOOL WINAPI NtGdiExtTextOutW( HDC hdc, INT x, INT y, UINT flags, const RECT *lpr
         desired[1].x -= desired[0].x;
         desired[1].y -= desired[0].y;
 
-        if (dc->attr->graphics_mode == GM_COMPATIBLE)
+        text_box_dim[1].x = sz.cx;
+        if (flags & ETO_GLYPH_INDEX)
+            abc_flags |= NTGDI_GETCHARABCWIDTHS_INDICES;
+
+        memset( &abc, 0, sizeof(abc) );
+        NtGdiGetCharABCWidthsW( hdc, 0, 1, (WCHAR *)str, abc_flags, &abc );
+        if (mirror_x && abc.abcC < 0)       text_box_dim[0].x += abc.abcC;
+        else if (!mirror_x && abc.abcA < 0) text_box_dim[0].x += abc.abcA;
+
+        memset( &abc, 0, sizeof(abc) );
+        NtGdiGetCharABCWidthsW( hdc, 0, 1, (WCHAR *)(str + count - 1), abc_flags, &abc );
+        if (mirror_x && abc.abcA < 0)       text_box_dim[1].x -= abc.abcA;
+        else if (!mirror_x && abc.abcC < 0) text_box_dim[1].x -= abc.abcC;
+
+        lp_to_dp(dc, text_box_dim, 2);
+
+        text_box_dim[0].x -= desired[0].x;
+        text_box_dim[1].x -= desired[0].x;
+        if (mirror_x)
         {
-            if (dc->vport2WorldValid && dc->xformWorld2Vport.eM11 < 0)
-                desired[1].x = -desired[1].x;
-            if (dc->vport2WorldValid && dc->xformWorld2Vport.eM22 < 0)
-                desired[1].y = -desired[1].y;
+            desired[1].x = -desired[1].x;
+            text_box_dim[0].x = -text_box_dim[0].x;
+            text_box_dim[1].x = -text_box_dim[1].x;
         }
+        if (mirror_y) desired[1].y = -desired[1].y;
         width = desired[1];
     }
 
@@ -6040,12 +6101,12 @@ BOOL WINAPI NtGdiExtTextOutW( HDC hdc, INT x, INT y, UINT flags, const RECT *lpr
         if(!((flags & ETO_CLIPPED) && (flags & ETO_OPAQUE)))
         {
             if(!(flags & ETO_OPAQUE) || !lprect ||
-               x < rc.left || x + width.x >= rc.right ||
+               x - fill_extra_left < rc.left || x + width.x + fill_extra_right >= rc.right ||
                y - tm.tmAscent < rc.top || y + tm.tmDescent >= rc.bottom)
             {
                 RECT text_box;
-                text_box.left = x;
-                text_box.right = x + width.x;
+                text_box.left = x + text_box_dim[0].x;
+                text_box.right = x + text_box_dim[1].x;
                 text_box.top = y - tm.tmAscent;
                 text_box.bottom = y + tm.tmDescent;
 
@@ -6594,19 +6655,11 @@ static void update_external_font_keys(void)
 
         path = get_nt_path( (WCHAR *)(buffer + info->DataOffset) );
         if ((tmp = wcsrchr( value, ' ' )) && !facename_compare( tmp, true_type_suffixW, -1 )) *tmp = 0;
-        if ((face = find_face_from_full_name( value )))
+        if ((face = find_face_from_full_name( value )) && !wcsicmp( face->file, path ))
         {
-            if (!wcsicmp( face->file, path ))
-            {
-                face->flags |= ADDFONT_EXTERNAL_FOUND;
-                free( path );
-                continue;
-            }
-            if (!(face->flags & ADDFONT_EXTERNAL_FONT))
-            {
-                free( path );
-                continue;
-            }
+            face->flags |= ADDFONT_EXTERNAL_FOUND;
+            free( path );
+            continue;
         }
         if (tmp && !*tmp) *tmp = ' ';
         if (!(key = malloc( sizeof(*key) ))) break;

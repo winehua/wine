@@ -70,6 +70,7 @@
 #endif
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "winternl.h"
 #include "ddk/wdm.h"
 #include "wine/server.h"
@@ -78,7 +79,10 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(thread);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
+WINE_DECLARE_DEBUG_CHANNEL(syscall);
 WINE_DECLARE_DEBUG_CHANNEL(threadname);
+
+pthread_key_t teb_key = 0;
 
 static LONG nb_threads = 1;
 
@@ -1101,13 +1105,31 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
  */
 static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
 {
-    struct thread_data *data = get_thread_data();
-    close( data->alert_fd );
-    close( data->wait_fd[0] );
-    close( data->wait_fd[1] );
-    close( data->reply_fd );
-    close( data->request_fd );
+    close( ntdll_get_thread_data()->alert_fd );
+    close( ntdll_get_thread_data()->wait_fd[0] );
+    close( ntdll_get_thread_data()->wait_fd[1] );
+    close( ntdll_get_thread_data()->reply_fd );
+    close( ntdll_get_thread_data()->request_fd );
     pthread_exit( UIntToPtr(status) );
+}
+
+
+/***********************************************************************
+ *           start_thread
+ *
+ * Startup routine for a newly created thread.
+ */
+static void start_thread( TEB *teb )
+{
+    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
+    BOOL suspend;
+
+    thread_data->syscall_table = KeServiceDescriptorTable;
+    thread_data->syscall_trace = TRACE_ON(syscall);
+    thread_data->pthread_id = pthread_self();
+    pthread_setspecific( teb_key, teb );
+    server_init_thread( thread_data->start, &suspend );
+    signal_start_thread( thread_data->start, thread_data->param, suspend, teb );
 }
 
 
@@ -1132,16 +1154,16 @@ static SIZE_T get_machine_context_size( USHORT machine )
  *
  * cf. RtlWow64GetCurrentCpuArea
  */
-void *get_cpu_area( struct thread_data *data, USHORT machine )
+void *get_cpu_area( USHORT machine )
 {
     WOW64_CPURESERVED *cpu;
     ULONG align;
 
     if (!is_wow64()) return NULL;
 #ifdef _WIN64
-    cpu = data->teb->TlsSlots[WOW64_TLS_CPURESERVED];
+    cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
 #else
-    cpu = ULongToPtr( get_teb64(data->teb)->TlsSlots[WOW64_TLS_CPURESERVED] );
+    cpu = ULongToPtr( NtCurrentTeb64()->TlsSlots[WOW64_TLS_CPURESERVED] );
 #endif
     if (cpu->Machine != machine) return NULL;
     switch (cpu->Machine)
@@ -1159,16 +1181,17 @@ void *get_cpu_area( struct thread_data *data, USHORT machine )
 /***********************************************************************
  *           set_thread_id
  */
-void set_thread_id( struct thread_data *data )
+void set_thread_id( TEB *teb, DWORD pid, DWORD tid )
 {
-    TEB *teb = data->teb;
     WOW_TEB *wow_teb = get_wow_teb( teb );
 
-    teb->RealClientId = teb->ClientId = make_client_id( pid, data->tid );
+    teb->ClientId.UniqueProcess = ULongToHandle( pid );
+    teb->ClientId.UniqueThread  = ULongToHandle( tid );
+    teb->RealClientId = teb->ClientId;
     if (wow_teb)
     {
         wow_teb->ClientId.UniqueProcess = pid;
-        wow_teb->ClientId.UniqueThread  = data->tid;
+        wow_teb->ClientId.UniqueThread  = tid;
         wow_teb->RealClientId = wow_teb->ClientId;
     }
 }
@@ -1177,11 +1200,122 @@ void set_thread_id( struct thread_data *data )
 /***********************************************************************
  *           init_thread_stack
  */
+/* WineHua 诊断 (2026-09-19): 阻塞在 unix 调用里的 ARM64EC 线程, 其 guest(x64)
+ * 上下文保存在 TEB 的 CHPE v2 CPU area —— ContextAmd64->Rip/Rsp 就是它调用的那个
+ * Win32 API 的位置, 栈上的返回地址则是调用者。Steam 客户端 "CreateResponse 之后
+ * 等不到 BrowserReady" 这类"全体线程空闲"的卡死, 只有这份数据能定位。
+ * 由 ohos_prof_handler (SIGPROF) 调用; app 侧看门狗会把 SIGPROF 投到每个线程。 */
+#if defined(__aarch64__)
+#ifndef SYS_gettid
+#define SYS_gettid 178
+#endif
+void ohos_prof_dump_guest_context( void )
+{
+    TEB *teb = NtCurrentTeb();
+    WOW_TEB *wow_teb;
+    uintptr_t lo, hi;
+    uint64_t rip = 0, rsp = 0;
+    const char *src = "none";
+    char buf[160];
+    int n, i;
+
+    if (!teb) return;
+    wow_teb = get_wow_teb( teb );
+
+    /* 1) CHPE v2 (ARM64EC) CPU area —— x64 guest 经 FEX 运行时不一定会填 */
+    {
+        CHPE_V2_CPU_AREA_INFO *area = teb->ChpeV2CpuAreaInfo;
+        ARM64EC_NT_CONTEXT *ctx = area ? area->ContextAmd64 : NULL;
+        if (ctx && (ctx->Pc || ctx->Sp))
+        {
+            rip = (uint64_t)ctx->Pc;      /* ARM64EC_NT_CONTEXT: Pc/Sp 即 x64 的 Rip/Rsp */
+            rsp = (uint64_t)ctx->Sp;
+            src = "chpev2";
+        }
+    }
+    /* 2) WoW64 CPU area (x64 guest 走 FEX/wow64 时上下文在这里) */
+    if (!rip && !rsp && wow_teb)
+    {
+        WOW64_CPURESERVED *cpu = (WOW64_CPURESERVED *)wow_teb->TlsSlots[WOW64_TLS_CPURESERVED];
+        if (cpu && cpu->Machine == IMAGE_FILE_MACHINE_AMD64)
+        {
+            AMD64_CONTEXT *x = (AMD64_CONTEXT *)(((uintptr_t)(cpu + 1) + 15) & ~(uintptr_t)15);
+            if (x->Rip || x->Rsp) { rip = x->Rip; rsp = x->Rsp; src = "wow64"; }
+        }
+        else if (cpu && cpu->Machine == IMAGE_FILE_MACHINE_I386)
+        {
+            I386_CONTEXT *x = (I386_CONTEXT *)(((uintptr_t)(cpu + 1) + 15) & ~(uintptr_t)15);
+            if (x->Eip || x->Esp) { rip = x->Eip; rsp = x->Esp; src = "wow64-x86"; }
+        }
+    }
+
+    lo = wow_teb ? (uintptr_t)wow_teb->Tib.StackLimit : (uintptr_t)teb->Tib.StackLimit;
+    hi = wow_teb ? (uintptr_t)wow_teb->Tib.StackBase : (uintptr_t)teb->Tib.StackBase;
+
+    n = snprintf( buf, sizeof(buf), "[prof-guest] pid=%d tid=%ld src=%s rip=%#llx rsp=%#llx\n",
+                  getpid(), (long)syscall( SYS_gettid ), src,
+                  (unsigned long long)rip, (unsigned long long)rsp );
+    if (n > 0) write( 2, buf, (size_t)n );
+
+    /* 栈扫描: 只读线程自己栈区间内的字, 避免在 signal handler 里踩到未映射页 */
+    if (!rip || !rsp || !lo || !hi || rsp < lo || rsp >= hi) return;
+    for (i = 0; i < 32; i++)
+    {
+        const uint64_t *sp = (const uint64_t *)(uintptr_t)(rsp + i * 8);
+        uint64_t v;
+        if ((uintptr_t)sp + 8 > hi) break;
+        v = *sp;
+        if (v < 0x10000 || v > 0x00007fffffffffffULL) continue;
+        n = snprintf( buf, sizeof(buf), "[prof-guest-stack] sp+%d=%#llx\n", i * 8,
+                      (unsigned long long)v );
+        if (n > 0) write( 2, buf, (size_t)n );
+    }
+}
+#endif
+
+/* WineHua: 本 runtime 的 ARM64EC/FEX + Win32 组合比原生 Windows 吃栈更深
+ * (2026-09-18 实测: CEF browser 进程在 GL/GPU 初始化路径里 sp 掉进 PROT_NONE
+ * guard 页 —— 线程栈被打爆, 现场 x16=0xd63f0200 即 ARM64EC thunk 的 blr x16)。
+ * 这里给两条栈加下限, 都用 env 可调, 默认开:
+ *   WINEHUA_EMU_STACK_MB    ARM64EC 模拟器栈 (上游固定 256KB, 明显偏小)
+ *   WINEHUA_MIN_THREAD_STACK_MB  Win32 线程栈 reserve 下限 (只影响保留, 不占物理内存)
+ */
+#define WINEHUA_EMU_STACK_DEFAULT_MB   2
+#define WINEHUA_MIN_STACK_DEFAULT_MB   8
+
+static SIZE_T winehua_env_mb( const char *name, SIZE_T default_mb )
+{
+    const char *v = getenv( name );
+    /* 显式 "0" = 完全回到上游行为 (供 A/B 定位用, 不改变默认值) */
+    if (v && v[0] == '0' && !v[1]) return 0;
+    if (v && v[0]) return (SIZE_T)atoi( v ) * 1024 * 1024;
+    return default_mb * 1024 * 1024;
+}
+
 NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size )
 {
+    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
     WOW_TEB *wow_teb = get_wow_teb( teb );
     INITIAL_TEB stack;
     NTSTATUS status;
+    static int logged = 0;
+
+    /* Win32 线程栈下限: 只对 ARM64EC 进程生效 (32 位地址空间不去动它),
+     * 且只放大 reserve (虚拟地址, 不占物理内存)。 */
+    if (is_arm64ec())
+    {
+        SIZE_T floor_size = winehua_env_mb( "WINEHUA_MIN_THREAD_STACK_MB", WINEHUA_MIN_STACK_DEFAULT_MB );
+        if (floor_size && reserve_size < floor_size) reserve_size = floor_size;
+        if (commit_size > reserve_size) commit_size = reserve_size;
+        if (!logged++)
+            fprintf( stderr, "[thread] WineHua stack policy: reserve=%#lx commit=%#lx min=%#lx\n",
+                     (unsigned long)reserve_size, (unsigned long)commit_size, (unsigned long)floor_size );
+    }
+
+    /* kernel stack */
+    if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, kernel_stack_size, kernel_stack_size, FALSE )))
+        return status;
+    thread_data->kernel_stack = stack.DeallocationStack;
 
     if (wow_teb)
     {
@@ -1218,13 +1352,16 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
     if (is_arm64ec())
     {
         CHPE_V2_CPU_AREA_INFO *cpu_area;
-        const SIZE_T chpev2_stack_size = 0x40000;
+        /* 上游固定 256KB。FEX 的 ARM64EC 模拟栈在 GL/ANGLE 这种深链初始化里不够,
+         * 实测 sp 直接踩到 guard (见函数头注释)。默认抬到 2MB, env 可调。 */
+        SIZE_T emu_stack_size = winehua_env_mb( "WINEHUA_EMU_STACK_MB", WINEHUA_EMU_STACK_DEFAULT_MB );
+        const SIZE_T chpev2_stack_size = emu_stack_size ? emu_stack_size : 0x40000;
 
         /* emulator stack */
         if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, chpev2_stack_size, chpev2_stack_size, FALSE )))
             return status;
 
-        cpu_area = stack.DeallocationStack;
+        cpu_area = (CHPE_V2_CPU_AREA_INFO *)((char*)stack.DeallocationStack + kernel_stack_guard_size);
         cpu_area->ContextAmd64 = (ARM64EC_NT_CONTEXT *)&cpu_area->EmulatorDataInline;
         cpu_area->EmulatorStackBase  = (ULONG_PTR)stack.StackBase;
         cpu_area->EmulatorStackLimit = (ULONG_PTR)stack.StackLimit + page_size;
@@ -1239,97 +1376,6 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
     teb->Tib.StackLimit = stack.StackLimit;
     teb->DeallocationStack = stack.DeallocationStack;
     return STATUS_SUCCESS;
-}
-
-
-/***********************************************************************
- *           create_server_thread
- */
-static NTSTATUS create_server_thread( HANDLE *handle, struct thread_data **data_ret,
-                                      ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
-                                      void *start, void *param, ULONG flags, BOOL is_system )
-{
-    data_size_t len;
-    struct object_attributes *objattr;
-    struct thread_data *data;
-    int request_pipe[2];
-    DWORD tid = 0;
-    NTSTATUS status;
-
-    if ((status = alloc_object_attributes( attr, &objattr, &len ))) return status;
-
-    if (server_pipe( request_pipe ) == -1)
-    {
-        free( objattr );
-        return STATUS_TOO_MANY_OPENED_FILES;
-    }
-    wine_server_send_fd( request_pipe[0] );
-
-    SERVER_START_REQ( new_thread )
-    {
-        req->process    = wine_server_obj_handle( NtCurrentProcess() );
-        req->access     = access;
-        req->flags      = flags;
-        req->is_system  = !!is_system;
-        req->request_fd = request_pipe[0];
-        wine_server_add_data( req, objattr, len );
-        if (!(status = wine_server_call( req )))
-        {
-            *handle = wine_server_ptr_handle( reply->handle );
-            tid = reply->tid;
-        }
-        close( request_pipe[0] );
-    }
-    SERVER_END_REQ;
-
-    free( objattr );
-    if (status)
-    {
-        close( request_pipe[1] );
-        return status;
-    }
-
-    if (!(data = virtual_alloc_thread_data()))
-    {
-        NtClose( *handle );
-        close( request_pipe[1] );
-        return STATUS_NO_MEMORY;
-    }
-
-    data->request_fd = request_pipe[1];
-    data->tid        = tid;
-    data->start      = start;
-    data->param      = param;
-
-    *data_ret = data;
-    return STATUS_SUCCESS;
-}
-
-
-/***********************************************************************
- *           spawn_thread
- */
-static NTSTATUS spawn_thread( struct thread_data *data )
-{
-    sigset_t sigset;
-    pthread_t pthread_id;
-    pthread_attr_t attr;
-    NTSTATUS status = STATUS_SUCCESS;
-
-    pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
-    pthread_attr_init( &attr );
-    pthread_attr_setstack( &attr, get_kernel_stack( data ), kernel_stack_size );
-    pthread_attr_setguardsize( &attr, 0 );
-    pthread_attr_setscope( &attr, PTHREAD_SCOPE_SYSTEM ); /* force creating a kernel thread */
-    InterlockedIncrement( &nb_threads );
-    if (pthread_create( &pthread_id, &attr, (void * (*)(void *))server_init_thread, data ))
-    {
-        InterlockedDecrement( &nb_threads );
-        status = STATUS_NO_MEMORY;
-    }
-    pthread_attr_destroy( &attr );
-    pthread_sigmask( SIG_SETMASK, &sigset, NULL );
-    return status;
 }
 
 
@@ -1396,7 +1442,14 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     static const ULONG supported_flags = THREAD_CREATE_FLAGS_CREATE_SUSPENDED | THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH |
                                          THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER | THREAD_CREATE_FLAGS_SKIP_LOADER_INIT |
                                          THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE;
-    struct thread_data *data;
+    sigset_t sigset;
+    pthread_t pthread_id;
+    pthread_attr_t pthread_attr;
+    data_size_t len;
+    struct object_attributes *objattr;
+    struct ntdll_thread_data *thread_data;
+    DWORD tid = 0;
+    int request_pipe[2];
     TEB *teb;
     WOW_TEB *wow_teb;
     unsigned int status;
@@ -1428,70 +1481,98 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
 
         if (!(status = result.create_thread.status))
         {
-            CLIENT_ID client_id = make_client_id( result.create_thread.pid, result.create_thread.tid );
+            CLIENT_ID client_id;
             TEB *teb = wine_server_get_ptr( result.create_thread.teb );
             *handle = wine_server_ptr_handle( result.create_thread.handle );
+            client_id.UniqueProcess = ULongToHandle( result.create_thread.pid );
+            client_id.UniqueThread  = ULongToHandle( result.create_thread.tid );
             if (attr_list) status = update_attr_list( attr_list, *handle, &client_id, teb );
         }
         return status;
     }
 
+    if ((status = alloc_object_attributes( attr, &objattr, &len ))) return status;
+
+    if (server_pipe( request_pipe ) == -1)
+    {
+        free( objattr );
+        return STATUS_TOO_MANY_OPENED_FILES;
+    }
+    wine_server_send_fd( request_pipe[0] );
+
     if (!access) access = THREAD_ALL_ACCESS;
 
-    if ((status = create_server_thread( handle, &data, access, attr, start, param, flags, FALSE )))
-        return status;
+    SERVER_START_REQ( new_thread )
+    {
+        req->process    = wine_server_obj_handle( process );
+        req->access     = access;
+        req->flags      = flags;
+        req->request_fd = request_pipe[0];
+        wine_server_add_data( req, objattr, len );
+        if (!(status = wine_server_call( req )))
+        {
+            *handle = wine_server_ptr_handle( reply->handle );
+            tid = reply->tid;
+        }
+        close( request_pipe[0] );
+    }
+    SERVER_END_REQ;
 
-    if ((status = virtual_alloc_teb( data ))) goto done;
-    teb = data->teb;
-    set_thread_id( data );
+    free( objattr );
+    if (status)
+    {
+        close( request_pipe[1] );
+        return status;
+    }
+
+    pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
+
+    if ((status = virtual_alloc_teb( &teb ))) goto done;
 
     if ((status = init_thread_stack( teb, get_zero_bits_limit( zero_bits ), stack_reserve, stack_commit )))
+    {
+        virtual_free_teb( teb );
         goto done;
+    }
+
+    set_thread_id( teb, GetCurrentProcessId(), tid );
 
     teb->SkipThreadAttach = !!(flags & THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH);
     teb->SkipLoaderInit = !!(flags & THREAD_CREATE_FLAGS_SKIP_LOADER_INIT);
-    if ((wow_teb = get_wow_teb( teb )))
+    wow_teb = get_wow_teb( teb );
+    if (wow_teb)
     {
         wow_teb->SkipThreadAttach = teb->SkipThreadAttach;
         wow_teb->SkipLoaderInit = teb->SkipLoaderInit;
     }
 
-    status = spawn_thread( data );
+    thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
+    thread_data->request_fd  = request_pipe[1];
+    thread_data->start = start;
+    thread_data->param = param;
+
+    pthread_attr_init( &pthread_attr );
+    pthread_attr_setstack( &pthread_attr, thread_data->kernel_stack, kernel_stack_size );
+    pthread_attr_setguardsize( &pthread_attr, 0 );
+    pthread_attr_setscope( &pthread_attr, PTHREAD_SCOPE_SYSTEM ); /* force creating a kernel thread */
+    InterlockedIncrement( &nb_threads );
+    if (pthread_create( &pthread_id, &pthread_attr, (void * (*)(void *))start_thread, teb ))
+    {
+        InterlockedDecrement( &nb_threads );
+        virtual_free_teb( teb );
+        status = STATUS_NO_MEMORY;
+    }
+    pthread_attr_destroy( &pthread_attr );
 
 done:
+    pthread_sigmask( SIG_SETMASK, &sigset, NULL );
     if (status)
     {
         NtClose( *handle );
-        close( data->request_fd );
-        virtual_free_thread_data( data );
+        close( request_pipe[1] );
         return status;
     }
     if (attr_list) status = update_attr_list( attr_list, *handle, &teb->ClientId, teb );
-    return status;
-}
-
-
-/***********************************************************************
- *              PsCreateSystemThread   (ntdll.so)
- */
-NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
-                                      HANDLE process, CLIENT_ID *id, PKSTART_ROUTINE start, void *param )
-{
-    struct thread_data *data;
-    NTSTATUS status;
-    ULONG flags = THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE;
-
-    if ((status = create_server_thread( handle, &data, access, attr, start, param, flags, TRUE )))
-        return status;
-
-    if ((status = spawn_thread( data )))
-    {
-        NtClose( *handle );
-        virtual_free_thread_data( data );
-        return status;
-    }
-
-    if (id) *id = make_client_id( pid, data->tid );
     return status;
 }
 
@@ -1521,19 +1602,21 @@ void abort_process( int status )
  */
 static DECLSPEC_NORETURN void exit_thread( int status )
 {
-    static void *prev_data;
-    struct thread_data *data;
+    static void *prev_teb;
+    TEB *teb;
 
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
 
     if (InterlockedDecrement( &nb_threads ) <= 0) exit_process( status );
 
-    if ((data = InterlockedExchangePointer( &prev_data, get_thread_data() )))
+    if ((teb = InterlockedExchangePointer( &prev_teb, NtCurrentTeb() )))
     {
-        if (data->pthread_id)
+        struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
+
+        if (thread_data->pthread_id)
         {
-            pthread_join( data->pthread_id, NULL );
-            virtual_free_thread_data( data );
+            pthread_join( thread_data->pthread_id, NULL );
+            virtual_free_teb( teb );
         }
     }
     pthread_exit_wrapper( status );
@@ -1573,8 +1656,7 @@ void wait_suspend( CONTEXT *context )
  *
  * Send an EXCEPTION_DEBUG_EVENT event to the debugger.
  */
-NTSTATUS send_debug_event( struct thread_data *data, EXCEPTION_RECORD *rec,
-                           CONTEXT *context, BOOL first_chance, BOOL exception )
+NTSTATUS send_debug_event( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL first_chance, BOOL exception )
 {
     unsigned int ret;
     DWORD i;
@@ -1582,12 +1664,6 @@ NTSTATUS send_debug_event( struct thread_data *data, EXCEPTION_RECORD *rec,
     client_ptr_t params[EXCEPTION_MAXIMUM_PARAMETERS];
     union select_op select_op;
     sigset_t old_set;
-
-    if (!data->teb)
-    {
-        ERR_(seh)( "Exception %x in system thread at %p\n", rec->ExceptionCode, rec->ExceptionAddress );
-        NtTerminateProcess( NtCurrentProcess(), rec->ExceptionCode );
-    }
 
     if (!peb->BeingDebugged) return 0;  /* no debugger present */
 
@@ -1641,13 +1717,12 @@ NTSTATUS send_debug_event( struct thread_data *data, EXCEPTION_RECORD *rec,
  */
 NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL first_chance )
 {
-    struct thread_data *data = get_thread_data();
-    NTSTATUS status = send_debug_event( data, rec, context, first_chance, !(is_win64 || is_wow64()) );
+    NTSTATUS status = send_debug_event( rec, context, first_chance, !(is_win64 || is_wow64() || is_old_wow64()) );
 
     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
         return NtContinue( context, FALSE );
 
-    if (first_chance) return call_user_exception_dispatcher( data, rec, context );
+    if (first_chance) return call_user_exception_dispatcher( rec, context );
 
     if (rec->ExceptionFlags & EXCEPTION_STACK_INVALID)
         ERR_(seh)("Exception frame is not in stack limits => unable to dispatch exception.\n");
@@ -1667,8 +1742,7 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
  */
 TEB * WINAPI NtCurrentTeb(void)
 {
-    struct thread_data *data = get_thread_data();
-    return data ? data->teb : NULL;
+    return pthread_getspecific( teb_key );
 }
 
 
@@ -1698,19 +1772,42 @@ NTSTATUS WINAPI NtOpenThread( HANDLE *handle, ACCESS_MASK access,
 /******************************************************************************
  *              NtSuspendThread   (NTDLL.@)
  */
-NTSTATUS WINAPI NtSuspendThread( HANDLE handle, ULONG *count )
+NTSTATUS WINAPI NtSuspendThread( HANDLE handle, ULONG *ret_count )
 {
-    unsigned int ret;
+    BOOL self = FALSE;
+    unsigned int ret, count = 0;
+    HANDLE wait_handle = NULL;
 
     SERVER_START_REQ( suspend_thread )
     {
         req->handle = wine_server_obj_handle( handle );
-        if (!(ret = wine_server_call( req )))
+        if (!(ret = wine_server_call( req )) || ret == STATUS_PENDING)
         {
-            if (count) *count = reply->count;
+            self = reply->count & 0x80000000;
+            count = reply->count & 0x7fffffff;;
+            wait_handle = wine_server_ptr_handle( reply->wait_handle );
         }
     }
     SERVER_END_REQ;
+
+    if (self) usleep( 0 );
+
+    if (ret == STATUS_PENDING && wait_handle)
+    {
+        NtWaitForSingleObject( wait_handle, FALSE, NULL );
+        /* remove the handle from the cache, get_thread_context will close it for us */
+        close_inproc_sync( wait_handle );
+
+        SERVER_START_REQ( suspend_thread )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            req->waited_handle = wine_server_obj_handle( wait_handle );
+            ret = wine_server_call( req );
+        }
+        SERVER_END_REQ;
+    }
+
+    if (!ret && ret_count) *ret_count = count;
     return ret;
 }
 
@@ -1778,15 +1875,6 @@ NTSTATUS WINAPI NtTerminateThread( HANDLE handle, LONG exit_code )
         exit_thread( exit_code );
     }
     return ret;
-}
-
-
-/******************************************************************************
- *              PsTerminateSystemThread  (ntdll.so)
- */
-NTSTATUS WINAPI PsTerminateSystemThread( NTSTATUS exit_code )
-{
-    for (;;) exit_thread( exit_code );
 }
 
 
@@ -1939,9 +2027,8 @@ NTSTATUS get_thread_context( HANDLE handle, void *context, BOOL *self, USHORT ma
  */
 void ntdll_set_exception_jmp_buf( jmp_buf jmp )
 {
-    struct thread_data *data = get_thread_data();
-    assert( !jmp || !data->jmp_buf );
-    data->jmp_buf = jmp;
+    assert( !jmp || !ntdll_get_thread_data()->jmp_buf );
+    ntdll_get_thread_data()->jmp_buf = jmp;
 }
 
 
@@ -2036,7 +2123,7 @@ static void set_native_thread_name( HANDLE handle, const UNICODE_STRING *name )
 #ifdef linux
     unsigned int status;
     char path[64], nameA[64];
-    int unix_pid, unix_tid, len, fd;
+    int unix_pid = -1, unix_tid = -1, len, fd;
 
     SERVER_START_REQ( get_thread_times )
     {
@@ -2075,7 +2162,7 @@ static void set_native_thread_name( HANDLE handle, const UNICODE_STRING *name )
     if (NtQueryInformationThread( handle, ThreadBasicInformation, &info, sizeof(info), NULL ))
         return;
 
-    if (HandleToULong( info.ClientId.UniqueProcess ) != pid )
+    if (HandleToULong( info.ClientId.UniqueProcess ) != GetCurrentProcessId())
     {
         static int once;
         if (!once++) FIXME("cross-process native thread naming not supported\n");
@@ -2134,7 +2221,7 @@ static BOOL is_process_wow64( const CLIENT_ID *id )
     ULONG_PTR info;
     BOOL ret = FALSE;
 
-    if (id->UniqueProcess == ULongToHandle(pid)) return is_old_wow64();
+    if (id->UniqueProcess == ULongToHandle(GetCurrentProcessId())) return is_old_wow64();
     if (!NtOpenProcess( &handle, PROCESS_QUERY_LIMITED_INFORMATION, NULL, id ))
     {
         if (!NtQueryInformationProcess( handle, ProcessWow64Information, &info, sizeof(info), NULL ))
@@ -2168,7 +2255,8 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
             {
                 info.ExitStatus             = reply->exit_code;
                 info.TebBaseAddress         = wine_server_get_ptr( reply->teb );
-                info.ClientId               = make_client_id( reply->pid, reply->tid );
+                info.ClientId.UniqueProcess = ULongToHandle(reply->pid);
+                info.ClientId.UniqueThread  = ULongToHandle(reply->tid);
                 info.AffinityMask           = reply->affinity & affinity_mask;
                 info.Priority               = reply->priority;
                 info.BasePriority           = reply->base_priority;
@@ -2685,7 +2773,7 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
         if (handle != GetCurrentThread()) return STATUS_NOT_SUPPORTED;
         if (mem->Version != 2) return STATUS_REVISION_MISMATCH;
         if (mem->ProcessEnableWriteExceptions) return STATUS_INVALID_PARAMETER;
-        get_thread_data()->allow_writes = mem->ThreadAllowWrites;
+        ntdll_get_thread_data()->allow_writes = mem->ThreadAllowWrites;
         return STATUS_SUCCESS;
 #else
         return STATUS_NOT_SUPPORTED;
@@ -2716,6 +2804,20 @@ ULONG WINAPI NtGetCurrentProcessorNumber(void)
 
 #if defined(HAVE_SCHED_GETCPU)
     int res = sched_getcpu();
+    if (res != -1)
+    {
+        struct cpu_topology_override *override = get_cpu_topology_override();
+        unsigned int i;
+
+        if (!override)
+            return res;
+
+        for (i = 0; i < override->cpu_count; ++i)
+            if (override->host_cpu_id[i] == res)
+                return i;
+
+        WARN("Thread is running on processor which is not in the defined override.\n");
+    }
     if (res >= 0) return res;
 #elif defined(__APPLE__) && defined(MAC_OS_VERSION_11_0)
     if (__builtin_available( macOS 11.0, * ))

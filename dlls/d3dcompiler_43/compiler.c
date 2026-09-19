@@ -334,6 +334,7 @@ HRESULT WINAPI D3DCompile2(const void *data, SIZE_T data_size, const char *filen
 
     hr = vkd3d_D3DCompile2VKD3D(data, data_size, filename, macros, include, entry_point, profile, flags, effect_flags,
             secondary_flags, secondary_data, secondary_data_size, shader_blob, messages_blob, D3D_COMPILER_VERSION);
+    TRACE("vkd3d_D3DCompile2VKD3D returned %#lx.\n", hr);
     if (SUCCEEDED(hr) && shader_blob == &dummy_blob)
         ID3D10Blob_Release(dummy_blob);
     return hr;

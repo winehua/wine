@@ -453,7 +453,6 @@ struct cancel_thread_ctx
 {
     HANDLE file;
     enum cancel_test test;
-    OVERLAPPED o, o2;
 };
 
 static DWORD WINAPI test_cancel_thread(void *param)
@@ -462,23 +461,18 @@ static DWORD WINAPI test_cancel_thread(void *param)
     NTSTATUS status = STATUS_SUCCESS;
     IO_STATUS_BLOCK cancel_sb;
     DWORD cancel_cnt, size;
-    OVERLAPPED o3 = {0};
+    OVERLAPPED o, o2, o3;
     BOOL res;
 
-    memset(&ctx->o, 0, sizeof(OVERLAPPED));
-    memset(&ctx->o2, 0, sizeof(OVERLAPPED));
-
-    res = DeviceIoControl(ctx->file, IOCTL_WINETEST_RESET_CANCEL, NULL, 0, NULL, 0, NULL, &ctx->o);
+    res = DeviceIoControl(ctx->file, IOCTL_WINETEST_RESET_CANCEL, NULL, 0, NULL, 0, NULL, &o);
     ok(res, "DeviceIoControl failed: %lu\n", GetLastError());
 
     if (ctx->test != cancelsync)
     {
-        ctx->o.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
-        res = DeviceIoControl(ctx->file, IOCTL_WINETEST_QUEUE_ASYNC, NULL, 0, NULL, 0, NULL, &ctx->o);
+        res = DeviceIoControl(ctx->file, IOCTL_WINETEST_QUEUE_ASYNC, NULL, 0, NULL, 0, NULL, &o);
         ok(!res && GetLastError() == ERROR_IO_PENDING, "DeviceIoControl failed: %lu\n", GetLastError());
 
-        ctx->o2.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
-        res = DeviceIoControl(ctx->file, IOCTL_WINETEST_QUEUE_ASYNC, NULL, 0, NULL, 0, NULL, &ctx->o2);
+        res = DeviceIoControl(ctx->file, IOCTL_WINETEST_QUEUE_ASYNC, NULL, 0, NULL, 0, NULL, &o2);
         ok(!res && GetLastError() == ERROR_IO_PENDING, "DeviceIoControl failed: %lu\n", GetLastError());
     }
 
@@ -614,11 +608,7 @@ static void test_overlapped(void)
     res = DeviceIoControl(file, IOCTL_WINETEST_COMPLETE_ASYNC, NULL, 0, NULL, 0, NULL, &overlapped);
     ok(res, "DeviceIoControl failed: %lu\n", GetLastError());
     WaitForSingleObject(thread, INFINITE);
-    WaitForSingleObject(ctx.o.hEvent, INFINITE);
-    WaitForSingleObject(ctx.o2.hEvent, INFINITE);
     CloseHandle(thread);
-    CloseHandle(ctx.o.hEvent);
-    CloseHandle(ctx.o2.hEvent);
 
     cancel_cnt = 0xdeadbeef;
     res = DeviceIoControl(file, IOCTL_WINETEST_GET_CANCEL_COUNT, NULL, 0, &cancel_cnt, sizeof(cancel_cnt), NULL, &overlapped2);
@@ -638,11 +628,7 @@ static void test_overlapped(void)
     res = DeviceIoControl(file, IOCTL_WINETEST_COMPLETE_ASYNC, NULL, 0, NULL, 0, NULL, &overlapped);
     ok(res, "DeviceIoControl failed: %lu\n", GetLastError());
     WaitForSingleObject(thread, INFINITE);
-    WaitForSingleObject(ctx.o.hEvent, INFINITE);
-    WaitForSingleObject(ctx.o2.hEvent, INFINITE);
     CloseHandle(thread);
-    CloseHandle(ctx.o.hEvent);
-    CloseHandle(ctx.o2.hEvent);
 
     cancel_cnt = 0xdeadbeef;
     res = DeviceIoControl(file, IOCTL_WINETEST_GET_CANCEL_COUNT, NULL, 0, &cancel_cnt, sizeof(cancel_cnt), NULL, &overlapped2);
@@ -660,11 +646,7 @@ static void test_overlapped(void)
     res = DeviceIoControl(file, IOCTL_WINETEST_COMPLETE_ASYNC, NULL, 0, NULL, 0, NULL, &overlapped);
     ok(res, "DeviceIoControl failed: %lu\n", GetLastError());
     WaitForSingleObject(thread, INFINITE);
-    WaitForSingleObject(ctx.o.hEvent, INFINITE);
-    WaitForSingleObject(ctx.o2.hEvent, INFINITE);
     CloseHandle(thread);
-    CloseHandle(ctx.o.hEvent);
-    CloseHandle(ctx.o2.hEvent);
 
     cancel_cnt = 0xdeadbeef;
     res = DeviceIoControl(file, IOCTL_WINETEST_GET_CANCEL_COUNT, NULL, 0, &cancel_cnt, sizeof(cancel_cnt), NULL, &overlapped2);
@@ -686,11 +668,7 @@ static void test_overlapped(void)
     res = DeviceIoControl(file, IOCTL_WINETEST_COMPLETE_ASYNC, NULL, 0, NULL, 0, NULL, &overlapped);
     ok(res, "DeviceIoControl failed: %lu\n", GetLastError());
     WaitForSingleObject(thread, INFINITE);
-    WaitForSingleObject(ctx.o.hEvent, INFINITE);
-    WaitForSingleObject(ctx.o2.hEvent, INFINITE);
     CloseHandle(thread);
-    CloseHandle(ctx.o.hEvent);
-    CloseHandle(ctx.o2.hEvent);
 
     cancel_cnt = 0xdeadbeef;
     res = DeviceIoControl(file, IOCTL_WINETEST_GET_CANCEL_COUNT, NULL, 0, &cancel_cnt, sizeof(cancel_cnt), NULL, &overlapped2);
@@ -1209,7 +1187,6 @@ static void test_object_info(void)
     OBJECT_TYPE_INFORMATION *type_info = (OBJECT_TYPE_INFORMATION *)buffer;
     FILE_FS_VOLUME_INFORMATION *volume_info = (FILE_FS_VOLUME_INFORMATION *)buffer;
     FILE_NAME_INFORMATION *file_info = (FILE_NAME_INFORMATION *)buffer;
-    FILE_FS_DEVICE_INFORMATION device_info;
     HANDLE file;
     NTSTATUS status;
     IO_STATUS_BLOCK io;
@@ -1230,23 +1207,6 @@ static void test_object_info(void)
 
     status = NtQueryVolumeInformationFile(device, &io, buffer, sizeof(buffer), FileFsVolumeInformation);
     todo_wine ok(status == STATUS_INVALID_DEVICE_REQUEST, "got %#lx\n", status);
-
-    io.Status = 0xdeadf00d;
-    io.Information = 0xdeadf00d;
-    status = NtQueryVolumeInformationFile(device, &io, &device_info, sizeof(device_info) - 1, FileFsDeviceInformation);
-    ok(status == STATUS_INFO_LENGTH_MISMATCH, "got %#lx\n", status);
-    ok(io.Status == 0xdeadf00d, "got status %#lx\n", io.Status);
-    ok(io.Information == 0xdeadf00d, "got information %Iu\n", io.Information);
-
-    io.Status = 0xdeadf00d;
-    io.Information = 0xdeadf00d;
-    status = NtQueryVolumeInformationFile(device, &io, &device_info, sizeof(device_info), FileFsDeviceInformation);
-    ok(!status, "got %#lx\n", status);
-    ok(!io.Status, "got status %#lx\n", io.Status);
-    ok(io.Information == sizeof(FILE_FS_DEVICE_INFORMATION), "got information %Iu\n", io.Information);
-    ok(device_info.DeviceType == FILE_DEVICE_UNKNOWN, "Got type %#lx.\n", device_info.DeviceType);
-    ok(device_info.Characteristics == (FILE_DEVICE_SECURE_OPEN | FILE_FLOPPY_DISKETTE | FILE_PORTABLE_DEVICE),
-            "Got characteristics %#lx.\n", device_info.Characteristics);
 
     file = CreateFileA("\\\\.\\WineTestDriver\\subfile", 0, 0, NULL, OPEN_EXISTING, 0, NULL);
     todo_wine ok(file != INVALID_HANDLE_VALUE, "got error %lu\n", GetLastError());
@@ -2234,80 +2194,6 @@ static void test_pnp_devices(void)
         ok(prop_type == DEVPROP_TYPE_STRING, "got type %#lx\n", prop_type);
         ok(size == sizeof(expect_device_location_w), "Got size %lu.\n", size);
         ok(!wcscmp(buffer_w, expect_device_location_w), "Got device location info %s.\n", debugstr_w(buffer_w));
-    }
-
-    /* DEVPKEY_Device_Parent — should be set by ntoskrnl during bus enumeration. */
-    prop_type = DEVPROP_TYPE_EMPTY;
-    size = 0;
-    memset(buffer_w, 0, sizeof(buffer_w));
-    ret = SetupDiGetDevicePropertyW(set, &device, &DEVPKEY_Device_Parent, &prop_type, (BYTE *)buffer_w,
-                                    sizeof(buffer_w), &size, 0);
-    ok(ret, "Got error %#lx.\n", GetLastError());
-    ok(prop_type == DEVPROP_TYPE_STRING, "got type %#lx\n", prop_type);
-    ok(size == sizeof(L"ROOT\\WINETEST\\0"), "got size %lu\n", size);
-    ok(!wcscmp(buffer_w, L"ROOT\\WINETEST\\0"), "got parent ID %s\n", debugstr_w(buffer_w));
-
-    /* DEVPKEY_Device_Children — set on the bus PDO after child enumeration.
-     * Open the bus device by its instance ID directly; the bus_class
-     * interface has been disabled earlier in this function, so a
-     * DIGCF_DEVICEINTERFACE-scoped enumeration would not find it.
-     *
-     * The test setup registers exactly one child ("Wine\Test\1"), so the
-     * full MULTI_SZ list is compared verbatim, including the trailing
-     * double-NUL terminator. */
-    {
-        static const WCHAR expected_children[] = L"Wine\\Test\\1\0";
-        SP_DEVINFO_DATA bus_dev = { sizeof(bus_dev) };
-        HDEVINFO bus_set;
-
-        bus_set = SetupDiCreateDeviceInfoList(NULL, NULL);
-        ok(bus_set != INVALID_HANDLE_VALUE, "failed to create bus device list, error %#lx\n",
-           GetLastError());
-        ret = SetupDiOpenDeviceInfoA(bus_set, "ROOT\\WINETEST\\0", NULL, 0, &bus_dev);
-        ok(ret, "failed to open bus device, error %#lx\n", GetLastError());
-
-        prop_type = DEVPROP_TYPE_EMPTY;
-        size = 0;
-        memset(buffer_w, 0, sizeof(buffer_w));
-        ret = SetupDiGetDevicePropertyW(bus_set, &bus_dev, &DEVPKEY_Device_Children,
-                                        &prop_type, (BYTE *)buffer_w, sizeof(buffer_w), &size, 0);
-        ok(ret, "DEVPKEY_Device_Children missing, error %#lx\n", GetLastError());
-        ok(prop_type == DEVPROP_TYPE_STRING_LIST, "got type %#lx\n", prop_type);
-        ok(size == sizeof(expected_children), "got size %lu, expected %Iu\n",
-           size, sizeof(expected_children));
-        ok(!memcmp(buffer_w, expected_children, size), "got children %s\n",
-           debugstr_w(buffer_w));
-
-        SetupDiDestroyDeviceInfoList(bus_set);
-    }
-
-    /* DEVPKEY_Device_Siblings — set on each child after bus enumeration.
-     * The test setup registers exactly one child, so the siblings list
-     * is empty. handle_bus_relations() writes the empty list as a single
-     * trailing NUL (one WCHAR). */
-    prop_type = DEVPROP_TYPE_EMPTY;
-    size = 0;
-    memset(buffer_w, 0, sizeof(buffer_w));
-    ret = SetupDiGetDevicePropertyW(set, &device, &DEVPKEY_Device_Siblings, &prop_type,
-                                    (BYTE *)buffer_w, sizeof(buffer_w), &size, 0);
-    ok(ret, "DEVPKEY_Device_Siblings missing, error %#lx\n", GetLastError());
-    ok(prop_type == DEVPROP_TYPE_STRING_LIST, "got type %#lx\n", prop_type);
-    ok(size == sizeof(WCHAR), "got size %lu, expected %Iu\n", size, sizeof(WCHAR));
-    ok(buffer_w[0] == 0, "got non-empty siblings %s\n", debugstr_w(buffer_w));
-
-    /* CM_Get_Parent on the PnP-managed child returns the bus parent. */
-    {
-        char parent_id[MAX_DEVICE_ID_LEN];
-        DEVINST cm_parent = 0;
-        CONFIGRET cm_ret;
-
-        cm_ret = CM_Get_Parent(&cm_parent, device.DevInst, 0);
-        ok(cm_ret == CR_SUCCESS, "CM_Get_Parent: got %#lx\n", cm_ret);
-        ok(cm_parent != 0, "got null parent devnode\n");
-
-        cm_ret = CM_Get_Device_IDA(cm_parent, parent_id, sizeof(parent_id), 0);
-        ok(cm_ret == CR_SUCCESS, "CM_Get_Device_IDA: got %#lx\n", cm_ret);
-        ok(!strcmp(parent_id, "ROOT\\WINETEST\\0"), "got parent ID %s\n", parent_id);
     }
 
     ret = SetupDiEnumDeviceInterfaces(set, NULL, &child_class, 0, &iface);

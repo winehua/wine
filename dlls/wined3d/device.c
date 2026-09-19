@@ -1487,8 +1487,6 @@ void wined3d_device_gl_delete_opengl_contexts_cs(void *object)
 
         wined3d_release_dc(device_gl->backup_wnd, device_gl->backup_dc);
         DestroyWindow(device_gl->backup_wnd);
-        device_gl->backup_dc = NULL;
-        device_gl->backup_wnd = NULL;
     }
 }
 
@@ -4441,7 +4439,7 @@ void CDECL wined3d_device_context_update_sub_resource(struct wined3d_device_cont
 void CDECL wined3d_device_context_resolve_sub_resource(struct wined3d_device_context *context,
         struct wined3d_resource *dst_resource, unsigned int dst_sub_resource_idx,
         struct wined3d_resource *src_resource, unsigned int src_sub_resource_idx,
-        uint32_t flags, enum wined3d_format_id format_id)
+        enum wined3d_format_id format_id)
 {
     struct wined3d_texture *dst_texture, *src_texture;
     unsigned int dst_level, src_level;
@@ -4485,7 +4483,7 @@ void CDECL wined3d_device_context_resolve_sub_resource(struct wined3d_device_con
     SetRect(&src_rect, 0, 0, wined3d_texture_get_level_width(src_texture, src_level),
             wined3d_texture_get_level_height(src_texture, src_level));
     wined3d_device_context_blt(context, dst_texture, dst_sub_resource_idx, &dst_rect,
-            src_texture, src_sub_resource_idx, &src_rect, flags, &fx, WINED3D_TEXF_POINT);
+            src_texture, src_sub_resource_idx, &src_rect, 0, &fx, WINED3D_TEXF_POINT);
     wined3d_device_context_unlock(context);
 }
 
@@ -5632,7 +5630,10 @@ LRESULT device_process_message(struct wined3d_device *device, HWND window, BOOL 
     }
     else if (message == WM_DISPLAYCHANGE)
     {
+        BOOL inside_mode_change = wined3d_set_inside_mode_change(window, TRUE);
+
         device->device_parent->ops->mode_changed(device->device_parent);
+        wined3d_set_inside_mode_change(window, inside_mode_change);
     }
     else if (message == WM_ACTIVATEAPP)
     {
@@ -5642,8 +5643,12 @@ LRESULT device_process_message(struct wined3d_device *device, HWND window, BOOL 
          * (e.g. Deus Ex: GOTY) to destroy the device, so take care to
          * deactivate the implicit swapchain last, and to avoid accessing the
          * "device" pointer afterwards. */
-        while (i--)
-            wined3d_swapchain_activate(device->swapchains[i], wparam);
+        if (!wparam || !wined3d_get_activate_processed(window))
+        {
+            wined3d_set_activate_processed(window, !!wparam);
+            while (i--)
+                wined3d_swapchain_activate(device->swapchains[i], wparam);
+        }
     }
     else if (message == WM_SYSCOMMAND)
     {
@@ -5654,6 +5659,11 @@ LRESULT device_process_message(struct wined3d_device *device, HWND window, BOOL 
             else
                 DefWindowProcA(window, message, wparam, lparam);
         }
+    }
+    else if (message == WM_SIZE && !wined3d_get_inside_mode_change(window))
+    {
+        if (!IsIconic(window))
+            PostMessageW(window, WM_ACTIVATEAPP, 1, GetCurrentThreadId());
     }
 
     if (unicode)

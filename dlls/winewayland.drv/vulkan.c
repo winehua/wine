@@ -28,6 +28,7 @@
 #include <stdlib.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "waylanddrv.h"
 #include "wine/debug.h"
 
@@ -38,14 +39,64 @@ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
 
-static VkResult wayland_vulkan_surface_create(HWND hwnd, const struct vulkan_instance *instance, VkSurfaceKHR *handle,
-                                              struct client_surface **client)
+/* WineHua keeps Vulkan WSI private: the Guest never receives a native
+ * VkSurfaceKHR. The tagged value carries only the Wayland proxy id, which
+ * is later paired with the client pid by the Host presenter. */
+#define WINEHUA_VULKAN_SURFACE_TAG UINT64_C(0x5748530000000000)
+
+static BOOL winehua_vulkan_present_enabled(void)
+{
+    const char *value = getenv("WINEHUA_VULKAN_PRESENT");
+    if (value && value[0] && strcmp(value, "0")) return TRUE;
+    value = getenv("WINEHUA_PRESENT_BACKEND");
+    if (value && (!strcmp(value, "venus_broker_present") ||
+                  !strcmp(value, "venus_direct_present"))) return TRUE;
+    /* See win32u/vulkan.c.  Child processes can retain the stable VirGL
+     * marker even when per-launch present variables are not forwarded. */
+    value = getenv("WINEHUA_GRAPHICS_BACKEND");
+    if (value && !strcmp(value, "virgl"))
+    {
+        TRACE("WineHua: enabling private Wayland/Vulkan present from VirGL runtime marker\n");
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* NOTE: the baseline's struct vulkan_driver_funcs entry is
+ *   VkResult (*)(HWND, BOOL raw, const struct vulkan_instance *, VkSurfaceKHR *, struct client_surface **)
+ * The WineHua driver was written against the 11.10 layout (no "raw"), and win32u
+ * calls it with 5 arguments — keeping the 4-argument form made "instance" receive
+ * the raw flag (a small integer) and every vkCreateWin32SurfaceKHR faulted inside
+ * the driver (observed as "Exception 0xc0000005 in Unix call" and DXVK reporting
+ * featureLevel 0.0). */
+static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct vulkan_instance *instance,
+                                              VkSurfaceKHR *handle, struct client_surface **client)
 {
     VkResult res;
     VkWaylandSurfaceCreateInfoKHR create_info_host;
     struct wayland_client_surface *surface;
 
+    (void)raw;  /* 11.10 baseline had no "raw" parameter; OHOS present path ignores it */
+
     TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
+
+    if (winehua_vulkan_present_enabled())
+    {
+        if (!(surface = wayland_client_surface_create(hwnd))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        *handle = (VkSurfaceKHR)(uintptr_t)(WINEHUA_VULKAN_SURFACE_TAG |
+                                            (uint64_t)wl_proxy_get_id((struct wl_proxy *)surface->wl_surface));
+        set_client_surface(hwnd, surface);
+        /* This private surface is not handed to a host WSI implementation,
+         * so nothing else implicitly flushes its Wayland create/subsurface
+         * requests before the first private present.  The host presenter
+         * keys targets by (Wayland client pid, wl_surface id) and must see
+         * those requests before it can attach the SurfaceQueue target. */
+        wl_display_flush(process_wayland.wl_display);
+        *client = &surface->client;
+        TRACE("Created private WineHua surface=0x%s, client=%p\n",
+              wine_dbgstr_longlong(*handle), *client);
+        return VK_SUCCESS;
+    }
 
     if (!(surface = wayland_client_surface_create(hwnd))) return VK_ERROR_OUT_OF_HOST_MEMORY;
     create_info_host.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
@@ -76,18 +127,37 @@ static VkBool32 wayland_get_physical_device_presentation_support(struct vulkan_p
 
     TRACE("%p %u\n", physical_device, index);
 
+    /* The WineHua surface is not a Host Wayland WSI object.  Presentation is
+     * performed by the private Venus/Broker path, and every graphics queue
+     * accepted by DXVK is present-capable from the Win32 application's point
+     * of view.  Calling the Host Wayland entry here would dereference a NULL
+     * function pointer because Harmony exposes only OHNativeWindow WSI. */
+    if (winehua_vulkan_present_enabled()) return VK_TRUE;
+
     return instance->p_vkGetPhysicalDeviceWaylandPresentationSupportKHR(physical_device->host.physical_device, index,
                                                                         process_wayland.wl_display);
 }
 
 static void wayland_map_instance_extensions(struct vulkan_instance_extensions *extensions)
 {
+    if (winehua_vulkan_present_enabled())
+    {
+        if (extensions->has_VK_KHR_surface) extensions->has_VK_KHR_win32_surface = 1;
+        return;
+    }
     if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_KHR_wayland_surface = 1;
     if (extensions->has_VK_KHR_wayland_surface) extensions->has_VK_KHR_win32_surface = 1;
 }
 
 static void wayland_map_device_extensions(struct vulkan_device_extensions *extensions)
 {
+    if (winehua_vulkan_present_enabled())
+    {
+        /* The private swapchain is backed by regular Venus images; no Host
+         * WSI extension is passed to vkCreateDevice. */
+        extensions->has_VK_KHR_swapchain = 1;
+        return;
+    }
     if (extensions->has_VK_KHR_external_memory_win32) extensions->has_VK_KHR_external_memory_fd = 1;
     if (extensions->has_VK_KHR_external_memory_fd) extensions->has_VK_KHR_external_memory_win32 = 1;
     if (extensions->has_VK_KHR_external_semaphore_win32) extensions->has_VK_KHR_external_semaphore_fd = 1;

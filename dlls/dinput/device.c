@@ -1756,7 +1756,7 @@ static HRESULT WINAPI dinput_device_EnumCreatedEffectObjects( IDirectInputDevice
 static HRESULT WINAPI dinput_device_Escape( IDirectInputDevice8W *iface, DIEFFESCAPE *escape )
 {
     FIXME( "iface %p, escape %p stub!\n", iface, escape );
-    return DIERR_UNSUPPORTED;
+    return DI_OK;
 }
 
 static HRESULT WINAPI dinput_device_Poll( IDirectInputDevice8W *iface )

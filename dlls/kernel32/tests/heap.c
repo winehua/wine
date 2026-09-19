@@ -59,6 +59,7 @@ static HGLOBAL (WINAPI *pLocalAlloc)(UINT,SIZE_T);
 static HGLOBAL (WINAPI *pLocalFree)(HLOCAL);
 static BOOL (WINAPI *pHeapQueryInformation)(HANDLE,HEAP_INFORMATION_CLASS,void*,SIZE_T,SIZE_T*);
 static BOOL (WINAPI *pHeapSetInformation)(HANDLE,HEAP_INFORMATION_CLASS,void*,SIZE_T);
+static UINT (WINAPI *pGlobalFlags)(HGLOBAL);
 static ULONG (WINAPI *pRtlGetNtGlobalFlags)(void);
 
 static void load_functions(void)
@@ -74,6 +75,7 @@ static void load_functions(void)
     LOAD_FUNC( kernel32, HeapSetInformation );
     LOAD_FUNC( kernel32, GetPhysicallyInstalledSystemMemory );
     LOAD_FUNC( kernel32, GlobalAlloc );
+    LOAD_FUNC( kernel32, GlobalFlags );
     LOAD_FUNC( kernel32, GlobalFree );
     LOAD_FUNC( kernel32, LocalAlloc );
     LOAD_FUNC( kernel32, LocalFree );

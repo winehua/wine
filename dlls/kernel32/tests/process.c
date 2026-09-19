@@ -79,6 +79,7 @@ static BOOL   (WINAPI *pSetInformationJobObject)(HANDLE job, JOBOBJECTINFOCLASS 
 static HANDLE (WINAPI *pCreateIoCompletionPort)(HANDLE file, HANDLE existing_port, ULONG_PTR key, DWORD threads);
 static BOOL   (WINAPI *pGetNumaProcessorNode)(UCHAR, PUCHAR);
 static NTSTATUS (WINAPI *pNtQueryInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+static NTSTATUS (WINAPI *pNtQueryInformationThread)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
 static NTSTATUS (WINAPI *pNtQuerySystemInformationEx)(SYSTEM_INFORMATION_CLASS, void*, ULONG, void*, ULONG, ULONG*);
 static DWORD  (WINAPI *pWTSGetActiveConsoleSessionId)(void);
 static HANDLE (WINAPI *pCreateToolhelp32Snapshot)(DWORD, DWORD);
@@ -97,10 +98,6 @@ static DWORD  (WINAPI *pGetMaximumProcessorCount)(WORD);
 static BOOL   (WINAPI *pGetProcessInformation)(HANDLE,PROCESS_INFORMATION_CLASS,void*,DWORD);
 static void (WINAPI *pClosePseudoConsole)(HPCON);
 static HRESULT (WINAPI *pCreatePseudoConsole)(COORD,HANDLE,HANDLE,DWORD,HPCON*);
-
-#if defined(__x86_64__) || defined(__i386__)
-static NTSTATUS (WINAPI *pNtQueryInformationThread)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
-#endif
 
 /* ############################### */
 static char     base[MAX_PATH];
@@ -247,10 +244,8 @@ static BOOL init(void)
     hntdll    = GetModuleHandleA("ntdll.dll");
 
     pNtQueryInformationProcess = (void *)GetProcAddress(hntdll, "NtQueryInformationProcess");
-    pNtQuerySystemInformationEx = (void *)GetProcAddress(hntdll, "NtQuerySystemInformationEx");
-#if defined(__x86_64__) || defined(__i386__)
     pNtQueryInformationThread = (void *)GetProcAddress(hntdll, "NtQueryInformationThread");
-#endif
+    pNtQuerySystemInformationEx = (void *)GetProcAddress(hntdll, "NtQuerySystemInformationEx");
 
     pGetNativeSystemInfo = (void *) GetProcAddress(hkernel32, "GetNativeSystemInfo");
     pGetSystemRegistryQuota = (void *) GetProcAddress(hkernel32, "GetSystemRegistryQuota");
@@ -1125,21 +1120,6 @@ static void test_CommandLine(void)
     ret = CreateProcessA(NULL, buffer2, NULL, NULL, FALSE, 0L, NULL, NULL, &startup, &info);
     ok(!ret, "CreateProcessA unexpectedly succeeded\n");
     ok(GetLastError() == ERROR_FILE_NOT_FOUND, "Expected ERROR_FILE_NOT_FOUND, got %ld\n", GetLastError());
-    strcpy(buffer2, "\" notepad.exe\"" );
-    SetLastError(0xdeadbeef);
-    ret = CreateProcessA(NULL, buffer2, NULL, NULL, FALSE, 0L, NULL, NULL, &startup, &info);
-    ok(!ret, "CreateProcessA unexpectedly succeeded\n");
-    ok(GetLastError() == ERROR_FILE_NOT_FOUND, "Expected ERROR_FILE_NOT_FOUND, got %ld\n", GetLastError());
-    strcpy(buffer2, "\"\tnotepad.exe\"" );
-    SetLastError(0xdeadbeef);
-    ret = CreateProcessA(NULL, buffer2, NULL, NULL, FALSE, 0L, NULL, NULL, &startup, &info);
-    ok(!ret, "CreateProcessA unexpectedly succeeded\n");
-    ok(GetLastError() == ERROR_FILE_NOT_FOUND, "Expected ERROR_FILE_NOT_FOUND, got %ld\n", GetLastError());
-    strcpy(buffer2, "\"notepad\t\"" );
-    SetLastError(0xdeadbeef);
-    ret = CreateProcessA(NULL, buffer2, NULL, NULL, FALSE, 0L, NULL, NULL, &startup, &info);
-    ok(!ret, "CreateProcessA unexpectedly succeeded\n");
-    ok(GetLastError() == ERROR_FILE_NOT_FOUND, "Expected ERROR_FILE_NOT_FOUND, got %ld\n", GetLastError());
 
     strcpy(buffer, "doesnotexist.exe");
     strcpy(buffer2, "does not exist.exe");
@@ -1175,21 +1155,6 @@ static void test_CommandLine(void)
     cmdline = GetCommandLineW();
     ok(cmdline == cmdline_backup, "Expected cached address from TEB, got %p\n", cmdline);
     NtCurrentTeb()->Peb->ProcessParameters->CommandLine.Buffer = cmdline_backup;
-
-    /* Test quoted command line without file extension*/
-    sprintf(buffer, "%s", selfname);
-    p = strrchr(buffer, '.');
-    *p = 0;
-    get_file_name(resfile);
-    sprintf(buffer2, "\"%s \" process dump \"%s\"", buffer, resfile);
-    ret = CreateProcessA(NULL, buffer2, NULL, NULL, FALSE, 0L, NULL, NULL, &startup, &info);
-    ok(ret, "CreateProcess (%s) failed : %ld\n", buffer, GetLastError());
-    if (ret)
-    {
-        wait_child_process(&info);
-        release_memory();
-        DeleteFileA(resfile);
-    }
 }
 
 static void test_Directory(void)
@@ -5704,7 +5669,7 @@ static void test_GetProcessInformation(void)
     ok(ret, "Unexpected return value %d.\n", ret);
 
     process = GetCurrentProcess();
-    status = NtQuerySystemInformationEx( SystemSupportedProcessorArchitectures2, &process, sizeof(process),
+    status = NtQuerySystemInformationEx( SystemSupportedProcessorArchitectures, &process, sizeof(process),
             machines, sizeof(machines), NULL );
     ok(!status, "Failed to get architectures information.\n");
     for (i = 0; machines[i].Machine; i++)

@@ -38,7 +38,7 @@ struct glsl_src
 
 struct glsl_dst
 {
-    const struct vsir_dst_operand *vsir;
+    const struct vkd3d_shader_dst_param *vsir;
     struct vkd3d_string_buffer *register_name;
     struct vkd3d_string_buffer *mask;
 };
@@ -67,20 +67,19 @@ struct vkd3d_glsl_generator
     const struct vkd3d_shader_scan_combined_resource_sampler_info *combined_sampler_info;
 };
 
-static void shader_glsl_print_subscript(struct vkd3d_string_buffer *buffer,
-        struct vkd3d_glsl_generator *gen, const struct vsir_src_operand *rel_addr, unsigned int offset);
+static void shader_glsl_print_subscript(struct vkd3d_string_buffer *buffer, struct vkd3d_glsl_generator *gen,
+        const struct vkd3d_shader_src_param *rel_addr, unsigned int offset);
 
-#define vkd3d_glsl_compiler_error(gen, error, ...) \
-        vkd3d_glsl_compiler_error_(gen, error, __FUNCTION__, __VA_ARGS__)
-static void VKD3D_PRINTF_FUNC(4, 5) vkd3d_glsl_compiler_error_(struct vkd3d_glsl_generator *gen,
-        enum vkd3d_shader_error error, const char *function, const char *fmt, ...)
+static void VKD3D_PRINTF_FUNC(3, 4) vkd3d_glsl_compiler_error(
+        struct vkd3d_glsl_generator *generator,
+        enum vkd3d_shader_error error, const char *fmt, ...)
 {
     va_list args;
 
     va_start(args, fmt);
-    vkd3d_shader_verror(gen->message_context, &gen->location, error, function, fmt, args);
+    vkd3d_shader_verror(generator->message_context, &generator->location, error, fmt, args);
     va_end(args);
-    gen->failed = true;
+    generator->failed = true;
 }
 
 static const char *shader_glsl_get_prefix(enum vkd3d_shader_type type)
@@ -188,7 +187,7 @@ static void shader_glsl_print_image_name(struct vkd3d_string_buffer *buffer,
 }
 
 static void shader_glsl_print_register_name(struct vkd3d_string_buffer *buffer,
-        struct vkd3d_glsl_generator *gen, const struct vsir_operand *reg)
+        struct vkd3d_glsl_generator *gen, const struct vkd3d_shader_register *reg)
 {
     switch (reg->type)
     {
@@ -390,9 +389,9 @@ static void shader_glsl_print_bitcast(struct vkd3d_string_buffer *dst, struct vk
 }
 
 static void shader_glsl_print_src(struct vkd3d_string_buffer *buffer, struct vkd3d_glsl_generator *gen,
-        const struct vsir_src_operand *vsir_src, uint32_t mask, enum vsir_data_type data_type)
+        const struct vkd3d_shader_src_param *vsir_src, uint32_t mask, enum vsir_data_type data_type)
 {
-    const struct vsir_operand *reg = &vsir_src->reg;
+    const struct vkd3d_shader_register *reg = &vsir_src->reg;
     struct vkd3d_string_buffer *register_name;
     enum vsir_data_type src_data_type;
     unsigned int size;
@@ -419,7 +418,7 @@ static void shader_glsl_print_src(struct vkd3d_string_buffer *buffer, struct vkd
 }
 
 static void glsl_src_init(struct glsl_src *glsl_src, struct vkd3d_glsl_generator *gen,
-        const struct vsir_src_operand *vsir_src, uint32_t mask)
+        const struct vkd3d_shader_src_param *vsir_src, uint32_t mask)
 {
     glsl_src->str = vkd3d_string_buffer_get(&gen->string_buffers);
     shader_glsl_print_src(glsl_src->str, gen, vsir_src, mask, vsir_src->reg.data_type);
@@ -432,7 +431,7 @@ static void glsl_dst_cleanup(struct glsl_dst *dst, struct vkd3d_string_buffer_ca
 }
 
 static uint32_t glsl_dst_init(struct glsl_dst *glsl_dst, struct vkd3d_glsl_generator *gen,
-        const struct vkd3d_shader_instruction *ins, const struct vsir_dst_operand *vsir_dst)
+        const struct vkd3d_shader_instruction *ins, const struct vkd3d_shader_dst_param *vsir_dst)
 {
     uint32_t write_mask = vsir_dst->write_mask;
 
@@ -453,8 +452,8 @@ static uint32_t glsl_dst_init(struct glsl_dst *glsl_dst, struct vkd3d_glsl_gener
     return write_mask;
 }
 
-static void shader_glsl_print_subscript(struct vkd3d_string_buffer *buffer,
-        struct vkd3d_glsl_generator *gen, const struct vsir_src_operand *rel_addr, unsigned int offset)
+static void shader_glsl_print_subscript(struct vkd3d_string_buffer *buffer, struct vkd3d_glsl_generator *gen,
+        const struct vkd3d_shader_src_param *rel_addr, unsigned int offset)
 {
     struct glsl_src r;
 
@@ -863,7 +862,7 @@ static void shader_glsl_ld(struct vkd3d_glsl_generator *gen, const struct vkd3d_
 }
 
 static void shader_glsl_print_shadow_coord(struct vkd3d_string_buffer *buffer, struct vkd3d_glsl_generator *gen,
-        const struct vsir_src_operand *coord, const struct vsir_src_operand *ref, unsigned int coord_size)
+        const struct vkd3d_shader_src_param *coord, const struct vkd3d_shader_src_param *ref, unsigned int coord_size)
 {
     uint32_t coord_mask = vkd3d_write_mask_from_component_count(coord_size);
 
@@ -897,9 +896,9 @@ static void shader_glsl_sample(struct vkd3d_glsl_generator *gen, const struct vk
 {
     bool shadow_sampler, array, bias, dynamic_offset, gather, grad, lod, lod_zero, offset, shadow;
     const struct glsl_resource_type_info *resource_type_info;
+    const struct vkd3d_shader_src_param *resource, *sampler;
     unsigned int resource_id, resource_idx, resource_space;
     unsigned int sampler_id, sampler_idx, sampler_space;
-    const struct vsir_src_operand *resource, *sampler;
     const struct vkd3d_shader_descriptor_info1 *d;
     enum vkd3d_shader_resource_type resource_type;
     unsigned int component_idx, coord_size;
@@ -2323,32 +2322,15 @@ static void shader_glsl_generate_output_declarations(struct vkd3d_glsl_generator
 static void shader_glsl_handle_global_flags(struct vkd3d_string_buffer *buffer,
         struct vkd3d_glsl_generator *gen, enum vsir_global_flags flags)
 {
-    static const uint64_t ignored_flags = VKD3DSGF_REFACTORING_ALLOWED | VKD3DSGF_BIND_FOR_DURATION;
-
     if (flags & VKD3DSGF_FORCE_EARLY_DEPTH_STENCIL)
     {
         vkd3d_string_buffer_printf(buffer, "layout(early_fragment_tests) in;\n");
         flags &= ~VKD3DSGF_FORCE_EARLY_DEPTH_STENCIL;
     }
 
-    if (flags & ignored_flags)
-    {
-        TRACE("Ignoring global flags %#"PRIx64".\n", flags & ignored_flags);
-        flags &= ~ignored_flags;
-    }
-
-    if (flags)
+    if (flags & ~VKD3DSGF_REFACTORING_ALLOWED)
         vkd3d_glsl_compiler_error(gen, VKD3D_SHADER_ERROR_GLSL_INTERNAL,
                 "Internal compiler error: Unhandled global flags %#"PRIx64".", (uint64_t)flags);
-
-    if (gen->program->f16_denormal_mode != VKD3D_SHADER_DENORMAL_MODE_ANY
-            || gen->program->f32_denormal_mode != VKD3D_SHADER_DENORMAL_MODE_ANY
-            || gen->program->f64_denormal_mode != VKD3D_SHADER_DENORMAL_MODE_ANY)
-    {
-        vkd3d_glsl_compiler_error(gen, VKD3D_SHADER_ERROR_GLSL_UNSUPPORTED,
-                "Cannot emit denormal modes. The target environment does not support float controls.");
-        return;
-    }
 }
 
 static void shader_glsl_generate_declarations(struct vkd3d_glsl_generator *gen)
@@ -2499,8 +2481,8 @@ int glsl_compile(struct vsir_program *program, uint64_t config_flags,
         return ret;
 
     VKD3D_ASSERT(program->normalisation_level == VSIR_NORMALISED_SM6);
-    VKD3D_ASSERT(program->normalisation_flags.has_descriptor_info);
-    VKD3D_ASSERT(program->normalisation_flags.has_no_modifiers);
+    VKD3D_ASSERT(program->has_descriptor_info);
+    VKD3D_ASSERT(program->has_no_modifiers);
 
     vkd3d_glsl_generator_init(&generator, program, compile_info,
             combined_sampler_info, message_context);

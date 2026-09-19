@@ -57,6 +57,7 @@ struct key_repeat
     timeout_t            delay;            /* auto-repeat delay */
     timeout_t            period;           /* auto-repeat period */
     union hw_input       input;            /* the input to repeat */
+    unsigned int         flags;            /* the queue_keyboard_message flags */
     user_handle_t        win;              /* target window for input event */
     struct timeout_user *timeout;          /* timeout for repeat */
 };
@@ -78,9 +79,11 @@ struct desktop
     struct list          hotkeys;          /* list of registered hotkeys */
     struct list          pointers;         /* list of active pointers */
     struct timeout_user *close_timeout;    /* timeout before closing the desktop */
+    timeout_t            close_timeout_val;/* timeout duration before closing desktop */
     struct thread_input *foreground_input; /* thread input of foreground thread */
     process_id_t         foreground_pid;   /* id of the foreground process */
     unsigned int         users;            /* processes and threads using this desktop */
+    unsigned char        keystate[256];    /* asynchronous key state */
     unsigned char        alt_pressed;      /* last key press was Alt (used to determine msg on release) */
     struct key_repeat    key_repeat;       /* key auto-repeat */
     unsigned int         clip_flags;       /* last cursor clip flags */
@@ -188,13 +191,13 @@ extern struct window_class *get_window_class( user_handle_t window );
 /* window class functions */
 
 extern void destroy_process_classes( struct process *process );
-extern struct window_class *grab_class( struct process *process, atom_t atom, mod_handle_t instance, struct obj_locator *locator );
+extern struct window_class *grab_class( struct process *process, atom_t atom, mod_handle_t instance,
+                                        int *extra_bytes, struct obj_locator *locator );
 extern void release_class( struct window_class *class );
 extern int is_desktop_class( struct window_class *class );
 extern int is_message_class( struct window_class *class );
 extern int get_class_style( struct window_class *class );
 extern atom_t get_class_atom( struct window_class *class );
-extern unsigned int get_class_fnid( struct window_class *class, data_size_t *extra_size, data_size_t *private_size );
 extern client_ptr_t get_class_client_ptr( struct window_class *class );
 
 /* windows station functions */
@@ -230,10 +233,24 @@ static inline int point_in_rect( const struct rectangle *rect, int x, int y )
     return (x >= rect->left && x < rect->right && y >= rect->top && y < rect->bottom);
 }
 
+static inline void get_dpi_num_den( UINT dpi, UINT *num, UINT *den )
+{
+    if (!(*den = (dpi >> 16))) *den = 1;
+    *num = dpi & 0xffff;
+}
+
 static inline int scale_dpi( int val, unsigned int dpi_from, unsigned int dpi_to )
 {
-    if (val >= 0) return (val * dpi_to + (dpi_from / 2)) / dpi_from;
-    return (val * dpi_to - (dpi_from / 2)) / dpi_from;
+    unsigned int from_num, from_den, to_num, to_den;
+    unsigned int num, den;
+
+    get_dpi_num_den( dpi_from, &from_num, &from_den );
+    get_dpi_num_den( dpi_to, &to_num, &to_den );
+    num = to_num * from_den;
+    den = from_num * to_den;
+
+    if (val >= 0) return (val * num + (den / 2)) / den;
+    return (val * num - (den / 2)) / den;
 }
 
 static inline void scale_dpi_rect( struct rectangle *rect, unsigned int dpi_from, unsigned int dpi_to )

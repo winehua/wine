@@ -436,6 +436,26 @@ static void test_math(void)
     release_test_context(&test_context);
 }
 
+static void test_sm4_half_arithmetic(void)
+{
+    static const char ps_source[] =
+        "half4 main(float4 pos : SV_POSITION) : SV_TARGET\n"
+        "{\n"
+        "    half4 a = half4(0.25, 0.5, 0.75, 1.0);\n"
+        "    half4 b = half4(0.5, 0.25, 0.125, 0.5);\n"
+        "    half4 c = a * b + a / b;\n"
+        "    c = max(c, min(a, b));\n"
+        "    c += half4(dot(a.xyz, b.xyz), a.x, -b.y, a.w);\n"
+        "    c += (a.x == b.x) ? half4(1, 2, 3, 4) : half4(0, 0, 0, 0);\n"
+        "    return c;\n"
+        "}";
+    ID3D10Blob *code;
+
+    code = compile_shader(ps_source, "ps_4_0");
+    if (code)
+        ID3D10Blob_Release(code);
+}
+
 static void test_conditionals(void)
 {
     struct test_context test_context;
@@ -1217,6 +1237,7 @@ START_TEST(hlsl_d3d11)
 
     test_swizzle();
     test_math();
+    test_sm4_half_arithmetic();
     test_conditionals();
     test_trig();
     test_sampling();

@@ -65,7 +65,6 @@
 @ stdcall CoQueryClientBlanket(ptr ptr ptr ptr ptr ptr ptr) combase.CoQueryClientBlanket
 @ stdcall CoQueryProxyBlanket(ptr ptr ptr ptr ptr ptr ptr ptr) combase.CoQueryProxyBlanket
 @ stub CoQueryReleaseObject
-@ stdcall CoRegisterActivationFilter(ptr) combase.CoRegisterActivationFilter
 @ stdcall CoRegisterChannelHook(ptr ptr) combase.CoRegisterChannelHook
 @ stdcall CoRegisterClassObject(ptr ptr long long ptr) combase.CoRegisterClassObject
 @ stdcall CoRegisterInitializeSpy(ptr ptr) combase.CoRegisterInitializeSpy

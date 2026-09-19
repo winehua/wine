@@ -175,6 +175,7 @@ struct transform_stream
     unsigned int block_alignment;
     unsigned int bytes_per_second;
     unsigned int min_buffer_size;
+    IMFSample *allocated_sample;
     BOOL samples_independent;
     BOOL draining;
 };
@@ -541,7 +542,7 @@ static void session_set_topo_status(struct media_session *session, HRESULT statu
     IMFMediaEvent *event;
     PROPVARIANT param;
 
-    if (topo_status == MF_TOPOSTATUS_INVALID)
+    if (topo_status == MF_TOPOSTATUS_INVALID || status == MF_E_SHUTDOWN)
         return;
 
     if (list_empty(&session->topologies))
@@ -779,6 +780,12 @@ static HRESULT transform_stream_pop_event(struct transform_stream *stream, IMFMe
 static void transform_stream_drop_events(struct transform_stream *stream)
 {
     IMFMediaEvent *event;
+
+    if (stream->allocated_sample)
+    {
+        IMFSample_Release(stream->allocated_sample);
+        stream->allocated_sample = NULL;
+    }
 
     while (SUCCEEDED(transform_stream_pop_event(stream, &event)))
         IMFMediaEvent_Release(event);
@@ -1949,7 +1956,7 @@ static HRESULT session_append_node(struct media_session *session, IMFTopologyNod
                         &IID_IMFVideoSampleAllocator, (void **)&topo_node->u.sink.allocator)))
                     {
                         if (FAILED(hr = IMFVideoSampleAllocator_InitializeSampleAllocator(topo_node->u.sink.allocator,
-                                2, media_type)))
+                                4, media_type)))
                         {
                             WARN("Failed to initialize sample allocator for the stream, hr %#lx.\n", hr);
                         }
@@ -2075,7 +2082,8 @@ static HRESULT session_set_current_topology(struct media_session *session, IMFTo
         return hr;
     }
 
-    session_collect_nodes(session);
+    if (FAILED(hr = session_collect_nodes(session)))
+        return hr;
 
     LIST_FOR_EACH_ENTRY(node, &session->presentation.nodes, struct topo_node, entry)
     {
@@ -2152,6 +2160,8 @@ static void session_set_topology(struct media_session *session, DWORD flags, IMF
         if (!(flags & MFSESSION_SETTOPOLOGY_NORESOLUTION))
         {
             hr = session_bind_output_nodes(topology);
+
+            IMFTopology_SetUINT32(topology, &MF_TOPOLOGY_ENUMERATE_SOURCE_TYPES, TRUE);
 
             if (SUCCEEDED(hr))
                 hr = IMFTopoLoader_Load(session->topo_loader, topology, &resolved_topology, NULL /* FIXME? */);
@@ -3487,11 +3497,21 @@ static void session_set_sink_stream_state(struct media_session *session, IMFStre
 static HRESULT transform_get_external_output_sample(const struct media_session *session, struct topo_node *transform,
         DWORD output, const MFT_OUTPUT_STREAM_INFO *stream_info, IMFSample **sample)
 {
+    struct transform_stream *stream = &transform->u.transform.outputs[output];
+    DWORD buffer_size, sample_size, input;
     IMFMediaBuffer *buffer = NULL;
     struct topo_node *topo_node;
-    unsigned int buffer_size;
-    DWORD input;
     HRESULT hr;
+
+    buffer_size = max(stream_info->cbSize, stream->min_buffer_size);
+    if ((*sample = stream->allocated_sample))
+    {
+        stream->allocated_sample = NULL;
+        if (SUCCEEDED(IMFSample_GetTotalLength(*sample, &sample_size)) && sample_size >= buffer_size)
+            return S_OK;
+        IMFSample_Release(*sample);
+        *sample = NULL;
+    }
 
     if (!(topo_node = session_get_topo_node_output(session, transform, output, &input)))
     {
@@ -3505,8 +3525,6 @@ static HRESULT transform_get_external_output_sample(const struct media_session *
     }
     else
     {
-        buffer_size = max(stream_info->cbSize, transform->u.transform.outputs[output].min_buffer_size);
-
         hr = MFCreateAlignedMemoryBuffer(buffer_size, stream_info->cbAlignment, &buffer);
         if (SUCCEEDED(hr))
             hr = MFCreateSample(sample);
@@ -3828,6 +3846,11 @@ static HRESULT transform_node_pull_samples(const struct media_session *session, 
                 IMFQualityManager_NotifyProcessOutput(session->quality_manager, node->node, i, buffers[i].pSample);
             if (FAILED(hr = transform_stream_push_sample(stream, buffers[i].pSample)))
                 WARN("Failed to queue output sample, hr %#lx\n", hr);
+        }
+        else if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT && !stream->allocated_sample)
+        {
+            stream->allocated_sample = buffers[i].pSample;
+            buffers[i].pSample = NULL;
         }
     }
 

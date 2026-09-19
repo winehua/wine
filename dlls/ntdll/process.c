@@ -29,6 +29,7 @@
 #include <sys/types.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "wine/debug.h"
 #include "windef.h"
 #include "winternl.h"
@@ -527,11 +528,28 @@ NTSTATUS WINAPI RtlCreateUserProcess( UNICODE_STRING *path, ULONG attributes,
     InitializeObjectAttributes( &process_attr, NULL, 0, NULL, process_descr );
     InitializeObjectAttributes( &thread_attr, NULL, 0, NULL, thread_descr );
 
-    return NtCreateUserProcess( &info->Process, &info->Thread, PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS,
-                                &process_attr, &thread_attr,
-                                inherit ? PROCESS_CREATE_FLAGS_INHERIT_HANDLES : 0,
-                                THREAD_CREATE_FLAGS_CREATE_SUSPENDED, params,
-                                &create_info, attr );
+    {
+        /* TEMP-DIAG(CREATEPROC): log every process creation attempt + result. */
+        char name[160];
+        unsigned int i, len = 0;
+        NTSTATUS status;
+
+        for (i = 0; i < 78 && path->Buffer && path->Buffer[i]; i++)
+        {
+            WCHAR ch = path->Buffer[i];
+            if (ch < 128) name[len++] = (char)ch;
+        }
+        name[len] = 0;
+
+        status = NtCreateUserProcess( &info->Process, &info->Thread, PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS,
+                                      &process_attr, &thread_attr,
+                                      inherit ? PROCESS_CREATE_FLAGS_INHERIT_HANDLES : 0,
+                                      THREAD_CREATE_FLAGS_CREATE_SUSPENDED, params,
+                                      &create_info, attr );
+        MESSAGE( "[createproc] status=0x%08x pid=%04x exe=%s\n", (unsigned int)status,
+                 (unsigned int)(ULONG_PTR)info->ClientId.UniqueProcess, name );
+        return status;
+    }
 }
 
 /***********************************************************************

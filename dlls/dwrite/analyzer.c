@@ -264,7 +264,7 @@ system_fallback_config[] =
     { "0D00-0D7F",              L"Noto Sans Malayalam" },
     { "0D80-0DFF",              L"Noto Sans Sinhala" },
 
-    { "0E00-0E7F",              L"Noto Sans Thai" },
+    { "0E00-0E7F",              L"Microsoft Sans Serif" },
     { "0E80-0EFF",              L"Noto Sans Lao" },
 
     { "0F00-0FFF",              L"Noto Serif Tibetan" },
@@ -284,7 +284,7 @@ system_fallback_config[] =
     { "1100-11FF, 3130-318F, "
       "3200-321F, 3260-327F, "
       "A960-A97F, AC00-D7FF, "
-      "D7B0-D7FF",              L"Noto Sans CJK KR" },
+      "D7B0-D7FF",              L"Malgun Gothic" },
 
     { "1680-169F",              L"Noto Sans Ogham" },
 
@@ -309,7 +309,7 @@ system_fallback_config[] =
     { "1C50-1C7F",              L"Noto Sans Ol Chiki" },
 
     /* Miscellaneous Symbols - 2600-26FF */
-    { "2600-26FF",              L"Noto Sans Symbols2, Noto Sans Symbols" },
+    { "2600-26FF",              L"Noto Sans Symbols2, Noto Sans Symbols 2, Noto Sans Symbols" },
 
     /* Dingbats - 2700-27BF */
     { "2700-27BF",              L"Noto Sans Symbols2, Noto Sans Symbols 2" },
@@ -319,27 +319,27 @@ system_fallback_config[] =
 
     /* CJK Radicals Supplement - 2E80-2EFF */
 
-    { "2E80-2EFF",              L"Noto Sans CJK SC", L"zh-Hans" },
+    { "2E80-2EFF",              L"Microsoft YaHei", L"zh-Hans" },
     { "2E80-2EFF",              L"Noto Sans CJK TC", L"zh-Hant" },
-    { "2E80-2EFF",              L"Noto Sans CJK KR", L"ko" },
+    { "2E80-2EFF",              L"Malgun Gothic", L"ko" },
 
     /* CJK Symbols and Punctuation - 3000-303F
        Hiragana                    - 3040-309F
        Katakana                    - 30A0-30FF
        Katakana Phonetic Ext.      - 31F0-31FF */
 
-    { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK SC", L"zh-Hans" },
+    { "3000-30FF, 31F0-31FF",   L"Microsoft YaHei", L"zh-Hans" },
     { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK TC", L"zh-Hant" },
-    { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK KR", L"ko" },
-    { "3000-30FF, 31F0-31FF",   L"Noto Sans CJK JP" },
+    { "3000-30FF, 31F0-31FF",   L"Malgun Gothic", L"ko" },
+    { "3000-30FF, 31F0-31FF",   L"MS Gothic" },
 
     /* CJK Unified Ext A - 3400-4DBF
        CJK Unified       - 4E00-9FFF */
 
-    { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK SC", L"zh-Hans" },
+    { "3400-4DBF, 4E00-9FFF",   L"Microsoft YaHei", L"zh-Hans" },
     { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK TC", L"zh-Hant" },
-    { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK KR", L"ko" },
-    { "3400-4DBF, 4E00-9FFF",   L"Noto Sans CJK JP" },
+    { "3400-4DBF, 4E00-9FFF",   L"Malgun Gothic", L"ko" },
+    { "3400-4DBF, 4E00-9FFF",   L"MS Gothic" },
 
     { "A000-A4CF",              L"Noto Sans Yi" },
     { "A4D0-A4FF",              L"Noto Sans Lisu" },
@@ -355,32 +355,32 @@ system_fallback_config[] =
 
     /* CJK Compatibility Ideographs - F900-FAFF */
 
-    { "F900-FAFF",              L"Noto Sans CJK SC", L"zh-Hans" },
+    { "F900-FAFF",              L"Microsoft YaHei", L"zh-Hans" },
     { "F900-FAFF",              L"Noto Sans CJK TC", L"zh-Hant" },
-    { "F900-FAFF",              L"Noto Sans CJK KR", L"ko" },
-    { "F900-FAFF",              L"Noto Sans CJK JP" },
+    { "F900-FAFF",              L"Malgun Gothic", L"ko" },
+    { "F900-FAFF",              L"MS Gothic" },
 
     /* Vertical Forms - FE10-FE1F */
 
-    { "FE10-FE1F",              L"Noto Sans CJK SC", L"zh-Hans" },
-    { "FE10-FE1F",              L"Noto Sans CJK KR", L"ko" },
+    { "FE10-FE1F",              L"Microsoft YaHei", L"zh-Hans" },
+    { "FE10-FE1F",              L"Malgun Gothic", L"ko" },
     { "FE10-FE1F",              L"Noto Sans CJK TC" },
 
     /* CJK Compatibility Forms - FE30-FE4F
        Small Form Variants     - FE50-FE6F */
 
-    { "FE30-FE6F",              L"Noto Sans CJK SC", L"zh-Hans" },
-    { "FE30-FE6F",              L"Noto Sans CJK KR", L"ko" },
-    { "FE30-FE6F",              L"Noto Sans CJK JP", L"ja" },
+    { "FE30-FE6F",              L"Microsoft YaHei", L"zh-Hans" },
+    { "FE30-FE6F",              L"Malgun Gothic", L"ko" },
+    { "FE30-FE6F",              L"MS Gothic", L"ja" },
     { "FE30-FE6F",              L"Noto Sans CJK TC" },
 
     /* Halfwidth and Fullwidth Forms */
-    { "FF00-FFEF",              L"Noto Sans CJK SC", L"zh-Hans" },
+    { "FF00-FFEF",              L"Microsoft YaHei", L"zh-Hans" },
     { "FF00-FFEF",              L"Noto Sans CJK TC", L"zh-Hant" },
-    { "FF00-FFEF",              L"Noto Sans CJK KR", L"ko" },
-    { "FF00-FFEF",              L"Noto Sans CJK JP" },
+    { "FF00-FFEF",              L"Malgun Gothic", L"ko" },
+    { "FF00-FFEF",              L"MS Gothic" },
 
-    { "1F800-1F8FF",            L"Noto Sans Symbols2, Noto Sans Symbols 2" },
+    { "1F300-1F8FF",            L"Noto Sans Symbols2, Noto Sans Symbols 2, Noto Emoji" },
 };
 
 struct text_source_context
@@ -2636,10 +2636,17 @@ static HRESULT WINAPI fontfallback_MapCharacters(IDWriteFontFallback1 *iface, ID
 
     if (basefamily && *basefamily)
     {
-        if (SUCCEEDED(create_matching_font(basecollection, basefamily, weight, style, stretch,
-                &IID_IDWriteFont, (void **)&font)))
+        /* fallback_font_get_supported_length() uses the IDWriteFont3
+         * HasCharacter method, so keep the requested interface aligned with
+         * the local pointer type. */
+        HRESULT base_hr = create_matching_font(basecollection, basefamily, weight, style, stretch,
+                &IID_IDWriteFont3, (void **)&font);
+        TRACE("base family %s lookup hr=%#lx.\n", debugstr_w(basefamily), base_hr);
+        if (SUCCEEDED(base_hr))
         {
-            if ((*mapped_length = fallback_font_get_supported_length(font, source, position, length)))
+            *mapped_length = fallback_font_get_supported_length(font, source, position, length);
+            TRACE("base family %s supported %u/%u.\n", debugstr_w(basefamily), *mapped_length, length);
+            if (*mapped_length)
             {
                 *ret_font = (IDWriteFont *)font;
                 *scale = 1.0f;

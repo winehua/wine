@@ -22,6 +22,7 @@
 #include <float.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "ntdll_misc.h"
 
 double math_error( int type, const char *name, double arg1, double arg2, double retval )

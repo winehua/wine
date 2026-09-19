@@ -445,7 +445,7 @@ TREEVIEW_GetNextListItem(const TREEVIEW_INFO *infoPtr, const TREEVIEW_ITEM *tvIt
 
 /***************************************************************************
  * This method returns the nth item starting at the given item.  It returns
- * the last item (or the first) when we run out of items.
+ * the last item (or first) we we run out of items.
  *
  * Will scroll backward if count is <0.
  *             forward if count is >0.
@@ -2342,30 +2342,21 @@ TREEVIEW_ToggleItemState(const TREEVIEW_INFO *infoPtr, TREEVIEW_ITEM *item)
 {
     if (infoPtr->dwStyle & TVS_CHECKBOXES)
     {
-        unsigned int state, stateImage, numStates;
+	static const unsigned int state_table[] = { 0, 2, 1 };
 
-        /* Toggle item state cycles through images other than zero, if image list with more state images is set */
-        numStates = 0;
-        if ( infoPtr->himlState ) numStates = ImageList_GetImageCount(infoPtr->himlState);
-        if ( numStates < 3 ) numStates = 3;
+	unsigned int state;
 
-        state = item->state;
-        stateImage = STATEIMAGEINDEX(state);
-        TRACE("stateImage: 0x%x\n", stateImage);
-        state &= ~TVIS_STATEIMAGEMASK;
+	state = STATEIMAGEINDEX(item->state);
+	TRACE("state: 0x%x\n", state);
+	item->state &= ~TVIS_STATEIMAGEMASK;
 
-        if ( stateImage > 0 )
-        {
-            ++ stateImage;
-            if ( stateImage >= numStates ) stateImage = 1;
-        }
+	if (state < 3)
+	    state = state_table[state];
 
-        state |= INDEXTOSTATEIMAGEMASK(stateImage);
+	item->state |= INDEXTOSTATEIMAGEMASK(state);
 
-        TRACE("stateImage: 0x%x\n", stateImage);
-
-        item->state = state;
-        TREEVIEW_Invalidate(infoPtr, item);
+	TRACE("state: 0x%x\n", state);
+	TREEVIEW_Invalidate(infoPtr, item);
     }
 }
 
@@ -2669,7 +2660,7 @@ TREEVIEW_DrawItem(const TREEVIEW_INFO *infoPtr, HDC hdc, TREEVIEW_ITEM *item)
      */
 
     /* Don't paint item's text if it's being edited */
-    if (!infoPtr->hwndEdit || (infoPtr->editItem != item))
+    if (!infoPtr->hwndEdit || (infoPtr->selectedItem != item))
     {
 	if (item->pszText)
 	{
@@ -4327,14 +4318,9 @@ TREEVIEW_LButtonDown(TREEVIEW_INFO *infoPtr, LPARAM lParam)
 
         if (do_focus)
         {
+            infoPtr->focusedItem = ht.hItem;
             TREEVIEW_InvalidateItem(infoPtr, infoPtr->focusedItem);
-            if (infoPtr->focusedItem != ht.hItem)
-            {
-                infoPtr->focusedItem = ht.hItem;
-                TREEVIEW_InvalidateItem(infoPtr, infoPtr->focusedItem);
-            }
-            if (infoPtr->focusedItem != infoPtr->selectedItem)
-                TREEVIEW_InvalidateItem(infoPtr, infoPtr->selectedItem);
+            TREEVIEW_InvalidateItem(infoPtr, infoPtr->selectedItem);
         }
     }
 

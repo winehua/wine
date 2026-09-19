@@ -1106,7 +1106,7 @@
     SYSCALL_ENTRY( 0x144e, NtUserGetThreadState, 4 ) \
     SYSCALL_ENTRY( 0x144f, NtUserGetTitleBarInfo, 8 ) \
     SYSCALL_ENTRY( 0x1450, NtUserGetTopLevelWindow, 0 ) \
-    SYSCALL_ENTRY( 0x1451, NtUserGetTouchInputInfo, 0 ) \
+    SYSCALL_ENTRY( 0x1451, NtUserGetTouchInputInfo, 16 ) \
     SYSCALL_ENTRY( 0x1452, NtUserGetTouchValidationStatus, 0 ) \
     SYSCALL_ENTRY( 0x1453, NtUserGetUniformSpaceMapping, 0 ) \
     SYSCALL_ENTRY( 0x1454, NtUserGetUnpredictedMessagePos, 0 ) \
@@ -1175,7 +1175,7 @@
     SYSCALL_ENTRY( 0x1493, NtUserIsQueueAttached, 0 ) \
     SYSCALL_ENTRY( 0x1494, NtUserIsResizeLayoutSynchronizationEnabled, 0 ) \
     SYSCALL_ENTRY( 0x1495, NtUserIsTopLevelWindow, 0 ) \
-    SYSCALL_ENTRY( 0x1496, NtUserIsTouchWindow, 0 ) \
+    SYSCALL_ENTRY( 0x1496, NtUserIsTouchWindow, 8 ) \
     SYSCALL_ENTRY( 0x1497, NtUserIsWindowBroadcastingDpiToChildren, 0 ) \
     SYSCALL_ENTRY( 0x1498, NtUserIsWindowDisplayChangeSuppressed, 0 ) \
     SYSCALL_ENTRY( 0x1499, NtUserIsWindowGDIScaledDpiMessageEnabled, 0 ) \
@@ -1390,7 +1390,7 @@
     SYSCALL_ENTRY( 0x156a, NtUserSetMenuContextHelpId, 8 ) \
     SYSCALL_ENTRY( 0x156b, NtUserSetMenuDefaultItem, 12 ) \
     SYSCALL_ENTRY( 0x156c, NtUserSetMenuFlagRtoL, 0 ) \
-    SYSCALL_ENTRY( 0x156d, NtUserSetMessageExtraInfo, 4 ) \
+    SYSCALL_ENTRY( 0x156d, NtUserSetMessageExtraInfo, 0 ) \
     SYSCALL_ENTRY( 0x156e, NtUserSetMirrorRendering, 0 ) \
     SYSCALL_ENTRY( 0x156f, NtUserSetModernAppWindow, 0 ) \
     SYSCALL_ENTRY( 0x1570, NtUserSetMonitorWorkArea, 0 ) \
@@ -1441,7 +1441,7 @@
     SYSCALL_ENTRY( 0x159d, NtUserSetWindowCompositionTransition, 0 ) \
     SYSCALL_ENTRY( 0x159e, NtUserSetWindowContextHelpId, 8 ) \
     SYSCALL_ENTRY( 0x159f, NtUserSetWindowDisplayAffinity, 0 ) \
-    SYSCALL_ENTRY( 0x15a0, NtUserSetWindowFNID, 8 ) \
+    SYSCALL_ENTRY( 0x15a0, NtUserSetWindowFNID, 0 ) \
     SYSCALL_ENTRY( 0x15a1, NtUserSetWindowFeedbackSetting, 0 ) \
     SYSCALL_ENTRY( 0x15a2, NtUserSetWindowGroup, 0 ) \
     SYSCALL_ENTRY( 0x15a3, NtUserSetWindowLong, 16 ) \
@@ -2648,7 +2648,7 @@
     SYSCALL_ENTRY( 0x144e, NtUserGetThreadState, 8 ) \
     SYSCALL_ENTRY( 0x144f, NtUserGetTitleBarInfo, 16 ) \
     SYSCALL_ENTRY( 0x1450, NtUserGetTopLevelWindow, 0 ) \
-    SYSCALL_ENTRY( 0x1451, NtUserGetTouchInputInfo, 0 ) \
+    SYSCALL_ENTRY( 0x1451, NtUserGetTouchInputInfo, 32 ) \
     SYSCALL_ENTRY( 0x1452, NtUserGetTouchValidationStatus, 0 ) \
     SYSCALL_ENTRY( 0x1453, NtUserGetUniformSpaceMapping, 0 ) \
     SYSCALL_ENTRY( 0x1454, NtUserGetUnpredictedMessagePos, 0 ) \
@@ -2717,7 +2717,7 @@
     SYSCALL_ENTRY( 0x1493, NtUserIsQueueAttached, 0 ) \
     SYSCALL_ENTRY( 0x1494, NtUserIsResizeLayoutSynchronizationEnabled, 0 ) \
     SYSCALL_ENTRY( 0x1495, NtUserIsTopLevelWindow, 0 ) \
-    SYSCALL_ENTRY( 0x1496, NtUserIsTouchWindow, 0 ) \
+    SYSCALL_ENTRY( 0x1496, NtUserIsTouchWindow, 16 ) \
     SYSCALL_ENTRY( 0x1497, NtUserIsWindowBroadcastingDpiToChildren, 0 ) \
     SYSCALL_ENTRY( 0x1498, NtUserIsWindowDisplayChangeSuppressed, 0 ) \
     SYSCALL_ENTRY( 0x1499, NtUserIsWindowGDIScaledDpiMessageEnabled, 0 ) \
@@ -2932,7 +2932,7 @@
     SYSCALL_ENTRY( 0x156a, NtUserSetMenuContextHelpId, 16 ) \
     SYSCALL_ENTRY( 0x156b, NtUserSetMenuDefaultItem, 24 ) \
     SYSCALL_ENTRY( 0x156c, NtUserSetMenuFlagRtoL, 0 ) \
-    SYSCALL_ENTRY( 0x156d, NtUserSetMessageExtraInfo, 8 ) \
+    SYSCALL_ENTRY( 0x156d, NtUserSetMessageExtraInfo, 0 ) \
     SYSCALL_ENTRY( 0x156e, NtUserSetMirrorRendering, 0 ) \
     SYSCALL_ENTRY( 0x156f, NtUserSetModernAppWindow, 0 ) \
     SYSCALL_ENTRY( 0x1570, NtUserSetMonitorWorkArea, 0 ) \
@@ -2983,7 +2983,7 @@
     SYSCALL_ENTRY( 0x159d, NtUserSetWindowCompositionTransition, 0 ) \
     SYSCALL_ENTRY( 0x159e, NtUserSetWindowContextHelpId, 16 ) \
     SYSCALL_ENTRY( 0x159f, NtUserSetWindowDisplayAffinity, 0 ) \
-    SYSCALL_ENTRY( 0x15a0, NtUserSetWindowFNID, 16 ) \
+    SYSCALL_ENTRY( 0x15a0, NtUserSetWindowFNID, 0 ) \
     SYSCALL_ENTRY( 0x15a1, NtUserSetWindowFeedbackSetting, 0 ) \
     SYSCALL_ENTRY( 0x15a2, NtUserSetWindowGroup, 0 ) \
     SYSCALL_ENTRY( 0x15a3, NtUserSetWindowLong, 32 ) \
@@ -3820,6 +3820,7 @@
     SYSCALL_STUB( NtUserGetKeyboardType ) \
     SYSCALL_STUB( NtUserGetListBoxInfo ) \
     SYSCALL_STUB( NtUserGetMenuIndex ) \
+    SYSCALL_STUB( NtUserGetMessagePos ) \
     SYSCALL_STUB( NtUserGetMinuserIdForBaseWindow ) \
     SYSCALL_STUB( NtUserGetModernAppWindow ) \
     SYSCALL_STUB( NtUserGetOemBitmapSize ) \
@@ -3851,7 +3852,6 @@
     SYSCALL_STUB( NtUserGetSysMenuOffset ) \
     SYSCALL_STUB( NtUserGetSystemContentRects ) \
     SYSCALL_STUB( NtUserGetTopLevelWindow ) \
-    SYSCALL_STUB( NtUserGetTouchInputInfo ) \
     SYSCALL_STUB( NtUserGetTouchValidationStatus ) \
     SYSCALL_STUB( NtUserGetUniformSpaceMapping ) \
     SYSCALL_STUB( NtUserGetUnpredictedMessagePos ) \
@@ -3901,7 +3901,6 @@
     SYSCALL_STUB( NtUserIsQueueAttached ) \
     SYSCALL_STUB( NtUserIsResizeLayoutSynchronizationEnabled ) \
     SYSCALL_STUB( NtUserIsTopLevelWindow ) \
-    SYSCALL_STUB( NtUserIsTouchWindow ) \
     SYSCALL_STUB( NtUserIsWindowBroadcastingDpiToChildren ) \
     SYSCALL_STUB( NtUserIsWindowDisplayChangeSuppressed ) \
     SYSCALL_STUB( NtUserIsWindowGDIScaledDpiMessageEnabled ) \
@@ -4050,6 +4049,7 @@
     SYSCALL_STUB( NtUserSetMagnificationDesktopMagnifierOffsetsDWMUpdated ) \
     SYSCALL_STUB( NtUserSetManipulationInputTarget ) \
     SYSCALL_STUB( NtUserSetMenuFlagRtoL ) \
+    SYSCALL_STUB( NtUserSetMessageExtraInfo ) \
     SYSCALL_STUB( NtUserSetMirrorRendering ) \
     SYSCALL_STUB( NtUserSetModernAppWindow ) \
     SYSCALL_STUB( NtUserSetMonitorWorkArea ) \
@@ -4083,6 +4083,7 @@
     SYSCALL_STUB( NtUserSetWindowCompositionAttribute ) \
     SYSCALL_STUB( NtUserSetWindowCompositionTransition ) \
     SYSCALL_STUB( NtUserSetWindowDisplayAffinity ) \
+    SYSCALL_STUB( NtUserSetWindowFNID ) \
     SYSCALL_STUB( NtUserSetWindowFeedbackSetting ) \
     SYSCALL_STUB( NtUserSetWindowGroup ) \
     SYSCALL_STUB( NtUserSetWindowMessageCapability ) \

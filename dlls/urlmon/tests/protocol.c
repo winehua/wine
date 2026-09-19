@@ -125,6 +125,7 @@ DEFINE_EXPECT(MimeFilter_LockRequest);
 DEFINE_EXPECT(MimeFilter_UnlockRequest);
 DEFINE_EXPECT(MimeFilter_Read);
 DEFINE_EXPECT(MimeFilter_Switch);
+DEFINE_EXPECT(MimeFilter_Continue);
 DEFINE_EXPECT(Stream_Seek);
 DEFINE_EXPECT(Stream_Read);
 DEFINE_EXPECT(Redirect);
@@ -2417,7 +2418,7 @@ static HRESULT WINAPI MimeProtocol_Start(IInternetProtocolEx *iface, LPCWSTR szU
 static HRESULT WINAPI Protocol_Continue(IInternetProtocolEx *iface,
         PROTOCOLDATA *pProtocolData)
 {
-    ok(0, "unexpected call\n");
+    CHECK_EXPECT(MimeFilter_Continue);
     return E_NOTIMPL;
 }
 

@@ -30,6 +30,8 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 
+#define WINE_MOUSE_HANDLE       ((HANDLE)1)
+#define WINE_KEYBOARD_HANDLE    ((HANDLE)2)
 
 #define DRAG_FILE  0x454c4946
 
@@ -256,6 +258,22 @@ BOOL adjust_window_rect( RECT *rect, DWORD style, BOOL menu, DWORD ex_style, UIN
     NONCLIENTMETRICSW ncm = {.cbSize = sizeof(ncm)};
     int adjust = 0;
 
+    if (user_driver->pHasWindowManager( "steamcompmgr" ))
+    {
+        /* Disable gamescope undecorated windows hack for following games. They don't expect client
+         * rect equals to window rect when in windowed mode. */
+        const char *sgi = getenv( "SteamGameId" );
+        if (
+             !((style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW)) /* Bug 20038: game splash screens */
+             && !(sgi && !strcmp( sgi, "2563800" )) /* Bug 23342: The Last Game */
+             && !(sgi && !strcmp( sgi, "1240440" )) /* Bug 23802: Halo Infinite */
+             && !(sgi && !strcmp( sgi, "613830" ))  /* Bug 25747: CHRONO TRIGGER */
+             && !(sgi && !strcmp( sgi, "3077660" )) /* Bug 26235: Mystery Manor: Hidden Objects */
+             && !(sgi && !strcmp( sgi, "3721960" )) /* Bug 26767: Rei and the Floating City */
+            )
+            return TRUE;
+    }
+
     NtUserSystemParametersInfoForDpi( SPI_GETNONCLIENTMETRICS, 0, &ncm, 0, dpi );
 
     if ((ex_style & (WS_EX_STATICEDGE|WS_EX_DLGMODALFRAME)) == WS_EX_STATICEDGE)
@@ -303,7 +321,7 @@ static BOOL set_window_text( HWND hwnd, const void *text, BOOL ansi )
     }
     else str = NULL;
 
-    TRACE( "%p, %s\n", hwnd, debugstr_w(str) );
+    TRACE( "%s\n", debugstr_w(str) );
 
     if (!(win = get_win_ptr( hwnd )))
     {
@@ -489,8 +507,16 @@ static LONG handle_window_pos_changing( HWND hwnd, WINDOWPOS *winpos )
     if ((style & WS_THICKFRAME) || ((style & (WS_POPUP | WS_CHILD)) == 0))
     {
         MINMAXINFO info = get_min_max_info( hwnd );
-        winpos->cx = min( winpos->cx, info.ptMaxTrackSize.x );
-        winpos->cy = min( winpos->cy, info.ptMaxTrackSize.y );
+
+        /* HACK: This code changes the window's size to fit the display. However,
+         * some games (Bayonetta, Dragon's Dogma) will then have the incorrect
+         * render size. So just let windows be too big to fit the display. */
+        if (disable_gamescope_max_size_hack() || !user_driver->pHasWindowManager( "steamcompmgr" ))
+        {
+            winpos->cx = min( winpos->cx, info.ptMaxTrackSize.x );
+            winpos->cy = min( winpos->cy, info.ptMaxTrackSize.y );
+        }
+
         if (!(style & WS_MINIMIZE))
         {
             winpos->cx = max( winpos->cx, info.ptMinTrackSize.x );
@@ -674,7 +700,7 @@ static BOOL on_bottom_border( int hit )
  */
 static void sys_command_size_move( HWND hwnd, WPARAM wparam )
 {
-    DWORD msg_pos = NtUserGetMessagePos();
+    DWORD msg_pos = NtUserGetThreadInfo()->message_pos;
     BOOL thickframe, drag_full_windows = TRUE, moved = FALSE;
     RECT sizing_rect, mouse_rect, orig_rect;
     UINT hittest = wparam & 0x0f;
@@ -800,7 +826,7 @@ static void sys_command_size_move( HWND hwnd, WPARAM wparam )
              * WM_LBUTTONUP. Detect that and terminate the loop as if we'd gotten it. */
             if (!(NtUserGetKeyState( VK_LBUTTON ) & 0x8000))
             {
-                DWORD last_pos = NtUserGetMessagePos();
+                DWORD last_pos = NtUserGetThreadInfo()->message_pos;
                 pt.x = ((int)(short)LOWORD( last_pos ));
                 pt.y = ((int)(short)HIWORD( last_pos ));
                 break;
@@ -959,7 +985,6 @@ static void track_nc_scroll_bar( HWND hwnd, WPARAM wparam, POINT pt )
 
 static LRESULT handle_sys_command( HWND hwnd, WPARAM wparam, LPARAM lparam )
 {
-    DWORD msgpos;
     POINT pos;
     RECT rect;
 
@@ -970,9 +995,8 @@ static LRESULT handle_sys_command( HWND hwnd, WPARAM wparam, LPARAM lparam )
     if (call_hooks( WH_CBT, HCBT_SYSCOMMAND, wparam, lparam, 0 ))
         return 0;
 
-    msgpos = NtUserGetMessagePos();
-    pos.x = (short)LOWORD( msgpos );
-    pos.y = (short)HIWORD( msgpos );
+    pos.x = (short)LOWORD( NtUserGetThreadInfo()->message_pos );
+    pos.y = (short)HIWORD( NtUserGetThreadInfo()->message_pos );
     NtUserLogicalToPerMonitorDPIPhysicalPoint( hwnd, &pos );
     SetRect( &rect, pos.x, pos.y, pos.x, pos.y );
     rect = map_rect_virt_to_raw( rect, 0 );
@@ -1869,6 +1893,21 @@ static void handle_nc_calc_size( HWND hwnd, WPARAM wparam, RECT *win_rect )
 
     if (!win_rect) return;
 
+    if (user_driver->pHasWindowManager( "steamcompmgr" ))
+    {
+        /* Disable gamescope undecorated windows hack for following games. They don't expect client
+         * rect equals to window rect when in windowed mode. */
+        const char *sgi = getenv( "SteamGameId" );
+        if (!((style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW))  /* Bug 20038: game splash screens */
+            && !(sgi && !strcmp( sgi, "2563800" ))                  /* Bug 23342: The Last Game */
+            && !(sgi && !strcmp( sgi, "1240440" ))                  /* Bug 23802: Halo Infinite */
+            && !(sgi && !strcmp( sgi, "2883280" ))                  /* Bug 24151: Dog Brew */
+            && !(sgi && !strcmp( sgi, "613830" ))                   /* Bug 25747: CHRONO TRIGGER */
+            && !(sgi && !strcmp( sgi, "3721960" ))                  /* Bug 26767: Rei and the Floating City */
+           )
+            return;
+    }
+
     if (!(style & WS_MINIMIZE))
     {
         adjust_window_rect( &rect, style, FALSE, ex_style & ~WS_EX_CLIENTEDGE, get_system_dpi() );
@@ -2398,6 +2437,14 @@ static LRESULT handle_nc_mouse_leave( HWND hwnd )
     return 0;
 }
 
+static struct touchinput_thread_data *touch_input_thread_data(void)
+{
+    struct user_thread_info *thread_info = get_user_thread_info();
+    struct touchinput_thread_data *data = thread_info->touchinput;
+
+    if (!data) data = thread_info->touchinput = calloc( 1, sizeof(struct touchinput_thread_data) );
+    return data;
+}
 
 LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, BOOL ansi )
 {
@@ -2987,6 +3034,70 @@ LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, 
                                             0, NtUserSendMessage, ansi );
         }
         break;
+
+    case WM_POINTERDOWN:
+    case WM_POINTERUP:
+    case WM_POINTERUPDATE:
+    {
+        TOUCHINPUT *touches, *end, *touch, *match = NULL;
+        struct touchinput_thread_data *thread_data;
+        UINT i;
+
+        update_mouse_state_from_pointer( hwnd, msg, GET_POINTERID_WPARAM( wparam ) );
+
+        if (!NtUserIsTouchWindow( hwnd, NULL )) return 0;
+        if (!(thread_data = touch_input_thread_data())) return 0;
+
+        touches = thread_data->current;
+        end = touches + ARRAY_SIZE(thread_data->current);
+        for (touch = touches; touch < end && touch->dwID; touch++)
+        {
+            if (touch->dwID == GET_POINTERID_WPARAM( wparam )) match = touch;
+            touch->dwFlags &= ~TOUCHEVENTF_DOWN;
+            touch->dwFlags |= TOUCHEVENTF_MOVE;
+        }
+        if (match) touch = match;
+
+        if (touch == end || (msg != WM_POINTERDOWN && !touch->dwID))
+        {
+            if (msg != WM_POINTERDOWN) FIXME("Touch point not found!\n");
+            else FIXME("Unsupported number of touch points!\n");
+            break;
+        }
+
+        while (end > (touch + 1) && !(end - 1)->dwID) end--;
+
+        touch->x = LOWORD( lparam ) * 100;
+        touch->y = HIWORD( lparam ) * 100;
+        touch->hSource = WINE_MOUSE_HANDLE;
+        touch->dwID = GET_POINTERID_WPARAM( wparam );
+        touch->dwFlags = 0;
+        if (msg == WM_POINTERUP) touch->dwFlags |= TOUCHEVENTF_UP;
+        if (msg == WM_POINTERDOWN) touch->dwFlags |= TOUCHEVENTF_INRANGE | TOUCHEVENTF_DOWN;
+        if (msg == WM_POINTERUPDATE) touch->dwFlags |= TOUCHEVENTF_INRANGE | TOUCHEVENTF_MOVE;
+        if (IS_POINTER_PRIMARY_WPARAM( wparam )) touch->dwFlags |= TOUCHEVENTF_PRIMARY;
+        touch->dwMask = 0;
+        touch->dwTime = NtGetTickCount();
+        touch->dwExtraInfo = 0;
+        touch->cxContact = 0;
+        touch->cyContact = 0;
+
+        i = thread_data->index++ % ARRAY_SIZE(thread_data->history);
+        memcpy( thread_data->history + i, thread_data->current, sizeof(thread_data->current) );
+
+        send_message( hwnd, WM_TOUCH, MAKELONG(end - touches, 0), (LPARAM)i );
+
+        if (msg == WM_POINTERUP)
+        {
+            while (++touch < end) *(touch - 1) = *touch;
+            memset( touch - 1, 0, sizeof(*touch) );
+        }
+        break;
+    }
+
+    case WM_TOUCH:
+        /* FIXME: CloseTouchInputHandle( (HTOUCHINPUT)lparam ); */
+        return 0;
     }
 
     return result;

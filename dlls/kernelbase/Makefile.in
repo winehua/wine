@@ -25,4 +25,5 @@ SOURCES = \
 	thread.c \
 	version.c \
 	volume.c \
+	winehua_ipc_trace.c \
 	winerror.mc

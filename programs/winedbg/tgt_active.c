@@ -22,6 +22,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <time.h>
+#include <sys/stat.h>
 
 #include "debugger.h"
 #include "psapi.h"
@@ -63,8 +65,12 @@ static unsigned dbg_handle_debug_event(DEBUG_EVENT* de);
  *		dbg_attach_debuggee
  *
  * Sets the debuggee to <pid>
+ * cofe instructs winedbg what to do when first exception is received 
+ * (break=FALSE, continue=TRUE)
+ * wfe is set to TRUE if dbg_attach_debuggee should also proceed with all debug events
+ * until the first exception is received (aka: attach to an already running process)
  */
-BOOL dbg_attach_debuggee(DWORD pid, BOOL verbose)
+BOOL dbg_attach_debuggee(DWORD pid)
 {
     if (pid == GetCurrentProcessId())
     {
@@ -88,8 +94,7 @@ BOOL dbg_attach_debuggee(DWORD pid, BOOL verbose)
     SetEnvironmentVariableA("DBGHELP_NOLIVE", NULL);
 
     dbg_curr_process->active_debuggee = TRUE;
-    if (verbose)
-        dbg_printf("WineDbg attached to pid %04lx\n", pid);
+    dbg_printf("WineDbg attached to pid %04lx\n", pid);
     dbg_curr_pid = pid;
     dbg_curr_thread = NULL;
     dbg_curr_tid = 0;
@@ -824,6 +829,48 @@ static HANDLE create_temp_file(void)
                         NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, 0 );
 }
 
+static HANDLE create_crash_report_file(void)
+{
+    const char *dir = getenv("WINE_CRASH_REPORT_DIR");
+    const char *sgi;
+    char timestr[32];
+    char name[MAX_PATH], *c;
+    time_t t;
+    struct tm lt;
+
+    if(!dir || dir[0] == 0)
+        return INVALID_HANDLE_VALUE;
+
+    strcpy(name, dir);
+
+    for(c = name + 1; *c; ++c){
+        if(*c == '/'){
+            *c = 0;
+            CreateDirectoryA(name, NULL);
+            *c = '/';
+        }
+    }
+    CreateDirectoryA(name, NULL);
+
+    sgi = getenv("SteamGameId");
+
+    t = time(NULL);
+    lt = *localtime(&t);
+    strftime(timestr, ARRAY_SIZE(timestr), "%Y-%m-%d_%H:%M:%S", &lt);
+
+    /* /path/to/crash/reports/2021-05-18_13:21:15_appid-976310_crash.log */
+    snprintf(name, ARRAY_SIZE(name),
+            "%s%s/%s_appid-%s_crash.log",
+            dir[0] == '/' ? "Z:/" : "",
+            dir,
+            timestr,
+            sgi ? sgi : "0"
+            );
+
+    return CreateFileA( name, GENERIC_WRITE, FILE_SHARE_READ,
+                        NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0 );
+}
+
 /******************************************************************
  *		dbg_active_attach
  *
@@ -837,14 +884,14 @@ enum dbg_start  dbg_active_attach(int argc, char* argv[])
     /* try the form <myself> pid */
     if (argc == 1 && str2int(argv[0], &pid) && pid != 0)
     {
-        if (!dbg_attach_debuggee(pid, TRUE))
+        if (!dbg_attach_debuggee(pid))
             return start_error_init;
     }
     /* try the form <myself> pid evt (Win32 JIT debugger) */
     else if (argc == 2 && str2int(argv[0], &pid) && pid != 0 &&
              str2int(argv[1], &evt) && evt != 0)
     {
-        if (!dbg_attach_debuggee(pid, TRUE))
+        if (!dbg_attach_debuggee(pid))
         {
             /* don't care about result */
             SetEvent((HANDLE)evt);
@@ -913,6 +960,10 @@ enum dbg_start dbg_active_auto(int argc, char* argv[])
         event = CreateEventW( NULL, TRUE, FALSE, NULL );
         if (event) thread = display_crash_details( event );
         if (thread) dbg_houtput = output = create_temp_file();
+        break;
+    case TRUE:
+        dbg_use_wine_dbg_output = TRUE;
+        dbg_crash_report_file = create_crash_report_file();
         break;
     }
 
@@ -1089,46 +1140,10 @@ static BOOL tgt_process_active_get_selector(HANDLE hThread, DWORD sel, LDT_ENTRY
 #endif
 }
 
-BOOL dbg_fetch_active_thread_name(DWORD tid, WCHAR **description)
-{
-    static HRESULT (WINAPI *my_GetThreadDescription)(HANDLE, PWSTR*) = NULL;
-    static BOOL resolved = FALSE;
-    HANDLE h;
-    WCHAR *result = NULL;
-
-    if (!resolved)
-    {
-        HMODULE kernelbase = GetModuleHandleA("kernelbase.dll");
-        if (kernelbase)
-            my_GetThreadDescription = (void *)GetProcAddress(kernelbase, "GetThreadDescription");
-        resolved = TRUE;
-    }
-
-    if (my_GetThreadDescription && (h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid)))
-    {
-        WCHAR *descr;
-        if (my_GetThreadDescription(h, &descr) == S_OK)
-        {
-            if (*descr) result = wcsdup(descr);
-            LocalFree(descr);
-        }
-        CloseHandle(h);
-    }
-    if (!result) return FALSE;
-    *description = result;
-    return TRUE;
-}
-
-static BOOL tgt_process_active_fetch_thread_name(const struct dbg_thread *thread, WCHAR **description)
-{
-    return dbg_fetch_active_thread_name(thread->tid, description);
-}
-
 static struct be_process_io be_process_active_io =
 {
     tgt_process_active_close_process,
     tgt_process_active_read,
     tgt_process_active_write,
-    tgt_process_active_get_selector,
-    tgt_process_active_fetch_thread_name,
+    tgt_process_active_get_selector
 };

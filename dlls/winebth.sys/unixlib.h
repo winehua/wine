@@ -69,25 +69,9 @@ struct bluetooth_gatt_service_free_params
     unix_name_t service;
 };
 
-struct bluetooth_gatt_characteristic_dup_params
-{
-    unix_name_t characteristic;
-};
-
 struct bluetooth_gatt_characteristic_free_params
 {
     unix_name_t characteristic;
-};
-
-struct bluetooth_gatt_characteristic_value_move_params
-{
-    struct winebluetooth_gatt_characteristic_value *val;
-    BYTE *buf;
-};
-
-struct bluetooth_gatt_characteristic_value_free_params
-{
-    UINT_PTR handle;
 };
 
 struct bluetooth_device_disconnect_params
@@ -142,12 +126,6 @@ struct bluetooth_device_start_pairing_params
     IRP *irp;
 };
 
-struct bluetooth_gatt_characteristic_read_params
-{
-    unix_name_t chrc;
-    IRP *irp;
-};
-
 struct bluetooth_get_event_params
 {
     struct winebluetooth_event result;
@@ -177,10 +155,6 @@ enum bluetoothapis_funcs
     unix_bluetooth_gatt_service_free,
 
     unix_bluetooth_gatt_characteristic_free,
-    unix_bluetooth_gatt_characteristic_read,
-
-    unix_bluetooth_gatt_characteristic_value_move,
-    unix_bluetooth_gatt_characteristic_value_free,
 
     unix_bluetooth_get_event,
 

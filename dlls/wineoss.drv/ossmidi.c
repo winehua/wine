@@ -43,6 +43,7 @@
 #include <pthread.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "winternl.h"
 #include "audioclient.h"
 #include "mmddk.h"

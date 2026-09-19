@@ -24,6 +24,7 @@
 #include <stdio.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winerror.h"
@@ -553,11 +554,11 @@ UINT CDECL __wine_msi_call_dll_function(DWORD client_pid, const GUID *guid)
         {
             r = custom_proc_wrapper( fn, hPackage );
         }
-        __EXCEPT_ALL
+        __EXCEPT_PAGE_FAULT
         {
-            ERR( "Custom action (%s:%s) caused an exception: %#lx\n",
+            ERR( "Custom action (%s:%s) caused a page fault: %#lx\n",
                  debugstr_w(dll), debugstr_a(proc), GetExceptionCode() );
-            r = ERROR_INSTALL_FAILURE;
+            r = ERROR_SUCCESS;
         }
         __ENDTRY;
     }

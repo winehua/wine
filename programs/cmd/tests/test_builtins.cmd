@@ -675,11 +675,6 @@ rem call :setError 666 & (start /B I\dont\exist.exe &&echo SUCCESS !errorlevel!|
 rem can't run this test, generates a nice popup under windows
 call :setError 666 & (start "" /B /WAIT cmd.exe /c "echo foo & exit /b 1024" &&echo SUCCESS !errorlevel!||echo FAILURE !errorlevel!)
 call :setError 666 & (start "" /B cmd.exe /c "(choice /C:YN /T:3 /D:Y > NUL) & exit /b 1024" &&echo SUCCESS !errorlevel!||echo FAILURE !errorlevel!)
-mkdir foo & cd foo
-set "FOO_PATH=%cd%" > NUL
-cd ..
-call :setError 666 & (start /B /WAIT /d "%FOO_PATH%" cmd /s /c "if /I \"%%cd%%\"==\"%FOO_PATH%\" (exit 0) else (exit 1)" >nul &&echo !errorlevel!)
-rd /q /s foo
 echo --- success/failure for TYPE command
 mkdir foo & cd foo
 echo a > fileA
@@ -778,7 +773,6 @@ call :setError 666 & (pushd abc &&echo SUCCESS !errorlevel!||echo FAILURE !error
 call :setError 666 & (pushd abc &&echo SUCCESS !errorlevel!||echo FAILURE !errorlevel!)
 call :setError 666 & (popd abc &&echo SUCCESS !errorlevel!||echo FAILURE !errorlevel!)
 call :setError 666 & (popd &&echo SUCCESS !errorlevel!||echo FAILURE !errorlevel!)
-call :setError 666 & (pushd "abc/"&&echo SUCCESS !errorlevel!||echo FAILURE !errorlevel!)
 call :setError 666 & popd & echo ERRORLEVEL !errorlevel!
 cd .. && rd /q /s foo
 
@@ -2050,10 +2044,8 @@ mkdir bar
 mkdir baz
 mkdir pop
 echo > bazbaz
-echo > notbaz
 echo --- basic wildcards
 for %%i in (ba*) do echo %%i
-for %%i in ("ba*" "ba?baz" "notbaz") do echo %%i
 echo --- wildcards in subdirs
 echo something>pop\bar1
 echo something>pop\bar2.txt

@@ -304,7 +304,7 @@ static DWORD create_netconn_socket(server_t *server, object_header_t *hdr, DWORD
     return ERROR_SUCCESS;
 }
 
-DWORD create_netconn(server_t *server, object_header_t *hdr, DWORD security_flags,
+DWORD create_netconn(server_t *server, object_header_t *hdr, DWORD_PTR callback_context, DWORD security_flags,
                      BOOL mask_errors, DWORD timeout, netconn_t **ret)
 {
     netconn_t *netconn;
@@ -320,7 +320,7 @@ DWORD create_netconn(server_t *server, object_header_t *hdr, DWORD security_flag
     list_init(&netconn->pool_entry);
     SecInvalidateHandle(&netconn->ssl_ctx);
 
-    result = create_netconn_socket(server, hdr, hdr->dwContext, netconn, timeout);
+    result = create_netconn_socket(server, hdr, callback_context, netconn, timeout);
     if (result != ERROR_SUCCESS) {
         free(netconn);
         return result;

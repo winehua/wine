@@ -26,6 +26,7 @@
 #include "windef.h"
 #include "winbase.h"
 #include "winternl.h"
+#define WIN32_NO_STATUS
 #include "ddk/wdm.h"
 #include "excpt.h"
 #include "wine/debug.h"

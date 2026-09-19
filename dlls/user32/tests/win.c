@@ -2486,11 +2486,6 @@ static LRESULT WINAPI mdi_child_wnd_proc_2(HWND hwnd, UINT msg, WPARAM wparam, L
     return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
-static LRESULT WINAPI mdi_child_wnd_proc_3(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
-{
-    return DefMDIChildProcA(hwnd, msg, wparam, lparam);
-}
-
 static LRESULT WINAPI mdi_main_wnd_procA(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     static HWND mdi_client;
@@ -2579,10 +2574,6 @@ static BOOL mdi_RegisterWindowClasses(void)
 
     cls.lpfnWndProc = mdi_child_wnd_proc_2;
     cls.lpszClassName = "MDI_child_Class_2";
-    if(!RegisterClassA(&cls)) return FALSE;
-
-    cls.lpfnWndProc = mdi_child_wnd_proc_3;
-    cls.lpszClassName = "MDI_child_Class_3";
     if(!RegisterClassA(&cls)) return FALSE;
 
     return TRUE;
@@ -8248,40 +8239,33 @@ static void test_ShowWindow_child(HWND hwndMain)
     DestroyWindow(hwnd);
 }
 
-static void test_ShowWindow_mdichild(void)
+static void test_ShowWindow_mdichild(HWND hwndMain)
 {
     RECT rect, orig, expect, nc;
     LPARAM ret;
-    HWND mdi_hwndMain, mdiclient, hwnd, hwnd2, hwnd3;
+    HWND mdiclient, hwnd, hwnd2;
     LONG style;
     POINT pt = {0};
     CLIENTCREATESTRUCT mdi_client_cs = {0,1};
 
-    mdi_hwndMain = CreateWindowExA(0, "MDI_parent_Class", "MDI parent window",
-                                   WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
-                                   100, 100, CW_USEDEFAULT, CW_USEDEFAULT,
-                                   GetDesktopWindow(), 0,
-                                   GetModuleHandleA(NULL), NULL);
-    ok(!!mdi_hwndMain, "failed to create window, error %lu\n", GetLastError());
-
     SetRect(&orig, 20, 20, 210, 110);
     GetClientRect(hwndMain, &rect);
-    mdiclient = CreateWindowA("mdiclient", "MDI client", WS_CHILD | WS_VISIBLE,
+    mdiclient = CreateWindowA("mdiclient", "MDI client", WS_CHILD,
                               rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
-                              mdi_hwndMain, 0, 0, &mdi_client_cs);
+                              hwndMain, 0, 0, &mdi_client_cs);
     ok(!!mdiclient, "failed to create window, error %lu\n", GetLastError());
-    hwnd = CreateWindowExA(WS_EX_MDICHILD, "MDI_child_Class_3", "MDI child",
+    hwnd = CreateWindowExA(WS_EX_MDICHILD, "MainWindowClass", "MDI child",
                            WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
                            orig.left, orig.top, orig.right - orig.left,
                            orig.bottom - orig.top, mdiclient, 0, 0, NULL);
     ok(!!hwnd, "failed to create window, error %lu\n", GetLastError());
-    hwnd2 = CreateWindowExA(WS_EX_MDICHILD, "MDI_child_Class_3", "MDI child 2",
+    hwnd2 = CreateWindowExA(WS_EX_MDICHILD, "MainWindowClass", "MDI child 2",
                             WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
                             orig.left, orig.top, orig.right - orig.left,
                             orig.bottom - orig.top, mdiclient, 0, 0, NULL);
     ok(!!hwnd2, "failed to create window, error %lu\n", GetLastError());
 
-    ClientToScreen(mdi_hwndMain, &pt);
+    ClientToScreen(hwndMain, &pt);
     OffsetRect(&orig, pt.x, pt.y);
 
     style = GetWindowLongA(hwnd, GWL_STYLE);
@@ -8301,7 +8285,7 @@ static void test_ShowWindow_mdichild(void)
     ok(style & WS_MINIMIZE, "window should be minimized\n");
     ok(!(style & WS_MAXIMIZE), "window should not be maximized\n");
     GetWindowRect(hwnd, &rect);
-    GetClientRect(mdiclient, &expect);
+    GetClientRect(hwndMain, &expect);
     SetRect(&expect, 0, expect.bottom - GetSystemMetrics(SM_CYMINIMIZED),
             GetSystemMetrics(SM_CXMINIMIZED), expect.bottom);
     OffsetRect(&expect, pt.x, pt.y);
@@ -8352,10 +8336,10 @@ static void test_ShowWindow_mdichild(void)
     ok(!(style & WS_DISABLED), "window should not be disabled\n");
     ok(style & WS_VISIBLE, "window should be visible\n");
     ok(!(style & WS_MINIMIZE), "window should be minimized\n");
-    ok(style & WS_MAXIMIZE, "window should be maximized\n");
+    ok(style & WS_MAXIMIZE, "window should not be maximized\n");
     GetWindowRect(hwnd, &rect);
-    GetClientRect(mdiclient, &expect);
-    AdjustWindowRectEx(&expect, GetWindowLongA(hwnd, GWL_STYLE),
+    GetClientRect(hwndMain, &expect);
+    AdjustWindowRectEx(&expect, GetWindowLongA(hwnd, GWL_STYLE) & ~WS_BORDER,
                        0, GetWindowLongA(hwnd, GWL_EXSTYLE));
     OffsetRect(&expect, pt.x, pt.y);
     ok(EqualRect(&expect, &rect), "expected %s, got %s\n",
@@ -8380,40 +8364,9 @@ static void test_ShowWindow_mdichild(void)
     ok(EqualRect(&orig, &rect), "expected %s, got %s\n",
        wine_dbgstr_rect(&orig), wine_dbgstr_rect(&rect));
 
-    /* test switching from a maximized MDI child to a child without WS_MAXIMIZEBOX */
-    ret = ShowWindow(hwnd2, SW_MAXIMIZE);
-    ok(ret, "wrong ret %Iu\n", ret);
-    style = GetWindowLongA(hwnd2, GWL_STYLE);
-    ok(!(style & WS_DISABLED), "window should not be disabled\n");
-    ok(style & WS_VISIBLE, "window should be visible\n");
-    ok(!(style & WS_MINIMIZE), "window should be minimized\n");
-    ok(style & WS_MAXIMIZE, "window should be maximized\n");
-
-    hwnd3 = (HWND)SendMessageA(mdiclient, WM_MDIGETACTIVE, 0, 0);
-    ok(hwnd3 == hwnd2, "wrong active child %p\n", hwnd3);
-
-    style = GetWindowLongA(hwnd, GWL_STYLE);
-    SetWindowLongA(hwnd, GWL_STYLE, style & ~WS_MAXIMIZEBOX);
-
-    GetWindowRect(hwndMain, &rect);
-    trace("hwndMain window rect %s\n", wine_dbgstr_rect(&rect));
-    GetWindowRect(mdiclient, &rect);
-    trace("mdiclient window rect %s\n", wine_dbgstr_rect(&rect));
-
-    SendMessageA(mdiclient, WM_MDIACTIVATE, (WPARAM)hwnd, 0);
-    hwnd3 = (HWND)SendMessageA(mdiclient, WM_MDIGETACTIVE, 0, 0);
-    ok(hwnd3 == hwnd, "wrong active child %p\n", hwnd3);
-
-    style = GetWindowLongA(hwnd, GWL_STYLE);
-    ok(!(style & WS_DISABLED), "window should not be disabled\n");
-    ok(style & WS_VISIBLE, "window should be visible\n");
-    ok(!(style & WS_MINIMIZE), "window should not be minimized\n");
-    ok(!(style & WS_MAXIMIZE), "window should not be maximized\n");
-
     DestroyWindow(hwnd2);
     DestroyWindow(hwnd);
     DestroyWindow(mdiclient);
-    DestroyWindow(mdi_hwndMain);
 }
 
 static DWORD CALLBACK enablewindow_thread(LPVOID arg)
@@ -9297,12 +9250,6 @@ static void test_layered_window(void)
     HBITMAP hbm;
     BOOL ret;
     MSG msg;
-    HDC hdc_from_hwnd;
-    BLENDFUNCTION bf;
-    bf.AlphaFormat = 0;
-    bf.BlendFlags = 0;
-    bf.BlendOp = 0;
-    bf.SourceConstantAlpha = 180;
 
     if (!pGetLayeredWindowAttributes || !pSetLayeredWindowAttributes || !pUpdateLayeredWindow)
     {
@@ -9326,17 +9273,9 @@ static void test_layered_window(void)
     ret = pSetLayeredWindowAttributes( hwnd, 0, 0, LWA_ALPHA );
     ok( !ret, "SetLayeredWindowAttributes should fail on non-layered window\n" );
     SetWindowLongA( hwnd, GWL_EXSTYLE, GetWindowLongA(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED );
-    hdc_from_hwnd = GetDC( hwnd );
-    ret = pUpdateLayeredWindow( hwnd, 0, NULL, &sz, hdc_from_hwnd, &pt, 0, &bf, ULW_ALPHA );
-    ReleaseDC ( hwnd, hdc_from_hwnd );
-    ok( ret, "UpdateLayeredWindow should succeed on layered window\n" );
     ret = pGetLayeredWindowAttributes( hwnd, &key, &alpha, &flags );
     ok( !ret, "GetLayeredWindowAttributes should fail on layered but not initialized window\n" );
     ret = pUpdateLayeredWindow( hwnd, 0, NULL, &sz, hdc, &pt, 0, NULL, ULW_OPAQUE );
-    ok( ret, "UpdateLayeredWindow should succeed on layered window\n" );
-    hdc_from_hwnd = GetDC( hwnd );
-    ret = pUpdateLayeredWindow( hwnd, 0, NULL, &sz, hdc_from_hwnd, &pt, 0, &bf, ULW_ALPHA );
-    ReleaseDC ( hwnd, hdc_from_hwnd );
     ok( ret, "UpdateLayeredWindow should succeed on layered window\n" );
     ret = pGetLayeredWindowAttributes( hwnd, &key, &alpha, &flags );
     ok( !ret, "GetLayeredWindowAttributes should fail on layered but not initialized window\n" );
@@ -9472,10 +9411,6 @@ static void test_layered_window(void)
     SetWindowLongA( hwnd, GWL_EXSTYLE, GetWindowLongA(hwnd, GWL_EXSTYLE) & ~WS_EX_LAYERED );
     SetWindowLongA( hwnd, GWL_EXSTYLE, GetWindowLongA(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED );
     ret = pUpdateLayeredWindow( hwnd, 0, NULL, &sz, hdc, &pt, 0, NULL, ULW_OPAQUE );
-    ok( ret, "UpdateLayeredWindow should succeed on layered window\n" );
-    hdc_from_hwnd = GetDC( hwnd );
-    ret = pUpdateLayeredWindow( hwnd, 0, NULL, &sz, hdc_from_hwnd, &pt, 0, &bf, ULW_ALPHA );
-    ReleaseDC ( hwnd, hdc_from_hwnd );
     ok( ret, "UpdateLayeredWindow should succeed on layered window\n" );
 
     ret = pSetLayeredWindowAttributes( hwnd, 0, 255, LWA_ALPHA );
@@ -11002,6 +10937,8 @@ static void test_update_region(void)
     const RECT rc = {15, 15, 40, 40};
     const POINT wnd_orig = {30, 20};
     const POINT child_orig = {10, 5};
+    RECT r, expect_rect;
+    BOOL bret;
 
     parent = CreateWindowExA(0, "MainWindowClass", NULL,
                 WS_VISIBLE | WS_CLIPCHILDREN,
@@ -11059,7 +10996,130 @@ static void test_update_region(void)
 
     DeleteObject(rgn1);
     DeleteObject(rgn2);
+
+    pump_messages();
+    /* Test that NULL invalidated region means current full client rect and not the one at the moment of
+     * invalidation. */
+    ValidateRect(parent, NULL);
+    GetUpdateRect(parent, &r, FALSE);
+    SetRect(&expect_rect, 0, 0, 0, 0);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    InvalidateRect(parent, NULL, FALSE);
+    SetRect(&r, 0, 0, 10, 10);
+    /* Adding a rectangle to NULL one still keeps that as full window. */
+    InvalidateRect(parent, &r, FALSE);
+    GetUpdateRect(parent, &r, FALSE);
+    GetClientRect(parent, &expect_rect);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    SetWindowPos(parent, NULL, 0, 0, 350, 200, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE);
+    GetUpdateRect(parent, &r, FALSE);
+    GetClientRect(parent, &expect_rect);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    ValidateRect(parent, NULL);
+
+    SetWindowPos(parent, NULL, 0, 0, 300, 150, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE);
+    GetUpdateRect(parent, &r, FALSE);
+    SetRect(&expect_rect, 0, 0, 0, 0);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    RedrawWindow(parent, NULL, 0, RDW_INVALIDATE | RDW_FRAME);
+    RedrawWindow(parent, NULL, 0, RDW_INVALIDATE);
+    GetUpdateRect(parent, &r, FALSE);
+    GetClientRect(parent, &expect_rect);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    SetWindowPos(parent, NULL, 0, 0, 350, 200, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE);
+    GetUpdateRect(parent, &r, FALSE);
+    GetClientRect(parent, &expect_rect);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    pump_messages();
+    RedrawWindow(parent, NULL, 0, RDW_VALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+
+    ValidateRect(hwnd, NULL);
+    SetRect(&expect_rect, 0, 0, 0, 0);
+    GetUpdateRect(hwnd, &r, FALSE);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    GetClientRect(hwnd, &expect_rect);
+    RedrawWindow(parent, NULL, 0, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    GetUpdateRect(hwnd, &r, FALSE);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    SetWindowPos(hwnd, NULL, 0, 0, 210, 110, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE);
+    GetUpdateRect(hwnd, &r, FALSE);
+    GetClientRect(hwnd, &expect_rect);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    ValidateRect(hwnd, NULL);
+    ValidateRect(parent, NULL);
+    SetWindowPos(hwnd, NULL, 0, 0, 200, 100, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE);
+
+    SetRect(&expect_rect, 0, 0, 0, 0);
+    GetUpdateRect(hwnd, &r, FALSE);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    GetClientRect(hwnd, &expect_rect);
+    InvalidateRect(hwnd, NULL, FALSE);
+    GetUpdateRect(hwnd, &r, FALSE);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    SetWindowPos(hwnd, NULL, 0, 0, 210, 110, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE);
+    GetUpdateRect(hwnd, &r, FALSE);
+    GetClientRect(hwnd, &expect_rect);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    ValidateRect(hwnd, NULL);
+    ValidateRect(parent, NULL);
+    SetWindowPos(hwnd, NULL, 0, 0, 200, 100, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE);
+
+    SetRect(&expect_rect, 0, 0, 0, 0);
+    GetUpdateRect(hwnd, &r, FALSE);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    GetClientRect(hwnd, &expect_rect);
+    InvalidateRect(hwnd, NULL, FALSE);
+    GetUpdateRect(hwnd, &r, FALSE);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    /* Child window bottom is outside parent window. Invalidated area is still new child window extents
+     * coordinates cropped to visible part. */
+    SetWindowPos(hwnd, NULL, 0, 150, 210, 100, SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE);
+    GetClientRect(hwnd, &expect_rect);
+    GetClientRect(parent, &r);
+    expect_rect.bottom = r.bottom - 150;
+    GetUpdateRect(hwnd, &r, FALSE);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    ValidateRect(hwnd, NULL);
+    ValidateRect(parent, NULL);
+    SetWindowPos(hwnd, NULL, 0, 0, 200, 100, SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE);
+
+    SetWindowPos(parent, NULL, 0, 0, 300, 150, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE);
+    GetUpdateRect(parent, &r, FALSE);
+    SetRect(&expect_rect, 0, 0, 0, 0);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+
+    GetClientRect(parent, &r);
+    InvalidateRect(parent, &r, FALSE);
+    expect_rect = r;
+    GetUpdateRect(parent, &r, FALSE);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    SetWindowPos(parent, NULL, 0, 0, 350, 200, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE);
+    GetUpdateRect(parent, &r, FALSE);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    GetClientRect(parent, &r);
+    ok(!EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+
+    ValidateRect(parent, NULL);
+    SetWindowPos(parent, NULL, 0, 0, 300, 150, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE);
+    GetUpdateRect(parent, &r, FALSE);
+    SetRect(&expect_rect, 0, 0, 0, 0);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    InvalidateRect(parent, NULL, FALSE);
+    SetRect(&r, 0, 0, 0, 0);
+    /* Subtracting empty rectangle from update region turns 'full client rect' into the specific coordinates
+     * region (unlike adding rectangle). */
+    bret = ValidateRect(parent, &r);
+    ok(bret, "got error %lu.\n", GetLastError());
+    GetClientRect(parent, &expect_rect);
+    GetUpdateRect(parent, &r, FALSE);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+    SetWindowPos(parent, NULL, 0, 0, 350, 200, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOACTIVATE);
+    GetUpdateRect(parent, &r, FALSE);
+    ok(EqualRect(&r, &expect_rect), "got %s, expected %s.\n", wine_dbgstr_rect(&r), wine_dbgstr_rect(&expect_rect));
+
+    ValidateRect(parent, NULL);
     DestroyWindow(parent);
+    pump_messages();
 }
 
 static void test_window_without_child_style(void)
@@ -14565,7 +14625,7 @@ START_TEST(win)
     test_ShowWindow();
     test_ShowWindow_owned(hwndMain);
     test_ShowWindow_child(hwndMain);
-    test_ShowWindow_mdichild();
+    test_ShowWindow_mdichild(hwndMain);
     test_EnableWindow();
     test_gettext();
     test_GetUpdateRect();

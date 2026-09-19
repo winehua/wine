@@ -31,6 +31,7 @@
 #include <sane/saneopts.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "unixlib.h"
 #include "wine/list.h"
 #include "wine/debug.h"

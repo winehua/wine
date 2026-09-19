@@ -23,6 +23,7 @@
 #include <sys/types.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winioctl.h"
 #include "wine/debug.h"
@@ -602,7 +603,7 @@ static ULONG get_full_path_helper(LPCWSTR name, LPWSTR buffer, ULONG size, RTL_P
 
     RtlAcquirePebLock();
 
-    if (NtCurrentTeb()->Tib.SubSystemTib)  /* FIXME: hack */
+    if (0 && NtCurrentTeb()->Tib.SubSystemTib)  /* FIXME: hack */
         cd = &((WIN16_SUBSYSTEM_TIB *)NtCurrentTeb()->Tib.SubSystemTib)->curdir.DosPath;
     else
         cd = &NtCurrentTeb()->Peb->ProcessParameters->CurrentDirectory.DosPath;
@@ -952,13 +953,13 @@ ULONG WINAPI RtlGetCurrentDirectory_U(ULONG buflen, LPWSTR buf)
 
     RtlAcquirePebLock();
 
-    if (NtCurrentTeb()->Tib.SubSystemTib)  /* FIXME: hack */
+    if (0 && NtCurrentTeb()->Tib.SubSystemTib)  /* FIXME: hack */
         us = &((WIN16_SUBSYSTEM_TIB *)NtCurrentTeb()->Tib.SubSystemTib)->curdir.DosPath;
     else
         us = &NtCurrentTeb()->Peb->ProcessParameters->CurrentDirectory.DosPath;
 
     len = us->Length / sizeof(WCHAR);
-    if (us->Buffer[len - 1] == '\\' && us->Buffer[len - 2] != ':')
+    if (len && us->Buffer[len - 1] == '\\' && us->Buffer[len - 2] != ':')
         len--;
 
     if (buflen / sizeof(WCHAR) > len)
@@ -984,6 +985,7 @@ NTSTATUS WINAPI RtlSetCurrentDirectory_U(const UNICODE_STRING* dir)
 {
     FILE_FS_DEVICE_INFORMATION device_info;
     HANDLE handle, old_handle;
+    WCHAR cur_path[MAX_PATH];
     OBJECT_ATTRIBUTES attr;
     UNICODE_STRING newdir;
     IO_STATUS_BLOCK io;
@@ -993,6 +995,16 @@ NTSTATUS WINAPI RtlSetCurrentDirectory_U(const UNICODE_STRING* dir)
     PWSTR ptr;
 
     newdir.Buffer = NULL;
+
+    if (RtlGetCurrentDirectory_U( sizeof(cur_path), cur_path ) < sizeof(cur_path))
+    {
+        size = wcslen( cur_path ) * sizeof(*cur_path);
+        if (dir->Length == size && !memcmp( dir->Buffer, cur_path, size ))
+        {
+            TRACE( "same directory.\n" );
+            return STATUS_SUCCESS;
+        }
+    }
 
     if (!RtlDosPathNameToNtPathName_U( dir->Buffer, &newdir, NULL, NULL )) return STATUS_OBJECT_NAME_INVALID;
 
@@ -1030,7 +1042,7 @@ NTSTATUS WINAPI RtlSetCurrentDirectory_U(const UNICODE_STRING* dir)
     }
 
     RtlAcquirePebLock();
-    if (NtCurrentTeb()->Tib.SubSystemTib)  /* FIXME: hack */
+    if (0 && NtCurrentTeb()->Tib.SubSystemTib)  /* FIXME: hack */
         curdir = &((WIN16_SUBSYSTEM_TIB *)NtCurrentTeb()->Tib.SubSystemTib)->curdir;
     else
         curdir = &NtCurrentTeb()->Peb->ProcessParameters->CurrentDirectory;

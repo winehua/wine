@@ -31,6 +31,7 @@
 #endif
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "win32u_private.h"
 #include "ntuser_private.h"
 #include "wine/server.h"
@@ -404,7 +405,6 @@ static const KBDTABLES kbdus_tables =
 };
 
 static LONG clipping_cursor; /* clipping thread counter */
-static LONG enable_mouse_in_pointer = -1;
 
 BOOL grab_pointer = TRUE;
 BOOL grab_fullscreen = FALSE;
@@ -545,6 +545,8 @@ static WCHAR kbd_tables_vkey_to_wchar( const KBDTABLES *tables, UINT vkey, const
 }
 
 #undef NEXT_ENTRY
+
+BOOL enable_mouse_in_pointer = FALSE;
 
 /*******************************************************************
  *           NtUserGetForegroundWindow  (win32u.@)
@@ -729,27 +731,33 @@ BOOL WINAPI NtUserSetCursorPos( INT x, INT y )
     return ret;
 }
 
-/***********************************************************************
- *	     NtUserGetCursorPos (win32u.@)
- */
-BOOL WINAPI NtUserGetCursorPos( POINT *pt )
+static BOOL get_shared_cursor_pos( POINT *pt, DWORD *last_change )
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
     const desktop_shm_t *desktop_shm;
-    BOOL ret = TRUE;
-    DWORD last_change = 0;
     NTSTATUS status;
-    RECT rect;
-
-    if (!pt) return FALSE;
 
     while ((status = get_shared_desktop( &lock, &desktop_shm )) == STATUS_PENDING)
     {
         pt->x = desktop_shm->cursor.x;
         pt->y = desktop_shm->cursor.y;
-        last_change = desktop_shm->cursor.last_change;
+        *last_change = desktop_shm->cursor.last_change;
     }
-    if (status) return FALSE;
+    return !status;
+}
+
+/***********************************************************************
+ *	     NtUserGetCursorPos (win32u.@)
+ */
+BOOL WINAPI NtUserGetCursorPos( POINT *pt )
+{
+    BOOL ret = TRUE;
+    DWORD last_change = 0;
+    RECT rect;
+
+    if (!pt) return FALSE;
+
+    if (!get_shared_cursor_pos( pt, &last_change )) return FALSE;
 
     /* query new position from graphics driver if we haven't updated recently */
     if (NtGetTickCount() - last_change > 100) ret = user_driver->pGetCursorPos( pt );
@@ -795,8 +803,9 @@ SHORT WINAPI NtUserGetAsyncKeyState( INT key )
     const desktop_shm_t *desktop_shm;
     struct object_lock lock = OBJECT_LOCK_INIT;
     NTSTATUS status;
-    BYTE state = 0;
+    BYTE prev, state = 0;
     SHORT ret = 0;
+    static LONG prev_keystate[256] = {0};
 
     if (key < 0 || key >= 256) return 0;
 
@@ -806,20 +815,13 @@ SHORT WINAPI NtUserGetAsyncKeyState( INT key )
         state = desktop_shm->keystate[key];
 
     if (status) return 0;
-    if (!(state & 0x40)) return (state & 0x80) << 8;
 
-    /* Need to make a server call to reset the last pressed bit */
-    SERVER_START_REQ( get_key_state )
-    {
-        req->async = 1;
-        req->key = key;
-        if (!wine_server_call( req ))
-        {
-            if (reply->state & 0x40) ret |= 0x0001;
-            if (reply->state & 0x80) ret |= 0x8000;
-        }
-    }
-    SERVER_END_REQ;
+    prev = InterlockedExchange(&prev_keystate[key], state);
+
+    if ((state & 0x80) && !(prev & 0x80))
+        ret |= 0x0001;
+    if (state & 0x80)
+        ret |= 0x8000;
 
     return ret;
 }
@@ -871,16 +873,8 @@ DWORD WINAPI NtUserGetQueueStatus( UINT flags )
     return ret;
 }
 
-/***********************************************************************
- *           NtUserGetMessagePos (win32u.@)
- */
-DWORD WINAPI NtUserGetMessagePos(void)
-{
-    return get_user_thread_info()->message_pos;
-}
-
 /*******************************************************************
- *           NtUserGetThreadState (win32u.@)
+ *           NtUserGetThreadInfo (win32u.@)
  */
 ULONG_PTR WINAPI NtUserGetThreadState( USERTHREADSTATECLASS cls )
 {
@@ -907,7 +901,7 @@ ULONG_PTR WINAPI NtUserGetThreadState( USERTHREADSTATECLASS cls )
         return (ULONG_PTR)get_default_ime_window( 0 );
 
     case UserThreadStateDefaultInputContext:
-        return (ULONG_PTR)get_default_input_context();
+        return NtUserGetThreadInfo()->default_imc;
 
     case UserThreadStateInputState:
         return get_input_state();
@@ -916,30 +910,19 @@ ULONG_PTR WINAPI NtUserGetThreadState( USERTHREADSTATECLASS cls )
         return (ULONG_PTR)NtUserGetCursor();
 
     case UserThreadStateExtraInfo:
-        return get_user_thread_info()->message_extra;
+        return NtUserGetThreadInfo()->message_extra;
 
     case UserThreadStateInSendMessage:
-        return get_send_message_flags();
+        return NtUserGetThreadInfo()->receive_flags;
 
     case UserThreadStateMessageTime:
-        return get_user_thread_info()->message_time;
+        return NtUserGetThreadInfo()->message_time;
 
     case UserThreadStateIsForeground:
     default:
         WARN( "unsupported class %u\n", cls );
         return 0;
     }
-}
-
-/***********************************************************************
- *           NtUserSetMessageExtraInfo (win32u.@)
- */
-LPARAM WINAPI NtUserSetMessageExtraInfo( LPARAM lparam )
-{
-    struct user_thread_info *thread_info = get_user_thread_info();
-    LPARAM old_value = thread_info->message_extra;
-    thread_info->message_extra = lparam;
-    return old_value;
 }
 
 /***********************************************************************
@@ -996,6 +979,9 @@ static HKL get_locale_kbd_layout(void)
 
 /***********************************************************************
  *	     NtUserGetKeyboardLayout    (win32u.@)
+ *
+ * Device handle for keyboard layout defaulted to
+ * the language id. This is the way Windows default works.
  */
 HKL WINAPI NtUserGetKeyboardLayout( DWORD thread_id )
 {
@@ -1473,10 +1459,11 @@ BOOL WINAPI NtUserGetKeyboardLayoutName( WCHAR *name )
 
     layout = NtUserGetKeyboardLayout( 0 );
     id = HandleToUlong( layout );
-    if (!(HIWORD( id ) & 0xf000)) id = HIWORD( id );
+    if (HIWORD( id ) == LOWORD( id )) id = LOWORD( id );
     snprintf( buffer, sizeof(buffer), "%08X", id );
     asciiz_to_unicode( name, buffer );
-    if ((HIWORD( id ) & 0x1000) && (hkey = reg_open_key( NULL, keyboard_layouts_keyW, sizeof(keyboard_layouts_keyW) )))
+
+    if ((hkey = reg_open_key( NULL, keyboard_layouts_keyW, sizeof(keyboard_layouts_keyW) )))
     {
         while (!NtEnumerateKey( hkey, i++, KeyNodeInformation, key,
                                 sizeof(buffer) - sizeof(WCHAR), &len ))
@@ -1960,7 +1947,7 @@ BOOL WINAPI NtUserReleaseCapture(void)
  *
  * Change the focus window, sending the WM_SETFOCUS and WM_KILLFOCUS messages
  */
-static HWND set_focus_window( HWND hwnd )
+static HWND set_focus_window( HWND hwnd, BOOL from_active )
 {
     HWND previous = 0, ime_hwnd;
     BOOL ret;
@@ -1977,6 +1964,8 @@ static HWND set_focus_window( HWND hwnd )
 
     if (previous)
     {
+        if (!is_window(hwnd) && !from_active)
+            NtUserNotifyWinEvent( EVENT_OBJECT_FOCUS, previous, OBJID_CLIENT, CHILDID_SELF );
         send_message( previous, WM_KILLFOCUS, (WPARAM)hwnd, 0 );
 
         ime_hwnd = get_default_ime_window( previous );
@@ -1993,7 +1982,8 @@ static HWND set_focus_window( HWND hwnd )
             send_message( ime_hwnd, WM_IME_INTERNAL, IME_INTERNAL_ACTIVATE,
                           HandleToUlong(hwnd) );
 
-        NtUserNotifyWinEvent( EVENT_OBJECT_FOCUS, hwnd, OBJID_CLIENT, 0 );
+        if (!from_active || !previous)
+            NtUserNotifyWinEvent( EVENT_OBJECT_FOCUS, hwnd, OBJID_CLIENT, 0 );
 
         send_message( hwnd, WM_SETFOCUS, (WPARAM)previous, 0 );
     }
@@ -2104,7 +2094,7 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
         if (hwnd == info.hwndActive)
         {
             if (!info.hwndFocus || !hwnd || NtUserGetAncestor( info.hwndFocus, GA_ROOT ) != hwnd)
-                set_focus_window( hwnd );
+                set_focus_window( hwnd, TRUE );
         }
     }
 
@@ -2203,7 +2193,7 @@ HWND WINAPI NtUserSetFocus( HWND hwnd )
     }
 
     /* change focus and send messages */
-    return set_focus_window( hwnd );
+    return set_focus_window( hwnd, FALSE );
 }
 
 /*****************************************************************
@@ -2253,7 +2243,15 @@ BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL internal )
             NtUserMessageCall( hwnd, WM_WINE_SETACTIVEWINDOW, (WPARAM)hwnd, 0,
                                0, NtUserSendNotifyMessage, FALSE );
         else  /* new window belongs to us */
+        {
+            BOOL already_active = (hwnd == get_active_window());
+
             ret = set_active_window( hwnd, NULL, mouse, TRUE, 0 );
+
+            if (already_active)
+                /* set_active_window will do no nothing */
+                NtUserNotifyWinEvent( EVENT_SYSTEM_FOREGROUND, hwnd, 0, 0 );
+        }
     }
     return ret;
 }
@@ -2623,21 +2621,14 @@ void toggle_caret( HWND hwnd )
     if (ret && !hidden) display_caret( hwnd, &r );
 }
 
+
 /**********************************************************************
  *       NtUserEnableMouseInPointer    (win32u.@)
  */
 BOOL WINAPI NtUserEnableMouseInPointer( BOOL enable )
 {
-    LONG prev;
-
-    TRACE( "enable %u\n", enable );
-
-    if ((prev = InterlockedCompareExchange( &enable_mouse_in_pointer, !!enable, -1 )) != -1 && prev != enable)
-    {
-        RtlSetLastWin32Error( ERROR_ACCESS_DENIED );
-        return FALSE;
-    }
-
+    FIXME( "enable %u semi-stub!\n", enable );
+    enable_mouse_in_pointer = TRUE;
     return TRUE;
 }
 
@@ -2656,14 +2647,29 @@ BOOL WINAPI NtUserEnableMouseInPointerForThread( void )
  */
 BOOL WINAPI NtUserIsMouseInPointerEnabled(void)
 {
-    BOOL ret = ReadNoFence( &enable_mouse_in_pointer ) == 1;
-    TRACE( "-> %d.\n", ret );
-    return ret;
+    TRACE( "-> %d.\n", enable_mouse_in_pointer );
+
+    return enable_mouse_in_pointer;
 }
 
-BOOL is_mouse_in_pointer_enabled( HWND hwnd )
+void update_mouse_state_from_pointer( HWND hwnd, UINT msg, unsigned int pointer_id )
 {
-    return ReadNoFence( &enable_mouse_in_pointer ) == 1;
+    BOOL update_cursor_pos = FALSE;
+    DWORD last_change;
+    POINT pt = { 0 };
+
+    SERVER_START_REQ( track_mouse_from_pointer )
+    {
+        req->win = wine_server_user_handle( hwnd );
+        req->msg = msg;
+        req->pointer_id = pointer_id;
+        if (!wine_server_call( req )) update_cursor_pos = reply->cursor_pos_updated;
+    }
+    SERVER_END_REQ;
+
+    if (!update_cursor_pos) return;
+    if (get_shared_cursor_pos( &pt, &last_change ))
+        user_driver->pSetCursorPos( pt.x, pt.y );
 }
 
 static BOOL is_captured_by_system(void)
@@ -2732,6 +2738,32 @@ BOOL clip_fullscreen_window( HWND hwnd, BOOL reset )
     SERVER_END_REQ;
 
     return ret;
+}
+
+/**********************************************************************
+ *       NtUserIsTouchWindow    (win32u.@)
+ */
+BOOL WINAPI NtUserIsTouchWindow( HWND hwnd, ULONG *flags )
+{
+    DWORD win_flags = win_set_flags( hwnd, 0, 0 );
+    TRACE( "hwnd %p, flags %p.\n", hwnd, flags );
+    return (win_flags & WIN_IS_TOUCH) != 0;
+}
+
+
+BOOL register_touch_window( HWND hwnd, UINT flags )
+{
+    DWORD win_flags = win_set_flags( hwnd, WIN_IS_TOUCH, 0 );
+    TRACE( "hwnd %p, flags %#x.\n", hwnd, flags );
+    return (win_flags & WIN_IS_TOUCH) == 0;
+}
+
+
+BOOL unregister_touch_window( HWND hwnd )
+{
+    DWORD win_flags = win_set_flags( hwnd, 0, WIN_IS_TOUCH );
+    TRACE( "hwnd %p.\n", hwnd );
+    return (win_flags & WIN_IS_TOUCH) != 0;
 }
 
 /**********************************************************************
@@ -2810,21 +2842,48 @@ BOOL WINAPI NtUserGetClipCursor( RECT *rect )
  */
 BOOL WINAPI NtUserClipCursor( const RECT *rect )
 {
+    static int keep_inside_window = -1;
+    HWND foreground = NtUserGetForegroundWindow();
     UINT dpi = get_thread_dpi();
-    RECT new_rect;
+    RECT new_rect, full_rect;
     BOOL ret;
 
     TRACE( "Clipping to %s\n", wine_dbgstr_rect(rect) );
 
+    if (foreground == NtUserGetDesktopWindow())
+    {
+        WARN( "desktop is foreground, ignoring ClipCursor\n" );
+        rect = NULL;
+    }
+
     if (rect)
     {
         HWND foreground = NtUserGetForegroundWindow();
+        MONITORINFO info = monitor_info_from_window( foreground, MONITOR_DEFAULTTONEAREST );
+
         if (IsRectEmpty( rect ) && get_present_rect( foreground, &new_rect, dpi ))
         {
             WARN( "Fullscreen clipping fixup to %s\n", wine_dbgstr_rect(&new_rect) );
             rect = &new_rect;
         }
         if (rect->left > rect->right || rect->top > rect->bottom) return FALSE;
+
+        if (keep_inside_window == -1)
+        {
+            const char *sgi = getenv( "SteamGameId" );
+            keep_inside_window = sgi && !strcmp( sgi, "730830" ); /* Escape from Monkey Island */
+        }
+
+        /* keep the mouse clipped inside of a fullscreen foreground window */
+        if (keep_inside_window && NtUserGetWindowRect( foreground, &full_rect, dpi ) && is_fullscreen( &info, &full_rect ))
+        {
+            full_rect.left = max( full_rect.left, min( full_rect.right - 1, rect->left ) );
+            full_rect.right = max( full_rect.left, min( full_rect.right - 1, rect->right ) );
+            full_rect.top = max( full_rect.top, min( full_rect.bottom - 1, rect->top ) );
+            full_rect.bottom = max( full_rect.top, min( full_rect.bottom - 1, rect->bottom ) );
+            rect = &full_rect;
+        }
+
         new_rect = map_rect_virt_to_raw( *rect, dpi );
         rect = &new_rect;
     }
@@ -2866,6 +2925,28 @@ INT WINAPI NtUserScheduleDispatchNotification( HWND hwnd )
         return 2;
 
     return 0;
+}
+
+/*****************************************************************************
+ * NtUserGetTouchInputInfo (WIN32U.@)
+ */
+BOOL WINAPI NtUserGetTouchInputInfo( HTOUCHINPUT handle, UINT count, TOUCHINPUT *ptr, int size )
+{
+    struct user_thread_info *thread_info = get_user_thread_info();
+    struct touchinput_thread_data *thread_data;
+    UINT index = (ULONG_PTR)handle;
+
+    TRACE( "handle %p, count %u, ptr %p, size %u.\n", handle, count, ptr, size );
+
+    if (!thread_info || !(thread_data = thread_info->touchinput) || size != sizeof(TOUCHINPUT) ||
+        index >= ARRAY_SIZE(thread_data->history))
+    {
+        RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+
+    memcpy( ptr, thread_data->history + index, min( count, ARRAY_SIZE(thread_data->current) ) * size );
+    return TRUE;
 }
 
 /**********************************************************************

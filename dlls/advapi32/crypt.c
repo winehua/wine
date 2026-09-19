@@ -31,6 +31,7 @@
 #include <sys/types.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "crypt.h"
 #include "winnls.h"
 #include "winreg.h"
@@ -633,9 +634,19 @@ BOOL WINAPI CryptReleaseContext (HCRYPTPROV hProv, DWORD dwFlags)
 
 	if (InterlockedDecrement(&pProv->refcount) == 0)
 	{
+		static unsigned int once;
+		char sgi[64];
+
 		ret = pProv->pFuncs->pCPReleaseContext(pProv->hPrivate, dwFlags);
 		pProv->dwMagic = 0;
-		FreeLibrary(pProv->hModule);
+		if(GetEnvironmentVariableA("SteamGameId", sgi, sizeof(sgi)) && !strcmp(sgi, "1252330"))
+		{
+			if (!once++) FIXME("HACK: not freeing provider library.\n");
+		}
+		else
+		{
+			FreeLibrary(pProv->hModule);
+		}
 #if 0
 		CRYPT_Free(pProv->pVTable->pContextInfo);
 #endif

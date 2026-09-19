@@ -25,12 +25,15 @@
 #include <sys/types.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winnls.h"
 #include "winternl.h"
 #include "winerror.h"
 #include "ddk/wdm.h"
+
+#include "winehua_ipc_trace.h"
 
 #include "kernelbase.h"
 #include "wine/exception.h"
@@ -122,17 +125,23 @@ DWORD WINAPI DECLSPEC_HOTPATCH DiscardVirtualMemory( void *addr, SIZE_T size )
  */
 BOOL WINAPI DECLSPEC_HOTPATCH FlushViewOfFile( const void *base, SIZE_T size )
 {
-    NTSTATUS status = NtFlushVirtualMemory( GetCurrentProcess(), &base, &size, NULL );
+    NTSTATUS status = NtFlushVirtualMemory( GetCurrentProcess(), &base, &size, 0 );
 
     if (status == STATUS_NOT_MAPPED_DATA) status = STATUS_SUCCESS;
     return set_ntstatus( status );
 }
 
-
 /****************************************************************************
  *           FlushInstructionCache   (kernelbase.@)
  */
+#if defined(__i386__) || defined(__x86_64__)
 BOOL WINAPI DECLSPEC_HOTPATCH FlushInstructionCache( HANDLE process, LPCVOID addr, SIZE_T size )
+{
+    /* X86 processors have coherent instruction and data caches, no need to do anything */
+    return TRUE;
+}
+#else
+static BOOL flush_instruction_cache( HANDLE process, LPCVOID addr, SIZE_T size )
 {
     CROSS_PROCESS_WORK_LIST *list;
 
@@ -144,6 +153,28 @@ BOOL WINAPI DECLSPEC_HOTPATCH FlushInstructionCache( HANDLE process, LPCVOID add
     return set_ntstatus( NtFlushInstructionCache( process, addr, size ));
 }
 
+#ifdef __arm64ec__
+/* Wrapper that preserves RDX/X0 */
+BOOL WINAPI __attribute__((naked)) FlushInstructionCache( HANDLE process, LPCVOID addr, SIZE_T size )
+{
+    asm( ".seh_proc \"#FlushInstructionCache\"\n\t"
+         "stp x29, x30, [sp, #-32]!\n\t"
+         "str x1, [sp, #16]\n\t"
+         ".seh_save_fplr_x 32\n\t"
+         ".seh_endprologue\n\t"
+         "bl \"#flush_instruction_cache\"\n\t"
+         "ldr x1, [sp, #16]\n\t"
+         "ldp x29, x30, [sp], #32\n\t"
+         "ret\n\t"
+         ".seh_endproc" );
+}
+#else
+BOOL WINAPI DECLSPEC_HOTPATCH FlushInstructionCache( HANDLE process, LPCVOID addr, SIZE_T size )
+{
+    return flush_instruction_cache( process, addr, size );
+}
+#endif
+#endif
 
 /***********************************************************************
  *          GetLargePageMinimum   (kernelbase.@)
@@ -208,16 +239,18 @@ void WINAPI DECLSPEC_HOTPATCH GetNativeSystemInfo( SYSTEM_INFO *si )
 {
     SYSTEM_BASIC_INFORMATION basic_info;
     SYSTEM_CPU_INFORMATION cpu_info;
-    USHORT current_machine, native_machine;
 
-    RtlWow64GetProcessMachines( 0, &current_machine, &native_machine );
-
-    if (!is_wow64 || native_machine != IMAGE_FILE_MACHINE_AMD64)
+    if (is_wow64)
     {
-        GetSystemInfo( si );
-        if (is_wow64 && native_machine != IMAGE_FILE_MACHINE_AMD64)
+        USHORT current_machine, native_machine;
+
+        RtlWow64GetProcessMachines( 0, &current_machine, &native_machine );
+        if (native_machine != IMAGE_FILE_MACHINE_AMD64)
+        {
+            GetSystemInfo( si );
             si->wProcessorArchitecture = PROCESSOR_ARCHITECTURE_AMD64;
-        return;
+            return;
+        }
     }
 
     if (!set_ntstatus( RtlGetNativeSystemInformation( SystemBasicInformation,
@@ -313,6 +346,13 @@ LPVOID WINAPI DECLSPEC_HOTPATCH MapViewOfFileEx( HANDLE handle, DWORD access, DW
         SetLastError( RtlNtStatusToDosError(status) );
         addr = NULL;
     }
+    /* WineHua TEMP-DIAG(IPC-TRACE): 记录被观测对象的视图建立 (access/offset/count/protect),
+     * 用于判断 FILE_MAP_COPY (私有/COW, 各写一份) 这类"看起来共享其实不共享"的情形。 */
+    winehua_ipc_trace_handle( "MapViewOfFileEx", handle,
+                              "access=0x%lx offset=0x%llx count=%lu protect=0x%lx view=%p status=0x%lx",
+                              (unsigned long)access,
+                              (unsigned long long)(((ULONGLONG)offset_high << 32) | offset_low),
+                              (unsigned long)count, (unsigned long)protect, addr, (unsigned long)status );
     return addr;
 }
 

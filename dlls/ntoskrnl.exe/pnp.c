@@ -36,12 +36,6 @@ DEFINE_GUID(GUID_NULL,0,0,0,0,0,0,0,0,0,0,0);
 
 WINE_DEFAULT_DEBUG_CHANNEL(plugplay);
 
-DECLARE_CRITICAL_SECTION(invalidated_devices_cs);
-static CONDITION_VARIABLE invalidated_devices_cv = CONDITION_VARIABLE_INIT;
-
-static DEVICE_OBJECT **invalidated_devices;
-static size_t invalidated_devices_count;
-
 static inline const char *debugstr_propkey( const DEVPROPKEY *id )
 {
     if (!id) return "(null)";
@@ -379,13 +373,12 @@ static void start_device( DEVICE_OBJECT *device, HDEVINFO set, SP_DEVINFO_DATA *
     create_dyn_data_key( device );
 }
 
-static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set, DEVICE_OBJECT *parent_device )
+static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set )
 {
     static const WCHAR infpathW[] = {'I','n','f','P','a','t','h',0};
 
     SP_DEVINFO_DATA sp_device = {sizeof(sp_device)};
     WCHAR device_instance_id[MAX_DEVICE_ID_LEN];
-    WCHAR parent_id[MAX_DEVICE_ID_LEN];
     DEVICE_CAPABILITIES caps;
     BOOL need_driver = TRUE;
     NTSTATUS status;
@@ -434,10 +427,6 @@ static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set, DEVICE_OB
             WARN("Failed to set bus reported device desc property.\n");
         ExFreePool( id );
     }
-
-    if (!get_device_instance_id( parent_device, parent_id ))
-        SetupDiSetDevicePropertyW( set, &sp_device, &DEVPKEY_Device_Parent, DEVPROP_TYPE_STRING,
-                (BYTE *)parent_id, (wcslen( parent_id ) + 1) * sizeof(WCHAR), 0 );
 
     if (need_driver && !install_device_driver( device, set, &sp_device ) && !caps.RawDeviceOK)
     {
@@ -494,16 +483,12 @@ static void handle_bus_relations( DEVICE_OBJECT *parent )
 {
     struct wine_device *wine_parent = CONTAINING_RECORD(parent, struct wine_device, device_obj);
     SP_DEVINFO_DATA sp_device = {sizeof(sp_device)};
-    SP_DEVINFO_DATA parent_sp = {sizeof(parent_sp)};
-    WCHAR parent_id[MAX_DEVICE_ID_LEN];
-    WCHAR (*child_ids)[MAX_DEVICE_ID_LEN] = NULL;
     DEVICE_RELATIONS *relations;
     IO_STATUS_BLOCK irp_status;
     IO_STACK_LOCATION *irpsp;
     HDEVINFO set;
     KEVENT event;
     IRP *irp;
-    DWORD count = 0;
     ULONG i;
 
     TRACE( "(%p)\n", parent );
@@ -544,7 +529,7 @@ static void handle_bus_relations( DEVICE_OBJECT *parent )
         if (!wine_parent->children || !device_in_list( wine_parent->children, child ))
         {
             TRACE("Adding new device %p.\n", child);
-            enumerate_new_device( child, set, parent );
+            enumerate_new_device( child, set );
         }
     }
 
@@ -566,65 +551,6 @@ static void handle_bus_relations( DEVICE_OBJECT *parent )
     ExFreePool( wine_parent->children );
     wine_parent->children = relations;
 
-    count = relations->Count;
-    child_ids = malloc( count * sizeof(*child_ids) );
-
-    for (i = 0; i < count; ++i)
-        get_device_instance_id( relations->Objects[i], child_ids[i] );
-
-    if (count && !get_device_instance_id( parent, parent_id )
-            && SetupDiOpenDeviceInfoW( set, parent_id, NULL, 0, &parent_sp ))
-    {
-        DWORD multi_len = 1;
-        WCHAR *children_multi, *p;
-
-        for (i = 0; i < count; ++i)
-            multi_len += wcslen( child_ids[i] ) + 1;
-
-        children_multi = malloc( multi_len * sizeof(WCHAR) );
-        p = children_multi;
-        for (i = 0; i < count; ++i)
-        {
-            wcscpy( p, child_ids[i] );
-            p += wcslen( child_ids[i] ) + 1;
-        }
-        *p = 0;
-        SetupDiSetDevicePropertyW( set, &parent_sp, &DEVPKEY_Device_Children,
-                DEVPROP_TYPE_STRING_LIST, (BYTE *)children_multi,
-                multi_len * sizeof(WCHAR), 0 );
-        free( children_multi );
-    }
-
-    for (i = 0; i < count; ++i)
-    {
-        SP_DEVINFO_DATA child_sp = {sizeof(child_sp)};
-        if (SetupDiOpenDeviceInfoW( set, child_ids[i], NULL, 0, &child_sp ))
-        {
-            DWORD sib_len = 1, j;
-            WCHAR *siblings_multi, *p;
-
-            for (j = 0; j < count; ++j)
-                if (j != i) sib_len += wcslen( child_ids[j] ) + 1;
-
-            siblings_multi = malloc( sib_len * sizeof(WCHAR) );
-            p = siblings_multi;
-            for (j = 0; j < count; ++j)
-            {
-                if (j != i)
-                {
-                    wcscpy( p, child_ids[j] );
-                    p += wcslen( child_ids[j] ) + 1;
-                }
-            }
-            *p = 0;
-            SetupDiSetDevicePropertyW( set, &child_sp, &DEVPKEY_Device_Siblings,
-                    DEVPROP_TYPE_STRING_LIST, (BYTE *)siblings_multi,
-                    sib_len * sizeof(WCHAR), 0 );
-            free( siblings_multi );
-        }
-    }
-    free( child_ids );
-
     SetupDiDestroyDeviceInfoList( set );
 }
 
@@ -638,14 +564,8 @@ void WINAPI IoInvalidateDeviceRelations( DEVICE_OBJECT *device_object, DEVICE_RE
     switch (type)
     {
         case BusRelations:
-            EnterCriticalSection( &invalidated_devices_cs );
-            invalidated_devices = realloc( invalidated_devices,
-                    (invalidated_devices_count + 1) * sizeof(*invalidated_devices) );
-            invalidated_devices[invalidated_devices_count++] = device_object;
-            LeaveCriticalSection( &invalidated_devices_cs );
-            WakeConditionVariable( &invalidated_devices_cv );
+            handle_bus_relations( device_object );
             break;
-
         default:
             FIXME("Unhandled relation %#x.\n", type);
             break;
@@ -1503,30 +1423,6 @@ static NTSTATUS WINAPI pnp_manager_driver_entry( DRIVER_OBJECT *driver, UNICODE_
     return STATUS_SUCCESS;
 }
 
-static DWORD CALLBACK device_enum_thread_proc(void *arg)
-{
-    for (;;)
-    {
-        DEVICE_OBJECT *device;
-
-        EnterCriticalSection( &invalidated_devices_cs );
-
-        while (!invalidated_devices_count)
-            SleepConditionVariableCS( &invalidated_devices_cv, &invalidated_devices_cs, INFINITE );
-
-        device = invalidated_devices[--invalidated_devices_count];
-
-        /* Don't hold the CS while enumerating the device. Tests show that
-         * calling IoInvalidateDeviceRelations() from another thread shouldn't
-         * block, even if this thread is blocked in an IRP handler. */
-        LeaveCriticalSection( &invalidated_devices_cs );
-
-        handle_bus_relations( device );
-    }
-
-    return 0;
-}
-
 void pnp_manager_start(void)
 {
     WCHAR endpoint[] = L"\\pipe\\wine_plugplay";
@@ -1548,8 +1444,6 @@ void pnp_manager_start(void)
     RpcStringFreeW( &binding_str );
     if (err)
         ERR("RpcBindingFromStringBinding() failed, error %#lx\n", err);
-
-    CreateThread( NULL, 0, device_enum_thread_proc, NULL, 0, NULL );
 }
 
 void pnp_manager_stop_driver( struct wine_driver *driver )

@@ -162,8 +162,7 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsMethodPresent(
     if (!type_name)
         return E_INVALIDARG;
 
-    *value = FALSE;
-    return S_OK;
+    return E_NOTIMPL;
 }
 
 static HRESULT STDMETHODCALLTYPE api_information_statics_IsMethodPresentWithArity(

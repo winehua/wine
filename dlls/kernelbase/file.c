@@ -25,6 +25,7 @@
 
 #include "winerror.h"
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "winnls.h"
@@ -83,6 +84,8 @@ static const WCHAR *get_machine_wow64_dir( WORD machine )
     case IMAGE_FILE_MACHINE_TARGET_HOST: return system_dir;
     case IMAGE_FILE_MACHINE_I386:        return L"C:\\windows\\syswow64";
     case IMAGE_FILE_MACHINE_ARMNT:       return L"C:\\windows\\sysarm32";
+    case IMAGE_FILE_MACHINE_AMD64:       return L"C:\\windows\\syswow64";
+    case IMAGE_FILE_MACHINE_ARM64:       return L"C:\\windows\\system32";
     default: return NULL;
     }
 }
@@ -873,22 +876,6 @@ HANDLE WINAPI DECLSPEC_HOTPATCH CreateFileW( LPCWSTR filename, DWORD access, DWO
                            NULL, attributes & FILE_ATTRIBUTE_VALID_FLAGS, sharing,
                            nt_disposition[creation - CREATE_NEW],
                            get_nt_file_options( attributes, creation ), NULL, 0 );
-
-    /* Before Windows NT, the write flag was ignored on CD drives */
-    if (status == STATUS_ACCESS_DENIED && (access & GENERIC_WRITE) && (GetVersion() & 0x80000000))
-    {
-        WCHAR volume[MAX_PATH];
-        if (GetVolumePathNameW( filename, volume, ARRAY_SIZE(volume) ) &&
-            GetDriveTypeW( volume ) == DRIVE_CDROM)
-        {
-            WARN( "Ignoring write flag on CD drive\n" );
-            status = NtCreateFile( &ret, (access & ~GENERIC_WRITE) | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
-                                   &attr, &io, NULL, attributes & FILE_ATTRIBUTE_VALID_FLAGS, sharing,
-                                   nt_disposition[creation - CREATE_NEW],
-                                   get_nt_file_options( attributes, creation ), NULL, 0 );
-        }
-    }
-
     if (status)
     {
         if (vxd_name && vxd_name[0])
@@ -1484,6 +1471,18 @@ HANDLE WINAPI FindFirstFileNameW( const WCHAR *file_name, DWORD flags, DWORD *le
     SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
     return INVALID_HANDLE_VALUE;
 }
+
+
+/******************************************************************************
+ *     FindNextFileNameW   (kernelbase.@)
+ */
+BOOL WINAPI FindNextFileNameW( HANDLE handle, DWORD *len, WCHAR *link_name )
+{
+    FIXME( "(%p, %p, %p): stub.\n", handle, len, link_name );
+    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+    return FALSE;
+}
+
 
 /**************************************************************************
  *	FindFirstStreamW   (kernelbase.@)
@@ -2766,7 +2765,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH ReplaceFileW( const WCHAR *replaced, const WCHAR *
     RtlFreeUnicodeString(&nt_replaced_name);
     if (!set_ntstatus( status )) return FALSE;
 
-    if (info.FileAttributes & ( FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_DIRECTORY ))
+    if (info.FileAttributes & FILE_ATTRIBUTE_READONLY)
     {
         SetLastError( ERROR_ACCESS_DENIED );
         return FALSE;
@@ -3643,7 +3642,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH ReadFile( HANDLE file, LPVOID buffer, DWORD count,
         status = io_status->Status;
     }
 
-    if (result && (!overlapped || !status)) *result = io_status->Information;
+    if (result) *result = overlapped && status ? 0 : io_status->Information;
 
     if (status == STATUS_END_OF_FILE)
     {
@@ -4036,8 +4035,6 @@ BOOL WINAPI DECLSPEC_HOTPATCH WriteFile( HANDLE file, LPCVOID buffer, DWORD coun
     else piosb->Information = 0;
     piosb->Status = STATUS_PENDING;
 
-    if (result) *result = 0;
-
     status = NtWriteFile( file, event, NULL, cvalue, piosb, buffer, count, poffset, NULL );
 
     if (status == STATUS_PENDING && !overlapped)
@@ -4046,7 +4043,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH WriteFile( HANDLE file, LPCVOID buffer, DWORD coun
         status = piosb->Status;
     }
 
-    if (result && (!overlapped || !status)) *result = piosb->Information;
+    if (result) *result = overlapped && status ? 0 : piosb->Information;
 
     if (status && status != STATUS_TIMEOUT)
     {

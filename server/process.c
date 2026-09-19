@@ -53,6 +53,7 @@
 #endif
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "winternl.h"
 #include "ddk/wdm.h"
 
@@ -63,6 +64,8 @@
 #include "request.h"
 #include "user.h"
 #include "security.h"
+
+#include "fsync.h"
 
 /* process object */
 
@@ -96,6 +99,7 @@ static void process_poll_event( struct fd *fd, int event );
 static struct list *process_get_kernel_obj_list( struct object *obj );
 static void process_destroy( struct object *obj );
 static void terminate_process( struct process *process, struct thread *skip, int exit_code );
+static void set_process_affinity( struct process *process, affinity_t affinity );
 
 static const struct object_ops process_ops =
 {
@@ -552,11 +556,9 @@ void *get_ptid_entry( unsigned int id )
 /* return the main thread of the process */
 struct thread *get_process_first_thread( struct process *process )
 {
-    struct thread *thread;
-
-    LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
-        if (!thread->is_system) return thread;
-    return NULL;
+    struct list *ptr = list_head( &process->thread_list );
+    if (!ptr) return NULL;
+    return LIST_ENTRY( ptr, struct thread, proc_entry );
 }
 
 /* set the state of the process startup info */
@@ -574,11 +576,9 @@ static void set_process_startup_state( struct process *process, enum startup_sta
 /* callback for server shutdown */
 static void server_shutdown_timeout( void *arg )
 {
-    write(2, "OHOS-WS: server_shutdown_timeout FIRED\n", 39);
     shutdown_timeout = NULL;
     if (!running_processes)
     {
-        write(2, "OHOS-WS: no running_processes, closing master socket\n", 53);
         close_master_socket( 0 );
         return;
     }
@@ -616,10 +616,7 @@ static void process_died( struct process *process )
     if (!process->is_system)
     {
         if (!--user_processes && !shutdown_stage && master_socket_timeout != TIMEOUT_INFINITE)
-        {
-            write(2, "OHOS-WS: user_processes->0, scheduling shutdown timeout\n", 55);
             shutdown_timeout = add_timeout_user( master_socket_timeout, server_shutdown_timeout, NULL );
-        }
     }
     release_object( process );
     if (!--running_processes && shutdown_stage) close_master_socket( 0 );
@@ -633,7 +630,32 @@ static void process_sigkill( void *private )
 
     process->sigkill_delay *= 2;
     if (process->sigkill_delay >= TICKS_PER_SEC / 2)
+    {
+        const char *telemetry = getenv( "WINEHUA_PROCESS_EXIT_TELEMETRY" );
+
         signal = SIGKILL;
+        if (telemetry && telemetry[0] && strcmp( telemetry, "0" ))
+        {
+            const char *prefix = getenv( "WINEPREFIX" );
+            char path[PATH_MAX];
+            char record[96];
+            int fd, length;
+
+            if (prefix && prefix[0] &&
+                snprintf( path, sizeof(path), "%s/.winehua-process-exit-status", prefix ) < sizeof(path) &&
+                (fd = open( path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600 )) >= 0)
+            {
+                length = snprintf( record, sizeof(record), "%d %u %d\n",
+                                   process->unix_pid, process->id, process->exit_code );
+                if (length > 0 && length < sizeof(record)) write( fd, record, length );
+                close( fd );
+            }
+            fprintf( stderr,
+                     "[WineHuaProcessExit] windows_pid=%04x unix_pid=%d exit_code=%u wait_ticks=%lld action=SIGKILL\n",
+                     process->id, process->unix_pid, process->exit_code,
+                     (long long)process->sigkill_delay );
+        }
+    }
 
     if (!kill( process->unix_pid, signal ) && !signal)
         process->sigkill_timeout = add_timeout_user( -process->sigkill_delay, process_sigkill, process );
@@ -663,6 +685,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
                                 unsigned int handle_count, struct token *token )
 {
     struct process *process;
+    struct job *job;
 
     if (!(process = alloc_object( &process_ops )))
     {
@@ -678,11 +701,9 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->sigkill_timeout = NULL;
     process->sigkill_delay   = TICKS_PER_SEC / 64;
     process->machine         = native_machine;
-    process->page_size       = get_page_size();
     process->unix_pid        = -1;
     process->exit_code       = STILL_ACTIVE;
     process->running_threads = 0;
-    process->user_threads    = 0;
     process->priority        = PROCESS_PRIOCLASS_NORMAL;
     process->base_priority   = 8;
     process->disable_boost   = 0;
@@ -708,6 +729,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->rawinput_mouse  = NULL;
     process->rawinput_kbd    = NULL;
     memset( &process->image_info, 0, sizeof(process->image_info) );
+    process->cpu_override.cpu_count = 0;
     list_init( &process->rawinput_entry );
     list_init( &process->kernel_object );
     list_init( &process->thread_list );
@@ -743,9 +765,12 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     {
         obj_handle_t std_handles[3];
 
-        std_handles[0] = info->hstdin;
-        std_handles[1] = info->hstdout;
-        std_handles[2] = info->hstderr;
+        if (flags & PROCESS_CREATE_FLAGS_INHERIT_HANDLES)
+        {
+            std_handles[0] = info->hstdin;
+            std_handles[1] = info->hstdout;
+            std_handles[2] = info->hstderr;
+        }
 
         process->parent_id = parent->id;
         if (flags & PROCESS_CREATE_FLAGS_INHERIT_HANDLES)
@@ -761,6 +786,22 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->session_id = token_get_session_id( process->token );
 
     set_fd_events( process->msg_fd, POLLIN );  /* start listening to events */
+
+    if (!parent) return process;
+    job = parent->job;
+    while (job)
+    {
+        if (!(job->limit_flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
+                && !(flags & PROCESS_CREATE_FLAGS_BREAKAWAY
+                && job->limit_flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK))
+        {
+            add_job_process( job, process );
+            assert( !get_error() );
+            break;
+        }
+        job = job->parent;
+    }
+
     return process;
 
  error:
@@ -805,6 +846,7 @@ static void process_destroy( struct object *obj )
     if (process->id) free_ptid( process->id );
     if (process->token) release_object( process->token );
     if (process->sync) release_object( process->sync );
+    if (do_fsync()) fsync_cleanup_process_shm_indices( process->id );
     list_remove( &process->rawinput_entry );
     free( process->rawinput_devices );
     free( process->dir_cache );
@@ -1015,7 +1057,6 @@ static void process_killed( struct process *process )
 void add_process_thread( struct process *process, struct thread *thread )
 {
     list_add_tail( &process->thread_list, &thread->proc_entry );
-    if (!thread->is_system) process->user_threads++;
     if (!process->running_threads++)
     {
         list_add_tail( &process_list, &process->entry );
@@ -1039,7 +1080,6 @@ void remove_process_thread( struct process *process, struct thread *thread )
     assert( !list_empty( &process->thread_list ));
 
     list_remove( &thread->proc_entry );
-    if (!thread->is_system) process->user_threads--;
 
     if (!--process->running_threads)
     {
@@ -1049,8 +1089,7 @@ void remove_process_thread( struct process *process, struct thread *thread )
         list_remove( &process->entry );
         process_killed( process );
     }
-    else if (!thread->is_system) generate_debug_event( thread, DbgExitThreadStateChange, thread );
-
+    else generate_debug_event( thread, DbgExitThreadStateChange, thread );
     release_object( thread );
 }
 
@@ -1337,20 +1376,6 @@ DECL_HANDLER(new_process)
 
     process->machine = req->machine;
     process->startup_info = (struct startup_info *)grab_object( info );
-
-    job = parent->job;
-    while (job)
-    {
-        if (!(job->limit_flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
-                && !(req->flags & PROCESS_CREATE_FLAGS_BREAKAWAY
-                && job->limit_flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK))
-        {
-            add_job_process( job, process );
-            assert( !get_error() );
-            break;
-        }
-        job = job->parent;
-    }
 
     for (i = 0; i < job_handle_count; ++i)
     {
@@ -1854,10 +1879,7 @@ DECL_HANDLER(make_process_system)
             release_thread_desktop( thread, 0 );
         process->is_system = 1;
         if (!--user_processes && !shutdown_stage && master_socket_timeout != TIMEOUT_INFINITE)
-        {
-            write(2, "OHOS-WS: user_processes->0 (detach), scheduling shutdown timeout\n", 61);
             shutdown_timeout = add_timeout_user( master_socket_timeout, server_shutdown_timeout, NULL );
-        }
     }
     release_object( process );
 }
@@ -2081,9 +2103,9 @@ DECL_HANDLER(list_processes)
         reply->info_size = (reply->info_size + 7) & ~7;
         reply->info_size += sizeof(struct process_info) + process->imagelen;
         reply->info_size = (reply->info_size + 7) & ~7;
-        reply->info_size += process->user_threads * sizeof(struct thread_info);
+        reply->info_size += process->running_threads * sizeof(struct thread_info);
         reply->process_count++;
-        reply->total_thread_count += process->user_threads;
+        reply->total_thread_count += process->running_threads;
         reply->total_name_len += process->imagelen;
     }
 
@@ -2104,7 +2126,7 @@ DECL_HANDLER(list_processes)
         process_info = (struct process_info *)(buffer + pos);
         process_info->start_time = process->start_time;
         process_info->name_len = process->imagelen;
-        process_info->thread_count = process->user_threads;
+        process_info->thread_count = process->running_threads;
         process_info->priority = process->priority;
         process_info->pid = process->id;
         process_info->parent_pid = process->parent_id;
@@ -2119,7 +2141,6 @@ DECL_HANDLER(list_processes)
         {
             struct thread_info *thread_info = (struct thread_info *)(buffer + pos);
 
-            if (thread->is_system) continue;
             thread_info->start_time = thread->creation_time;
             thread_info->tid = thread->id;
             thread_info->base_priority = thread->base_priority;

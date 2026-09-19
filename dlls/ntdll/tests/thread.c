@@ -36,6 +36,8 @@ static NTSTATUS (WINAPI *pNtAllocateReserveObject)( HANDLE *, const OBJECT_ATTRI
 static NTSTATUS (WINAPI *pNtCreateThreadEx)( HANDLE *, ACCESS_MASK, OBJECT_ATTRIBUTES *,
                                              HANDLE, PRTL_THREAD_START_ROUTINE, void *,
                                              ULONG, ULONG_PTR, SIZE_T, SIZE_T, PS_ATTRIBUTE_LIST * );
+static NTSTATUS (WINAPI *pNtAllocateVirtualMemoryEx)(HANDLE, PVOID *, SIZE_T *, ULONG, ULONG,
+                                                     MEM_EXTENDED_PARAMETER *, ULONG);
 static NTSTATUS  (WINAPI *pNtSuspendProcess)(HANDLE process);
 static NTSTATUS  (WINAPI *pNtResumeProcess)(HANDLE process);
 static NTSTATUS  (WINAPI *pNtQueueApcThreadEx)(HANDLE handle, HANDLE reserve_handle, PNTAPCFUNC func,
@@ -43,11 +45,6 @@ static NTSTATUS  (WINAPI *pNtQueueApcThreadEx)(HANDLE handle, HANDLE reserve_han
 static NTSTATUS  (WINAPI *pNtQueueApcThreadEx2)(HANDLE handle, HANDLE reserve_handle, ULONG flags, PNTAPCFUNC func,
                                                 ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3);
 static NTSTATUS  (WINAPI *pRtlWow64GetProcessMachines)(HANDLE, WORD*, WORD*);
-
-#ifdef __x86_64__
-static NTSTATUS (WINAPI *pNtAllocateVirtualMemoryEx)(HANDLE, PVOID *, SIZE_T *, ULONG, ULONG,
-                                                     MEM_EXTENDED_PARAMETER *, ULONG);
-#endif
 
 static int * (CDECL *p_errno)(void);
 
@@ -60,16 +57,13 @@ static void init_function_pointers(void)
     hdll = GetModuleHandleA( "ntdll.dll" );
     GET_FUNC( NtAllocateReserveObject );
     GET_FUNC( NtCreateThreadEx );
+    GET_FUNC( NtAllocateVirtualMemoryEx );
     GET_FUNC( NtSuspendProcess );
     GET_FUNC( NtQueueApcThreadEx );
     GET_FUNC( NtQueueApcThreadEx2 );
     GET_FUNC( NtResumeProcess );
     GET_FUNC( RtlWow64GetProcessMachines );
     GET_FUNC( _errno );
-
-#ifdef __x86_64__
-    GET_FUNC( NtAllocateVirtualMemoryEx );
-#endif
 
     hdll = GetModuleHandleA( "kernel32.dll" );
     GET_FUNC( IsWow64Process );
@@ -310,8 +304,11 @@ static void test_thread_bypass_process_freeze(void)
     CloseHandle( thread );
 }
 
+static int apc_count;
+
 static void CALLBACK apc_func( ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3 )
 {
+    ++apc_count;
 }
 
 static void test_NtQueueApcThreadEx(void)

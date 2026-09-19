@@ -22,7 +22,6 @@
 #define __WINE_SERVER_OBJECT_H
 
 #include <poll.h>
-#include <stdbool.h>
 #include <sys/time.h>
 #include "wine/server_protocol.h"
 #include "wine/list.h"
@@ -178,6 +177,9 @@ static inline struct object *get_obj_sync( struct object *obj ) { return obj->op
 extern unsigned int default_map_access( struct object *obj, unsigned int access );
 extern struct security_descriptor *default_get_sd( struct object *obj );
 extern int default_set_sd( struct object *obj, const struct security_descriptor *sd, unsigned int set_info );
+extern struct security_descriptor *set_sd_from_token_internal( const struct security_descriptor *sd,
+                                                               const struct security_descriptor *old_sd,
+                                                               unsigned int set_info, struct token *token );
 extern int set_sd_defaults_from_token( struct object *obj, const struct security_descriptor *sd,
                                        unsigned int set_info, struct token *token );
 extern WCHAR *no_get_full_name( struct object *obj, data_size_t max, data_size_t *ret_len );
@@ -288,8 +290,9 @@ static inline int is_machine_64bit( unsigned short machine )
 }
 static inline int is_machine_supported( unsigned short machine )
 {
-    for (unsigned int i = 0; i < supported_machines_count; i++)
-        if (supported_machines[i] == machine) return 1;
+    unsigned int i;
+    for (i = 0; i < supported_machines_count; i++) if (supported_machines[i] == machine) return 1;
+    if (native_machine == IMAGE_FILE_MACHINE_ARM64) return machine == IMAGE_FILE_MACHINE_AMD64;
     return 0;
 }
 
@@ -341,7 +344,6 @@ extern struct object *create_symlink( struct object *root, const struct unicode_
   /* command-line options */
 extern int debug_level;
 extern int foreground;
-extern int no_auto_close;
 extern timeout_t master_socket_timeout;
 extern const char *server_argv0;
 

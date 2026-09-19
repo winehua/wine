@@ -227,11 +227,7 @@ struct strarray find_tool( const char *name, const char * const *names )
         names++;
     }
 
-    if (!file && cc_command.count)
-    {
-        file = find_clang_tool( cc_command, strmake( "llvm-%s", name ));
-        if (!file) file = find_clang_tool( cc_command, name );
-    }
+    if (!file && cc_command.count) file = find_clang_tool( cc_command, name );
     if (!file) file = find_binary( "llvm", name );
     if (!file) file = find_clang_tool( empty_strarray, strmake( "llvm-%s", name ));
     if (!file) file = find_clang_tool( empty_strarray, name );
@@ -345,7 +341,6 @@ struct strarray get_ld_command(void)
             break;
         case PLATFORM_MINGW:
         case PLATFORM_WINDOWS:
-        case PLATFORM_WINDOWS_GNU:
             strarray_add( &args, "-m" );
             strarray_add( &args, (force_pointer_size == 8) ? "i386pep" : "i386pe" );
             break;
@@ -748,7 +743,6 @@ const char *asm_name( const char *sym )
     {
     case PLATFORM_MINGW:
     case PLATFORM_WINDOWS:
-    case PLATFORM_WINDOWS_GNU:
         if (target.cpu != CPU_i386) return sym;
         if (sym[0] == '@') return sym;  /* fastcall */
         /* fall through */
@@ -781,7 +775,6 @@ void output_function_header( const char *func, int global )
         break;
     case PLATFORM_MINGW:
     case PLATFORM_WINDOWS:
-    case PLATFORM_WINDOWS_GNU:
         if (target.cpu == CPU_ARM64EC) output( ".section .text,\"xr\",discard,%s\n\t", name );
         output( "\t.def %s\n\t.scl 2\n\t.type 32\n\t.endef\n", name );
         if (global) output( "\t.globl %s\n", name );
@@ -803,7 +796,6 @@ void output_function_size( const char *name )
     case PLATFORM_APPLE:
     case PLATFORM_MINGW:
     case PLATFORM_WINDOWS:
-    case PLATFORM_WINDOWS_GNU:
         break;
     default:
         output( "\t.size %s, .-%s\n", name, name );
@@ -895,7 +887,6 @@ void output_gnu_stack_note(void)
     {
     case PLATFORM_MINGW:
     case PLATFORM_WINDOWS:
-    case PLATFORM_WINDOWS_GNU:
     case PLATFORM_APPLE:
         break;
     default:
@@ -913,7 +904,6 @@ const char *asm_globl( const char *func )
         return strmake( "\t.globl _%s\n\t.private_extern _%s\n_%s:", func, func, func );
     case PLATFORM_MINGW:
     case PLATFORM_WINDOWS:
-    case PLATFORM_WINDOWS_GNU:
     {
         const char *name = asm_name( func );
         return strmake( "\t.globl %s\n%s:", name, name );
@@ -949,11 +939,10 @@ const char *get_asm_export_section(void)
 {
     switch (target.platform)
     {
-    case PLATFORM_APPLE:       return ".data";
+    case PLATFORM_APPLE:   return ".data";
     case PLATFORM_MINGW:
-    case PLATFORM_WINDOWS:
-    case PLATFORM_WINDOWS_GNU: return ".section .edata";
-    default:                   return ".section .data";
+    case PLATFORM_WINDOWS: return ".section .edata";
+    default:               return ".section .data";
     }
 }
 
@@ -961,11 +950,10 @@ const char *get_asm_rodata_section(void)
 {
     switch (target.platform)
     {
-    case PLATFORM_APPLE:       return ".const";
+    case PLATFORM_APPLE:   return ".const";
     case PLATFORM_MINGW:
-    case PLATFORM_WINDOWS:
-    case PLATFORM_WINDOWS_GNU: return ".section .rdata";
-    default:                   return ".section .rodata";
+    case PLATFORM_WINDOWS: return ".section .rdata";
+    default:               return ".section .rodata";
     }
 }
 
@@ -973,11 +961,10 @@ const char *get_asm_rsrc_section(void)
 {
     switch (target.platform)
     {
-    case PLATFORM_APPLE:       return ".data";
+    case PLATFORM_APPLE:   return ".data";
     case PLATFORM_MINGW:
-    case PLATFORM_WINDOWS:
-    case PLATFORM_WINDOWS_GNU: return ".section .rsrc";
-    default:                   return ".section .data";
+    case PLATFORM_WINDOWS: return ".section .rsrc";
+    default:               return ".section .data";
     }
 }
 
@@ -985,10 +972,9 @@ const char *get_asm_string_section(void)
 {
     switch (target.platform)
     {
-    case PLATFORM_APPLE:       return ".cstring";
+    case PLATFORM_APPLE:   return ".cstring";
     case PLATFORM_MINGW:
-    case PLATFORM_WINDOWS:
-    case PLATFORM_WINDOWS_GNU: return ".section .rdata";
-    default:                   return ".section .rodata";
+    case PLATFORM_WINDOWS: return ".section .rdata";
+    default:               return ".section .rodata";
     }
 }

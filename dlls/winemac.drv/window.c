@@ -859,7 +859,7 @@ static LRESULT move_window(HWND hwnd, WPARAM wparam)
     POINT capturePoint;
     LONG style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     BOOL moved = FALSE;
-    DWORD dwPoint = NtUserGetMessagePos();
+    DWORD dwPoint = NtUserGetThreadInfo()->message_pos;
     INT captionHeight;
     HMONITOR mon = 0;
     MONITORINFO info;
@@ -1076,7 +1076,8 @@ static void macdrv_client_surface_destroy(struct client_surface *client)
 
     TRACE("%s\n", debugstr_client_surface(client));
 
-    if (surface->metal_swapchain) macdrv_destroy_swapchain(surface->metal_swapchain);
+    if (surface->metal_view) macdrv_view_release_metal_view(surface->metal_view);
+    if (surface->metal_device) macdrv_release_metal_device(surface->metal_device);
 }
 
 static void macdrv_client_surface_detach(struct client_surface *client)
@@ -1166,41 +1167,11 @@ struct macdrv_client_surface *macdrv_client_surface_create(HWND hwnd)
     return surface;
 }
 
-BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface)
-{
-    HWND hwnd = surface->client.hwnd;
-    struct macdrv_win_data *data;
-
-    if (surface->metal_swapchain) return TRUE;
-
-    if ((data = get_win_data(hwnd)))
-    {
-        release_win_data(data);
-        surface->metal_swapchain = macdrv_create_view_swapchain(surface->cocoa_view);
-    }
-    else
-    {
-        RECT rect;
-
-        if (NtUserGetAncestor(hwnd, GA_ROOT) != hwnd)
-        {
-            FIXME("Cross-process child window Metal swapchains are not implemented\n");
-            return FALSE;
-        }
-
-        if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI))) return FALSE;
-        surface->metal_swapchain = macdrv_create_offscreen_swapchain(hwnd, cgrect_from_rect(rect));
-    }
-
-    return surface->metal_swapchain != NULL;
-}
-
 /**********************************************************************
  *              SetDesktopWindow   (MACDRV.@)
  */
 void macdrv_SetDesktopWindow(HWND hwnd)
 {
-    static pthread_once_t app_icon_once = PTHREAD_ONCE_INIT;
     unsigned int width, height;
 
     TRACE("%p\n", hwnd);
@@ -1235,7 +1206,7 @@ void macdrv_SetDesktopWindow(HWND hwnd)
         SERVER_END_REQ;
     }
 
-    pthread_once(&app_icon_once, set_app_icon);
+    set_app_icon();
 }
 
 #define WM_WINE_NOTIFY_ACTIVITY WM_USER
@@ -1559,38 +1530,10 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         activate_on_following_focus();
         TRACE("WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS time %u\n", activate_on_focus_time);
         return 0;
-    case WM_MACDRV_CREATE_REMOTE_LAYER:
-        if ((data = get_win_data(hwnd)))
-        {
-            TRACE("WM_MACDRV_CREATE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
-            if (data->cocoa_window) macdrv_window_create_ca_layer_host_view(data->cocoa_window, (unsigned int)lp);
-            release_win_data(data);
-        }
-        return 0;
-    case WM_MACDRV_RELEASE_REMOTE_LAYER:
-        if ((data = get_win_data(hwnd)))
-        {
-            TRACE("WM_MACDRV_RELEASE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
-            if (data->cocoa_window) macdrv_window_release_ca_layer_host_view(data->cocoa_window, (unsigned int)lp);
-            release_win_data(data);
-        }
-        return 0;
     }
 
     FIXME("unrecognized window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (unsigned long)wp, lp);
     return 0;
-}
-
-
-void macdrv_create_remote_layer(void* hwnd_ptr, unsigned int context_id)
-{
-    NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_CREATE_REMOTE_LAYER, 0, context_id);
-}
-
-
-void macdrv_release_remote_layer(void* hwnd_ptr, unsigned int context_id)
-{
-    NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_RELEASE_REMOTE_LAYER, 0, context_id);
 }
 
 

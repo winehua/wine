@@ -42,10 +42,8 @@ static NTSTATUS (WINAPI *pRtlQueryTimeZoneInformation)( RTL_TIME_ZONE_INFORMATIO
 static NTSTATUS (WINAPI *pRtlQueryDynamicTimeZoneInformation)( RTL_DYNAMIC_TIME_ZONE_INFORMATION *);
 static BOOL     (WINAPI *pRtlQueryUnbiasedInterruptTime)( ULONGLONG *time );
 
-#if (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__)
 static BOOL     (WINAPI *pRtlQueryPerformanceCounter)(LARGE_INTEGER*);
 static BOOL     (WINAPI *pRtlQueryPerformanceFrequency)(LARGE_INTEGER*);
-#endif
 
 static NTSTATUS (WINAPI *pNtConvertBetweenAuxiliaryCounterAndPerformanceCounter)(ULONG, ULONGLONG *, ULONGLONG *, ULONGLONG *);
 static HRESULT (WINAPI *pConvertAuxiliaryCounterToPerformanceCounter)(ULONGLONG, ULONGLONG *, ULONGLONG *);
@@ -541,10 +539,8 @@ START_TEST(time)
     pRtlQueryDynamicTimeZoneInformation =
         (void *)GetProcAddress(mod, "RtlQueryDynamicTimeZoneInformation");
     pRtlQueryUnbiasedInterruptTime = (void *)GetProcAddress(mod, "RtlQueryUnbiasedInterruptTime");
-#if (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__)
     pRtlQueryPerformanceCounter = (void *)GetProcAddress(mod, "RtlQueryPerformanceCounter");
     pRtlQueryPerformanceFrequency = (void *)GetProcAddress(mod, "RtlQueryPerformanceFrequency");
-#endif
     pNtConvertBetweenAuxiliaryCounterAndPerformanceCounter =
         (void *)GetProcAddress(mod, "NtConvertBetweenAuxiliaryCounterAndPerformanceCounter");
 

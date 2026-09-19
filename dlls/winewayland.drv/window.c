@@ -28,6 +28,7 @@
 #include <stdlib.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 
 #include "waylanddrv.h"
 
@@ -62,13 +63,15 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
     struct rb_entry *rb_entry;
     HWND parent;
 
-    /* PAD_MODE: 桌面窗口需要 wayland surface 作为 subsurfacing 的根。
-     * 允许所有窗口（包括桌面/HWND_MESSAGE）创建 win_data。 */
-#ifndef PAD_MODE
-    if (!(parent = NtUserGetAncestor(hwnd, GA_PARENT))) return NULL;
-    if (parent != NtUserGetDesktopWindow() && !NtUserGetAncestor(parent, GA_PARENT))
-        return NULL;
-#endif
+    /* 桌面模式: 所有窗口(包括桌面/HWND_MESSAGE)都需创建 win_data
+     * 作为 subsurfacing 的根。独立窗口模式: 只创建有父窗口的。
+     * 运行时通过环境变量 WINEHUA_DESKTOP_MODE 判断。 */
+    if (!getenv("WINEHUA_DESKTOP_MODE") || !atoi(getenv("WINEHUA_DESKTOP_MODE")))
+    {
+        if (!(parent = NtUserGetAncestor(hwnd, GA_PARENT))) return NULL;
+        if (parent != NtUserGetDesktopWindow() && !NtUserGetAncestor(parent, GA_PARENT))
+            return NULL;
+    }
 
     if (!(data = calloc(1, sizeof(*data)))) return NULL;
 
@@ -161,8 +164,6 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
 
     TRACE("window=%s style=%#x\n", wine_dbgstr_rect(&conf->rect), style);
-
-    conf->minimized = !!(style & WS_MINIMIZE);
 
     /* The fullscreen state is implied by the window position and style. */
     if (data->is_fullscreen)
@@ -272,14 +273,12 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
          /* First do all state unsettings, before setting new state. Some
           * Wayland compositors misbehave if the order is reversed. */
         if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
-            (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
-            !surface->window.minimized)
+            (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
         {
             xdg_toplevel_unset_maximized(surface->xdg_toplevel);
         }
         if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
-            (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
-            !surface->window.minimized)
+            (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
         {
             xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
         }
@@ -293,10 +292,6 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
            !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
         {
             xdg_toplevel_set_fullscreen(surface->xdg_toplevel, NULL);
-        }
-        if (surface->window.minimized)
-        {
-            xdg_toplevel_set_minimized(surface->xdg_toplevel);
         }
     }
     else
@@ -472,15 +467,31 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     if (!surface)
     {
+        BOOL keep_toplevel = FALSE;
+
         if ((client = data->client_surface))
         {
             if (toplevel && NtUserIsWindowVisible(hwnd))
+            {
                 wayland_client_surface_attach(client, toplevel);
+                /* Proton 11.0 drops the GDI window surface when a visible
+                 * top-level switches to an OpenGL/Vulkan client surface.  The
+                 * Wayland surface is still the parent of that client's
+                 * subsurface and must remain alive until the window is hidden
+                 * or destroyed. */
+                keep_toplevel = toplevel == hwnd;
+            }
             else
                 wayland_client_surface_attach(client, NULL);
         }
 
-        if (data->wayland_surface)
+        if (data->wayland_surface && keep_toplevel)
+        {
+            /* The retained parent still has to consume the configure that was
+             * posted before the Vulkan/OpenGL client surface took over. */
+            wayland_win_data_update_wayland_state(data);
+        }
+        else if (data->wayland_surface)
         {
             wayland_surface_destroy(data->wayland_surface);
             data->wayland_surface = NULL;
@@ -504,7 +515,6 @@ static void wayland_configure_window(HWND hwnd)
     DWORD style;
     BOOL needs_enter_size_move = FALSE;
     BOOL needs_exit_size_move = FALSE;
-    BOOL restoring_from_minimize = FALSE;
     struct wayland_win_data *data;
     RECT rect;
 
@@ -587,31 +597,6 @@ static void wayland_configure_window(HWND hwnd)
     wayland_surface_coords_to_window(surface, width, height,
                                      &window_width, &window_height);
 
-    /* Detect a restore from an application-initiated minimize: the last
-     * requested config placed the window at the offscreen sentinel position
-     * with WS_MINIMIZE, and the compositor is now sending a configure. Ack
-     * the configure to avoid a protocol violation and send SC_RESTORE so
-     * Win32 runs the full restore sequence (clearing WS_MINIMIZE, restoring
-     * position/size, sending WM_SIZE, etc.), which triggers a new configure
-     * cycle. */
-    restoring_from_minimize = surface->window.rect.left <= -32000 &&
-                              surface->window.rect.top  <= -32000 &&
-                              surface->window.minimized;
-    if (restoring_from_minimize)
-    {
-        TRACE("hwnd=%p restoring from minimize\n", hwnd);
-        surface->current = surface->processing;
-        memset(&surface->processing, 0, sizeof(surface->processing));
-        xdg_surface_ack_configure(surface->xdg_surface,
-                                  surface->current.serial);
-        wayland_win_data_release(data);
-        send_message(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
-        return;
-    }
-
-    SetRect(&rect, 0, 0, window_width, window_height);
-    OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
-
     wayland_win_data_release(data);
 
     TRACE("processing=%dx%d,%#x\n", width, height, state);
@@ -637,6 +622,8 @@ static void wayland_configure_window(HWND hwnd)
         flags |= SWP_NOSENDCHANGING;
     }
 
+    SetRect(&rect, 0, 0, window_width, window_height);
+    OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
     NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
 }
 
@@ -894,7 +881,10 @@ void ensure_window_surface_contents(HWND hwnd)
 
     if ((wayland_surface = data->wayland_surface))
     {
-        wayland_surface_ensure_contents(wayland_surface);
+        /* win_data_mutex is held here. Pass the current GDI buffer directly;
+         * looking it up again from wayland_surface_ensure_contents() would
+         * recursively lock the non-recursive mutex after the first present. */
+        wayland_surface_ensure_contents(wayland_surface, data->window_contents);
 
         /* Handle any processed configure request, to ensure the related
          * surface state is applied by the compositor. */

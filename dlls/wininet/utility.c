@@ -39,28 +39,29 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(wininet);
 
-server_addr_t *GetAddress(const WCHAR *name, INTERNET_PORT port)
+BOOL GetAddress(const WCHAR *name, INTERNET_PORT port, server_addr_t **server_addr)
 {
-    server_addr_t *server_addr, *p;
     struct sockaddr_storage *addr;
     ADDRINFOW *res, *ai, hints;
     unsigned int len, count;
+    server_addr_t *p;
     int ret;
 
     TRACE("%s\n", debugstr_w(name));
 
+    *server_addr = NULL;
     memset( &hints, 0, sizeof(hints) );
     hints.ai_socktype = SOCK_STREAM;
     ret = GetAddrInfoW(name, NULL, &hints, &res);
     if (ret != 0)
     {
         TRACE("failed to get address of %s\n", debugstr_w(name));
-        return NULL;
+        return FALSE;
     }
     count = 0;
     for (ai = res; ai; ai = ai->ai_next)
         ++count;
-    p = server_addr = calloc(count, sizeof(*server_addr));
+    p = *server_addr = calloc(count, sizeof(**server_addr));
     ai = res;
     while (ai)
     {
@@ -90,7 +91,7 @@ server_addr_t *GetAddress(const WCHAR *name, INTERNET_PORT port)
     }
 
     FreeAddrInfoW(res);
-    return server_addr;
+    return TRUE;
 }
 
 static int try_create_connect_socket(server_addr_t *addr, int af, DWORD timeout, object_header_t *hdr,

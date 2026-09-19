@@ -28,6 +28,7 @@
 #include <setjmp.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
@@ -109,9 +110,11 @@ __ASM_GLOBAL_FUNC( RtlCaptureContext,
 /**********************************************************************
  *           virtual_unwind
  */
-static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT *dispatch, CONTEXT *context )
+static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT *dispatch, CONTEXT *context,
+                                BOOL dump_backtrace )
 {
     DISPATCHER_CONTEXT_NONVOLREG_ARM64 *nonvol_regs;
+    LDR_DATA_TABLE_ENTRY *module = NULL;
     DWORD64 pc = context->Pc;
     int i;
 
@@ -125,6 +128,15 @@ static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT *dispatch, CONTEX
     for (i = 0; i < 8; i++) nonvol_regs->FpNvRegs[i] = context->V[i + 8].D[0];
 
     dispatch->FunctionEntry = RtlLookupFunctionEntry( pc, &dispatch->ImageBase, dispatch->HistoryTable );
+
+    if (dump_backtrace)
+    {
+        if (!LdrFindEntryForAddress( (void *)pc, &module ))
+            WINE_BACKTRACE_LOG( "%p: %s + %p.\n", (void *)pc, debugstr_w(module->BaseDllName.Buffer),
+                                (void *)((char *)pc - (char *)module->DllBase) );
+        else
+            WINE_BACKTRACE_LOG( "%p: unknown module.\n", (void *)pc );
+    }
 
     if (RtlVirtualUnwind2( type, dispatch->ImageBase, pc, dispatch->FunctionEntry, context,
                            NULL, &dispatch->HandlerData, &dispatch->EstablisherFrame,
@@ -233,7 +245,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
 
     for (;;)
     {
-        status = virtual_unwind( UNW_FLAG_EHANDLER, &dispatch, &context );
+        status = virtual_unwind( UNW_FLAG_EHANDLER, &dispatch, &context, need_backtrace( rec->ExceptionCode ) );
         if (status != STATUS_SUCCESS) return status;
 
     unwind_done:
@@ -507,7 +519,7 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
 
     for (;;)
     {
-        status = virtual_unwind( UNW_FLAG_UHANDLER, &dispatch, &new_context );
+        status = virtual_unwind( UNW_FLAG_UHANDLER, &dispatch, &new_context, FALSE );
         if (status != STATUS_SUCCESS) raise_status( status, rec );
 
     unwind_done:
@@ -670,6 +682,91 @@ BOOLEAN WINAPI RtlIsProcessorFeaturePresent( UINT feature )
 
     RtlRunOnceExecuteOnce( &init_once, init_cpu_features, NULL, NULL );
     return !!(cpu_features_bitmap[feature / 64] & (1ull << (feature % 64)));
+}
+
+static LONG apc_worker_started = 0;
+
+static void apc_worker_thread( void * )
+{
+    ULONG count = 0;
+    while (1) NtSuspendThread( NtCurrentThread(), &count );
+}
+
+static void suspend_remote_breakin( HANDLE thread )
+{
+    ULONG count = 0;
+    NTSTATUS status = 0;
+    /* NOTE(WOW64-SUSPEND): this tail-jumps to NULL when the loaded CPU backend
+     * (HODLL, currently wowbox64.dll) does not export BTCpuSuspendLocalThread.
+     * The contract-satisfying backend is libwow64fex.dll; select it instead of
+     * patching this path. */
+    if (pWow64SuspendLocalThread)
+        status = pWow64SuspendLocalThread( thread, &count );
+    else
+        status = NtSuspendThread( thread, &count );
+
+    if (status >= 0) status = count;
+    NtTerminateThread( GetCurrentThread(),  status );
+}
+
+/***********************************************************************
+ *              RtlWow64SuspendThread (NTDLL.@)
+ */
+NTSTATUS WINAPI RtlWow64SuspendThread( HANDLE thread, ULONG *count )
+{
+    HANDLE thread_dup;
+    THREAD_BASIC_INFORMATION tbi;
+    NTSTATUS status = NtDuplicateObject( NtCurrentProcess(), thread, NtCurrentProcess(), &thread_dup,
+                                         THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME, 0, 0 );
+    if (status) return status;
+    status = NtQueryInformationThread( thread_dup, ThreadBasicInformation, &tbi, sizeof(tbi), NULL);
+    NtClose( thread_dup );
+    if (status) return status;
+
+    if (tbi.ClientId.UniqueProcess != NtCurrentTeb()->ClientId.UniqueProcess)
+    {
+        HANDLE process;
+        HANDLE suspender_thread;
+        HANDLE remote_suspendee_thread;
+        OBJECT_ATTRIBUTES attr = { .Length = sizeof(attr) };
+
+        status = NtOpenProcess( &process, PROCESS_CREATE_THREAD | PROCESS_DUP_HANDLE, &attr, &tbi.ClientId );
+        if (status) return status;
+
+        status = NtDuplicateObject( NtCurrentProcess(), thread, process, &remote_suspendee_thread, 0, 0,
+                                    DUPLICATE_SAME_ACCESS );
+        if (status) goto err_close_proc;
+
+        status = NtCreateThreadEx( &suspender_thread, SYNCHRONIZE | THREAD_QUERY_INFORMATION, NULL, process,
+                                   suspend_remote_breakin, remote_suspendee_thread,
+                                   THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH | THREAD_CREATE_FLAGS_SKIP_LOADER_INIT |
+                                   THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER | THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE,
+                                   0, 0, 0, NULL );
+        if (status) goto err_close_remote_hnd;
+
+        NtWaitForSingleObject( suspender_thread, FALSE, NULL );
+        status = NtQueryInformationThread( suspender_thread, ThreadBasicInformation, &tbi, sizeof(tbi), NULL );
+        if (!status)
+        {
+            if (tbi.ExitStatus < 0)
+            {
+                status = tbi.ExitStatus;
+            }
+            else if (count)
+            {
+                *count = (ULONG)tbi.ExitStatus;
+            }
+        }
+
+        NtClose( suspender_thread );
+err_close_remote_hnd:
+        NtDuplicateObject( process, remote_suspendee_thread, NULL, NULL, 0, 0, DUPLICATE_CLOSE_SOURCE );
+err_close_proc:
+        NtClose( process );
+        return status;
+    }
+
+    return pWow64SuspendLocalThread( thread, count );
 }
 
 
@@ -838,6 +935,21 @@ __ASM_GLOBAL_FUNC( RtlUserThreadStart,
  */
 void WINAPI LdrInitializeThunk( CONTEXT *context, ULONG_PTR unk2, ULONG_PTR unk3, ULONG_PTR unk4 )
 {
+    extern void *__wine_syscall_dispatcher;
+    MESSAGE( "[thread-start] LdrInitializeThunk tid=%04x wow=%d dispatcher=%p\n",
+             (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+             NtCurrentTeb()->WowTebOffset, __wine_syscall_dispatcher );
+    if (NtCurrentTeb()->WowTebOffset && InterlockedCompareExchange( &apc_worker_started, 1, 0 ) == 0)
+    {
+        HANDLE handle;
+        MESSAGE( "[thread-start] creating apc_worker_thread (dispatcher=%p)\n",
+                 __wine_syscall_dispatcher );
+        NtCreateThreadEx( &handle, SYNCHRONIZE | THREAD_QUERY_INFORMATION, NULL, NtCurrentProcess(),
+                          apc_worker_thread, NULL,
+                          THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH | THREAD_CREATE_FLAGS_SKIP_LOADER_INIT |
+                          THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER, 0, 0, 0, NULL );
+    }
+
     loader_init( context, (void **)&context->X0 );
     TRACE_(relay)( "\1Starting thread proc %p (arg=%p)\n", (void *)context->X0, (void *)context->X1 );
     NtContinue( context, TRUE );

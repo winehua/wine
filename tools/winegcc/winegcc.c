@@ -151,7 +151,6 @@ struct strarray temp_files = { 0 };
 static const char *bindir;
 static const char *libdir;
 static const char *includedir;
-static const char *cc_cmd;
 static const char *wine_objdir;
 static const char *winebuild;
 static const char *lib_suffix;
@@ -404,29 +403,10 @@ static const struct tool_names tool_cpp     = { "cpp",     "clang --driver-mode=
 static const struct tool_names tool_ld      = { "ld",      "ld.lld",                  LD };
 static const struct tool_names tool_objcopy = { "objcopy", "llvm-objcopy" };
 
-static void add_clang_options( const char *target_name, struct strarray *ret )
-{
-    if (target_name)
-    {
-        strarray_add( ret, "-target" );
-        strarray_add( ret, target_name );
-    }
-    strarray_add( ret, "-Wno-unused-command-line-argument" );
-    strarray_add( ret, "-fuse-ld=lld" );
-    if (no_default_config) strarray_add( ret, "--no-default-config" );
-}
-
 static struct strarray build_tool_name( const char *target_name, struct tool_names tool )
 {
     const char *path, *str;
     struct strarray ret;
-
-    if (cc_cmd && !strncmp( tool.llvm_base, "clang", 5 ))
-    {
-        ret = strarray_fromstring( cc_cmd, " " );
-        if (is_llvm_pe_target( target )) add_clang_options( target_name, &ret );
-        return ret;
-    }
 
     if (target_name && target_version)
         str = strmake( "%s-%s-%s", target_name, tool.base, target_version );
@@ -447,7 +427,17 @@ static struct strarray build_tool_name( const char *target_name, struct tool_nam
     if (!(path = find_binary( str ))) error( "Could not find %s\n", tool.base );
 
     ret = strarray_fromstring( path, " " );
-    if (!strncmp( tool.llvm_base, "clang", 5 )) add_clang_options( target_name, &ret );
+    if (!strncmp( tool.llvm_base, "clang", 5 ))
+    {
+        if (target_name)
+        {
+            strarray_add( &ret, "-target" );
+            strarray_add( &ret, target_name );
+        }
+        strarray_add( &ret, "-Wno-unused-command-line-argument" );
+        strarray_add( &ret, "-fuse-ld=lld" );
+        if (no_default_config) strarray_add( &ret, "--no-default-config" );
+    }
     return ret;
 }
 
@@ -505,7 +495,7 @@ static struct strarray get_link_args( const char *output_name )
 {
     struct strarray link_args = get_translator();
     struct strarray flags = empty_strarray;
-    const char *version;
+    char *version;
 
     strarray_addall( &link_args, linker_args );
 
@@ -542,7 +532,7 @@ static struct strarray get_link_args( const char *output_name )
         break;
 
     case PLATFORM_MINGW:
-    case PLATFORM_WINDOWS_GNU:
+    case PLATFORM_CYGWIN:
         strarray_add( &link_args, "-nodefaultlibs" );
         strarray_add( &link_args, "-nostartfiles" );
 
@@ -588,8 +578,6 @@ static struct strarray get_link_args( const char *output_name )
         else if (!try_link( link_args, "-Wl,--file-alignment,0x1000,--section-alignment,0x1000" ))
             strarray_add( &link_args, strmake( "-Wl,--file-alignment,%s,--section-alignment,%s",
                                                file_align, section_align ));
-        strarray_add( &link_args, target.cpu == CPU_i386 ?
-                      "-Wl,--undefined,___wine_call_gcc_ctors" : "-Wl,--undefined,__wine_call_gcc_ctors" );
         strarray_addall( &link_args, flags );
         return link_args;
 
@@ -639,7 +627,6 @@ static struct strarray get_link_args( const char *output_name )
             strarray_add(&link_args, strmake("-Wl,-implib:%s", make_temp_file( output_name, ".lib" )));
 
         strarray_add( &link_args, strmake( "-Wl,-filealign:%s,-align:%s,-driver", file_align, section_align ));
-        strarray_add( &link_args, "-Wl,-merge:.CRT=.rdata" );
 
         strarray_addall( &link_args, flags );
         return link_args;
@@ -1026,6 +1013,51 @@ static char *find_static_lib( const char *dll )
     return NULL;
 }
 
+static const char *find_libgcc(void)
+{
+    const char *out = make_temp_file( "find_libgcc", ".out" );
+    const char *err = make_temp_file( "find_libgcc", ".err" );
+    struct strarray link = get_translator();
+    int sout = -1, serr = -1;
+    char *libgcc, *p;
+    struct stat st;
+    size_t cnt;
+    int ret;
+
+    STRARRAY_FOR_EACH( arg, &linker_args )
+	if (strcmp(arg, "--no-default-config" )) strarray_add( &link, arg );
+
+    strarray_add( &link, "-print-libgcc-file-name" );
+
+    sout = dup( fileno(stdout) );
+    freopen( out, "w", stdout );
+    serr = dup( fileno(stderr) );
+    freopen( err, "w", stderr );
+    ret = spawn( link, 1 );
+    if (sout >= 0)
+    {
+        dup2( sout, fileno(stdout) );
+        close( sout );
+    }
+    if (serr >= 0)
+    {
+        dup2( serr, fileno(stderr) );
+        close( serr );
+    }
+
+    if (ret || stat(out, &st) || !st.st_size) return NULL;
+
+    libgcc = xmalloc(st.st_size + 1);
+    sout = open(out, O_RDONLY);
+    if (sout == -1) return NULL;
+    cnt = read(sout, libgcc, st.st_size);
+    close(sout);
+    libgcc[cnt] = 0;
+    if ((p = strchr(libgcc, '\n'))) *p = 0;
+    return libgcc;
+}
+
+
 /* add specified library to the list of files */
 static void add_library( struct strarray lib_dirs, struct strarray *files, const char *library )
 {
@@ -1168,6 +1200,7 @@ static void build(struct strarray input_files, const char *output)
     struct strarray link_args;
     char *output_file;
     const char *output_name, *spec_file, *lang;
+    const char *libgcc = NULL;
     int generate_app_loader = 1;
     const char *crt_lib = NULL;
 
@@ -1285,15 +1318,10 @@ static void build(struct strarray input_files, const char *output)
         add_library(lib_dirs, &files, "advapi32");
         add_library(lib_dirs, &files, "user32");
         add_library(lib_dirs, &files, "winecrt0");
-        if (is_pe) add_library(lib_dirs, &files, "compiler-rt");
+        if (target.platform == PLATFORM_WINDOWS)
+            add_library(lib_dirs, &files, "compiler-rt");
         if (use_msvcrt)
         {
-            if (processor == proc_cxx)
-            {
-                add_library(lib_dirs, &files, "c++");
-                add_library(lib_dirs, &files, "msvcp140");
-                add_library(lib_dirs, &files, "vcruntime140");
-            }
             if (!crt_lib)
             {
                 if (strncmp( output_name, "msvcr", 5 ) &&
@@ -1342,6 +1370,18 @@ static void build(struct strarray input_files, const char *output)
 
     /* link everything together now */
     link_args = get_link_args( output_name );
+
+    switch (target.platform)
+    {
+    case PLATFORM_MINGW:
+    case PLATFORM_CYGWIN:
+        libgcc = find_libgcc();
+        if (!libgcc) libgcc = "-lgcc";
+        break;
+    default:
+        break;
+    }
+
     strarray_add(&link_args, "-o");
     strarray_add(&link_args, output_file_name);
 
@@ -1396,6 +1436,8 @@ static void build(struct strarray input_files, const char *output)
 	strarray_add(&link_args, "-lm");
 	strarray_add(&link_args, "-lc");
     }
+
+    if (libgcc) strarray_add(&link_args, libgcc);
 
     atexit( cleanup_output_files );
 
@@ -1641,8 +1683,7 @@ int main(int argc, char **argv)
                     next_is_arg = strcmp("-target", args.str[i]) == 0;
                     break;
 		case '-':
-		    next_is_arg = (strcmp("--cc-cmd", args.str[i]) == 0 ||
-                                   strcmp("--param", args.str[i]) == 0 ||
+		    next_is_arg = (strcmp("--param", args.str[i]) == 0 ||
                                    strcmp("--sysroot", args.str[i]) == 0 ||
                                    strcmp("--target", args.str[i]) == 0 ||
                                    strcmp("--wine-objdir", args.str[i]) == 0 ||
@@ -1927,11 +1968,6 @@ int main(int argc, char **argv)
                     {
                         no_default_config = true;
                         raw_compiler_arg = raw_linker_arg = 1;
-                    }
-                    else if (is_option( args, i, "--cc-cmd", &option_arg ))
-                    {
-                        cc_cmd = option_arg;
-                        raw_compiler_arg = raw_linker_arg = 0;
                     }
                     else if (is_option( args, i, "--sysroot", &option_arg ))
                     {

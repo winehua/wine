@@ -182,7 +182,6 @@ static void ANIMATE_Free(ANIMATE_INFO *infoPtr)
     {
         ANIMATE_DoStop(infoPtr);
         mmioClose(infoPtr->hMMio, 0);
-        infoPtr->hMMio = NULL;
         if (infoPtr->hRes)
         {
             FreeResource(infoPtr->hRes);
@@ -694,7 +693,7 @@ static BOOL ANIMATE_OpenW(ANIMATE_INFO *infoPtr, HINSTANCE hInstance, LPWSTR lps
     {
 	TRACE("Closing avi.\n");
         /* installer of thebat! v1.62 requires FALSE here */
-	return FALSE;
+	return (infoPtr->hMMio != 0);
     }
 
     if (!hInstance)

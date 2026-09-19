@@ -26,8 +26,10 @@
 
 #include <pthread.h>
 #include <assert.h>
+#include <stdlib.h>
 
 #include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "ntgdi_private.h"
 #include "ntuser_private.h"
 #include "winreg.h"
@@ -165,7 +167,19 @@ static INT64 last_query_display_time;
 static UINT64 monitor_update_serial;
 static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static BOOL emulate_modeset;
+static BOOL emulate_modelist = TRUE;
+static BOOL emulate_modeset = TRUE;
+static UINT limit_resolutions = 0;
+
+/* winehua: per-process simulated ChangeDisplaySettings in virtual desktop mode.
+ * gated by the WINEHUA_SIMULATE_RESOLUTION environment variable (default off).
+ * When the calling process changes the display settings, the requested mode is
+ * recorded here and reported back to the same process (EnumDisplaySettings,
+ * SM_CXSCREEN, MONITORINFO.rcMonitor, ...) instead of the virtual desktop size.
+ * Other processes have their own win32u instance and are not affected. */
+static BOOL simulate_resolution;
+static BOOL resolution_override_valid;
+static DEVMODEW resolution_override;
 BOOL decorated_mode = TRUE;
 UINT64 thunk_lock_callback = 0;
 
@@ -302,6 +316,67 @@ static pthread_mutex_t display_dc_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t user_mutex;
 static unsigned int user_lock_thread, user_lock_rec;
 
+#define GAMMA_RAMP_SIZE 256
+
+static WORD gamma_ramp_i[GAMMA_RAMP_SIZE * 3];
+static float gamma_ramp[GAMMA_RAMP_SIZE * 4];
+static LONG gamma_serial;
+
+BOOL get_float_gamma_ramp( float *data, LONG *serial )
+{
+    pthread_mutex_lock( &display_lock );
+    if ((*serial = gamma_serial)) memcpy( data, gamma_ramp, sizeof(gamma_ramp) );
+    pthread_mutex_unlock( &display_lock );
+    return !!*serial;
+}
+
+BOOL get_global_gamma_ramp( void *data )
+{
+    pthread_mutex_lock( &display_lock );
+    memcpy( data, gamma_ramp_i, sizeof(gamma_ramp_i) );
+    pthread_mutex_unlock( &display_lock );
+    return TRUE;
+}
+
+BOOL set_global_gamma_ramp( void *data )
+{
+    const WORD *ramp = data;
+    int i;
+
+    pthread_mutex_lock( &display_lock );
+
+    if (!memcmp( gamma_ramp_i, ramp, sizeof(gamma_ramp_i) )) goto done;
+    for (i = 0; i < GAMMA_RAMP_SIZE; ++i)
+    {
+        gamma_ramp[i * 4] = ramp[i] / 65535.f;
+        gamma_ramp[i * 4 + 1] = ramp[i + GAMMA_RAMP_SIZE] / 65535.f;
+        gamma_ramp[i * 4 + 2] = ramp[i + 2 * GAMMA_RAMP_SIZE] / 65535.f;
+    }
+    memcpy( gamma_ramp_i, ramp, sizeof(gamma_ramp_i) );
+    if (!++gamma_serial) gamma_serial = 1;
+    TRACE( "new gamma serial: %u\n", gamma_serial );
+
+done:
+    pthread_mutex_unlock( &display_lock );
+    return TRUE;
+}
+
+static void init_default_gamma_ramp(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < GAMMA_RAMP_SIZE; ++i)
+    {
+        int default_value = i * 65535 / (GAMMA_RAMP_SIZE - 1);
+        gamma_ramp_i[i] = default_value;
+        gamma_ramp_i[i + GAMMA_RAMP_SIZE] = default_value;
+        gamma_ramp_i[i + 2 * GAMMA_RAMP_SIZE] = default_value;
+        gamma_ramp[i * 4] = gamma_ramp_i[i] / 65535.f;
+        gamma_ramp[i * 4 + 1] = gamma_ramp_i[i + GAMMA_RAMP_SIZE] / 65535.f;
+        gamma_ramp[i * 4 + 2] = gamma_ramp_i[i + 2 * GAMMA_RAMP_SIZE] / 65535.f;
+    }
+}
+
 void user_lock(void)
 {
     pthread_mutex_lock( &user_mutex );
@@ -332,7 +407,7 @@ static HANDLE get_display_device_init_mutex( void )
     HANDLE mutex;
 
     snprintf( buffer, ARRAY_SIZE(buffer), "\\Sessions\\%u\\BaseNamedObjects\\display_device_init",
-              RtlGetCurrentPeb()->SessionId );
+              NtCurrentTeb()->Peb->SessionId );
     name.MaximumLength = asciiz_to_unicode( bufferW, buffer );
     name.Length = name.MaximumLength - sizeof(WCHAR);
 
@@ -1113,10 +1188,10 @@ static const char* driver_vendor_to_version( UINT16 vendor )
     /* The last seven digits are the driver number. */
     switch (vendor)
     {
-    case 0x8086: /* Intel */    return "35.0.101.6314";
-    case 0x1002: /* AMD */      return "35.0.21025.1024";
-    case 0x10de: /* Nvidia */   return "35.0.15.6094";
-    default:                    return "35.0.10.1000";
+    case 0x8086: /* Intel */    return "35.0.999.9999";
+    case 0x1002: /* AMD */      return "35.0.99999.9999";
+    case 0x10de: /* Nvidia */   return "35.0.99.9999";
+    default:                    return "35.0.99.9999";
     }
 }
 
@@ -1456,7 +1531,6 @@ const char *gpu_device_name( UINT16 vendor, UINT16 device, const char *default_n
     case MAKELONG(0x8086, 0x193d): return "Intel(R) Iris(TM) Pro Graphics P580";
     case MAKELONG(0x8086, 0x87c0): return "Intel(R) UHD Graphics 617";
     case MAKELONG(0x8086, 0x3ea0): return "Intel(R) UHD Graphics 620";
-    case MAKELONG(0x8086, 0x5917): return "Intel(R) UHD Graphics 620";
     case MAKELONG(0x8086, 0x591e): return "Intel(R) HD Graphics 615";
     case MAKELONG(0x8086, 0x5916): return "Intel(R) HD Graphics 620";
     case MAKELONG(0x8086, 0x5912): return "Intel(R) HD Graphics 630";
@@ -1643,12 +1717,14 @@ static BOOL write_gpu_to_registry( const struct gpu *gpu, const struct pci_id *p
         set_reg_value( hkey, bufferW, REG_SZ, gpu->name, name_size );
         if (pci->vendor && pci->device)
         {
+            DWORD val;
+
             asciiz_to_unicode( bufferW, "DeviceId" );
-            value = pci->device;
-            set_reg_value( hkey, bufferW, REG_DWORD, &value, sizeof(value) );
+            val = pci->device;
+            set_reg_value( hkey, bufferW, REG_DWORD, &val, sizeof(val) );
             asciiz_to_unicode( bufferW, "VendorId" );
-            value = pci->vendor;
-            set_reg_value( hkey, bufferW, REG_DWORD, &value, sizeof(value) );
+            val = pci->vendor;
+            set_reg_value( hkey, bufferW, REG_DWORD, &val, sizeof(val) );
         }
         NtClose( hkey );
     }
@@ -1675,6 +1751,38 @@ static struct gpu_info *find_gpu_info_from_pci_id( const struct list *infos, con
         if (gpu->pci_id.vendor == pci_id->vendor && gpu->pci_id.device == pci_id->device) return gpu;
 
     return NULL;
+}
+
+void fixup_device_id( const struct pci_id **pci_id )
+{
+    static struct pci_id fake_id;
+    const char *sgi;
+
+    if ((*pci_id)->vendor == 0x10de /* NVIDIA */ && (sgi = getenv("WINE_HIDE_NVIDIA_GPU")) && *sgi != '0')
+    {
+        fake_id.vendor = 0x1002; /* AMD */
+        fake_id.device = 0x73df; /* RX 6700XT */
+        *pci_id = &fake_id;
+    }
+    else if ((*pci_id)->vendor == 0x1002 /* AMD */ && (sgi = getenv("WINE_HIDE_AMD_GPU")) && *sgi != '0')
+    {
+        fake_id.vendor = 0x10de; /* NVIDIA */
+        fake_id.device = 0x2487; /* RTX 3060 */
+        *pci_id = &fake_id;
+    }
+    else if ((*pci_id)->vendor == 0x1002 && ((*pci_id)->device == 0x163f || (*pci_id)->device == 0x1435)
+             && (sgi = getenv("WINE_HIDE_VANGOGH_GPU")) && *sgi != '0')
+    {
+        fake_id.vendor = (*pci_id)->vendor;
+        fake_id.device = 0x687f; /* Radeon RX Vega 56/64 */
+        *pci_id = &fake_id;
+    }
+    else if ((*pci_id)->vendor == 0x8086 /* Intel */ && (sgi = getenv("WINE_HIDE_INTEL_GPU")) && *sgi != '0')
+    {
+        fake_id.vendor = 0x1002; /* AMD */
+        fake_id.device = 0x73df; /* RX 6700XT */
+        *pci_id = &fake_id;
+    }
 }
 
 static struct gpu_info *find_gpu_info( const struct list *infos, const GUID *uuid, const struct pci_id *pci_id )
@@ -1743,6 +1851,7 @@ static void add_gpu( const char *name, const struct pci_id *pci_id, const GUID *
 
     if (!pci_id->vendor && !pci_id->device && vulkan_gpu) pci_id = &vulkan_gpu->pci_id;
     if (!pci_id->vendor && !pci_id->device && opengl_gpu) pci_id = &opengl_gpu->pci_id;
+    fixup_device_id( &pci_id );
 
     name = gpu_device_name( pci_id->vendor, pci_id->device, name );
     if (!strcmp( name, "Wine Adapter" ) && vulkan_gpu) name = vulkan_gpu->name;
@@ -2035,27 +2144,50 @@ static UINT add_screen_size( SIZE *sizes, UINT count, SIZE size )
     return 1;
 }
 
-static UINT add_virtual_mode( DEVMODEW *modes, UINT count, const DEVMODEW *mode )
+static BOOL virtual_mode_fits_compatibility_envelope( const DEVMODEW *maximum, UINT width, UINT height )
 {
-    TRACE( "adding mode %s\n", debugstr_devmodew(mode) );
+    static const SIZE compatibility_envelope = {1280, 800};
+    UINT maximum_width = devmode_get( maximum, DM_PELSWIDTH );
+    UINT maximum_height = devmode_get( maximum, DM_PELSHEIGHT );
+    SIZE physical = {max( maximum_width, maximum_height ), min( maximum_width, maximum_height )};
+    SIZE candidate = {max( width, height ), min( width, height )};
+
+    /* A single-mode host is already using Wine's virtual modeset path. Keep a
+     * 1280x800 logical envelope so 1024x768 remains available on 720-line
+     * widescreen outputs; the host compositor scales it to the physical mode. */
+    return (candidate.cx <= physical.cx && candidate.cy <= physical.cy) ||
+           (candidate.cx <= compatibility_envelope.cx && candidate.cy <= compatibility_envelope.cy);
+}
+
+static UINT add_virtual_mode( DEVMODEW *modes, UINT count, const DEVMODEW *mode, BOOL center )
+{
+    TRACE( "adding %s\n", debugstr_devmodew(mode) );
+    modes[count++] = *mode;
+    if (!center) return 1;
+
     modes[count] = *mode;
-    return 1;
+    modes[count].dmFields |= DM_DISPLAYFIXEDOUTPUT;
+    modes[count].dmDisplayFixedOutput = DMDFO_CENTER;
+    return 2;
 }
 
 static SIZE *get_screen_sizes( const DEVMODEW *maximum, const DEVMODEW *modes, UINT modes_count,
                                UINT *sizes_count )
 {
-    static SIZE default_sizes[] =
+    static SIZE lowres_sizes[] =
     {
         /* 4:3 */
         { 640,  480},
-        { 800,  600},
-        {1024,  768},
-        {1152,  864},
-        {1280,  960},
-        {1600, 1200},
         /* 16:9 */
         { 960,  540},
+    };
+    static SIZE default_sizes[] =
+    {
+        /* 4:3 */
+        { 800,  600},
+        {1024,  768},
+        {1600, 1200},
+        /* 16:9 */
         {1280,  720},
         {1600,  900},
         {1920, 1080},
@@ -2063,6 +2195,7 @@ static SIZE *get_screen_sizes( const DEVMODEW *maximum, const DEVMODEW *modes, U
         {2880, 1620},
         {3200, 1800},
         /* 16:10 */
+        {1280,  800},
         {1440,  900},
         {1680, 1050},
         {1920, 1200},
@@ -2077,33 +2210,42 @@ static SIZE *get_screen_sizes( const DEVMODEW *maximum, const DEVMODEW *modes, U
         {3840, 1600},
         /* 5:4 */
         {1280, 1024},
-        /* 5:3 */
-        {1280,  768},
     };
     UINT max_width = devmode_get( maximum, DM_PELSWIDTH ), max_height = devmode_get( maximum, DM_PELSHEIGHT );
     SIZE *sizes, max_size = {.cx = max( max_width, max_height ), .cy = min( max_width, max_height )};
     const DEVMODEW *mode;
+    BOOL enable_lowres;
     UINT i, count;
 
-    count = 1 + ARRAY_SIZE(default_sizes) + modes_count;
+    const char *env;
+
+    count = 1 + ARRAY_SIZE(default_sizes) + ARRAY_SIZE(lowres_sizes) + modes_count;
     if (!(sizes = malloc( count * sizeof(*sizes) ))) return NULL;
 
     count = add_screen_size( sizes, 0, max_size );
     for (i = 0; i < ARRAY_SIZE(default_sizes); i++)
     {
-        if (default_sizes[i].cx > max_size.cx || default_sizes[i].cy > max_size.cy) continue;
+        if (!virtual_mode_fits_compatibility_envelope( maximum, default_sizes[i].cx, default_sizes[i].cy )) continue;
         count += add_screen_size( sizes, count, default_sizes[i] );
+    }
+
+    /* Titan Souls renders incorrectly if we report modes smaller than 800x600 */
+    if ((enable_lowres = (!(env = getenv( "SteamAppId" )) || (strcmp( env, "297130" ) && strcmp( env, "403640" )))))
+    {
+        memcpy( sizes + count, lowres_sizes, ARRAY_SIZE(lowres_sizes) * sizeof(*sizes) );
+        count += ARRAY_SIZE(lowres_sizes);
     }
 
     for (mode = modes; mode && modes_count; mode = NEXT_DEVMODEW(mode), modes_count--)
     {
         UINT width = devmode_get( mode, DM_PELSWIDTH ), height = devmode_get( mode, DM_PELSHEIGHT );
         SIZE size = {.cx = max( width, height ), .cy = min( width, height )};
-        if (!size.cx || size.cx > max_size.cx) continue;
-        if (!size.cy || size.cy > max_size.cy) continue;
+        if (!size.cx || (size.cx < 800 && !enable_lowres) || size.cx > max_size.cx) continue;
+        if (!size.cy || (size.cy < 600 && !enable_lowres) || size.cy > max_size.cy) continue;
         count += add_screen_size( sizes, count, size );
     }
 
+    if (limit_resolutions && count > limit_resolutions) count = limit_resolutions;
     *sizes_count = count;
     return sizes;
 }
@@ -2116,16 +2258,39 @@ static DEVMODEW *get_virtual_modes( const DEVMODEW *initial, const DEVMODEW *max
     SIZE *screen_sizes;
     BOOL vertical;
 
+    BOOL center_modes = FALSE;
+    const char *env;
+
     /* Check the ratio of dmPelsWidth to dmPelsHeight to determine whether the initial display mode
      * is in horizontal or vertical orientation. DMDO_DEFAULT is the natural orientation of the
      * device, which isn't necessarily a horizontal mode */
     vertical = initial->dmPelsHeight > initial->dmPelsWidth;
 
+    if ((env = getenv( "WINE_CENTER_DISPLAY_MODES" )))
+        center_modes = (env[0] != '0');
+    else if ((env = getenv( "SteamAppId" )))
+        center_modes = !strcmp( env, "359870" );
+
     freqs[1] = devmode_get( initial, DM_DISPLAYFREQUENCY );
     if (freqs[1] <= 60) freqs[1] = 0;
 
     if (!(screen_sizes = get_screen_sizes( maximum, host_modes, host_modes_count, &sizes_count ))) return NULL;
-    modes = malloc( ARRAY_SIZE(freqs) * ARRAY_SIZE(depths) * (sizes_count + 2) * sizeof(*modes) );
+    modes = malloc( (2 * ARRAY_SIZE(freqs) * ARRAY_SIZE(depths) * (sizes_count + 2) + 1) * sizeof(*modes) );
+
+    if ((env = getenv( "SteamAppId" )) && !strcmp( env, "403640" ))
+    {
+        DEVMODEW mode =
+        {
+            .dmSize = sizeof(mode),
+            .dmFields = DM_DISPLAYORIENTATION | DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY,
+            .dmDisplayFrequency = 30,
+            .dmBitsPerPel = 32,
+            .dmDisplayOrientation = initial->dmDisplayOrientation,
+            .dmPelsWidth = 800,
+            .dmPelsHeight = 600,
+        };
+        count += add_virtual_mode( modes, count, &mode, center_modes );
+    }
 
     for (i = 0; modes && i < ARRAY_SIZE(depths); ++i)
     for (f = 0; f < ARRAY_SIZE(freqs); ++f)
@@ -2145,21 +2310,21 @@ static DEVMODEW *get_virtual_modes( const DEVMODEW *initial, const DEVMODEW *max
             mode.dmPelsWidth = vertical ? screen_sizes[j].cy : screen_sizes[j].cx;
             mode.dmPelsHeight = vertical ? screen_sizes[j].cx : screen_sizes[j].cy;
 
-            if (mode.dmPelsWidth > maximum->dmPelsWidth || mode.dmPelsHeight > maximum->dmPelsHeight) continue;
+            if (!virtual_mode_fits_compatibility_envelope( maximum, mode.dmPelsWidth, mode.dmPelsHeight )) continue;
             if (mode.dmPelsWidth == maximum->dmPelsWidth && mode.dmPelsHeight == maximum->dmPelsHeight) continue;
             if (mode.dmPelsWidth == initial->dmPelsWidth && mode.dmPelsHeight == initial->dmPelsHeight) continue;
-            count += add_virtual_mode( modes, count, &mode );
+            count += add_virtual_mode( modes, count, &mode, center_modes );
         }
 
         mode.dmPelsWidth = vertical ? initial->dmPelsHeight : initial->dmPelsWidth;
         mode.dmPelsHeight = vertical ? initial->dmPelsWidth : initial->dmPelsHeight;
-        count += add_virtual_mode( modes, count, &mode );
+        count += add_virtual_mode( modes, count, &mode, center_modes );
 
         if (maximum->dmPelsWidth != initial->dmPelsWidth || maximum->dmPelsHeight != initial->dmPelsHeight)
         {
             mode.dmPelsWidth = vertical ? maximum->dmPelsHeight : maximum->dmPelsWidth;
             mode.dmPelsHeight = vertical ? maximum->dmPelsWidth : maximum->dmPelsHeight;
-            count += add_virtual_mode( modes, count, &mode );
+            count += add_virtual_mode( modes, count, &mode, center_modes );
         }
     }
 
@@ -2187,6 +2352,23 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
         modes = current;
         modes_count = 1;
     }
+    else if (emulate_modelist)
+    {
+        physical = *current;
+        if ((virtual_modes = get_virtual_modes( current, &physical, host_modes, host_modes_count, &virtual_count )))
+        {
+            modes_count = virtual_count;
+            modes = virtual_modes;
+        }
+
+        /* HACK: Gamescope doesn't really changes the display mode, pretend it changed to what was requested */
+        if (user_driver->pHasWindowManager( "steamcompmgr" ) && read_source_mode( source->key, ENUM_CURRENT_SETTINGS, &virtual ))
+        {
+            WARN( "Faking current mode to %s\n", debugstr_devmodew(&virtual) );
+            current = &virtual;
+            detached = *current;
+        }
+    }
 
     physical = modes_count == 1 ? *modes : *current;
     if (ctx->is_primary) ctx->primary = *current;
@@ -2198,7 +2380,7 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
     if (modes_count > 1 || current == &detached)
     {
         reg_delete_value( source->key, physicalW );
-        virtual_modes = NULL;
+        if (!emulate_modelist) virtual_modes = NULL;
     }
     else
     {
@@ -2303,23 +2485,57 @@ static void monitor_virt_to_raw_ratio( struct monitor *monitor, UINT *num, UINT 
     }
 }
 
+static UINT gcd( UINT a, UINT b )
+{
+    int r;
+
+    while (1)
+    {
+        if (!a) return b;
+        if (!b) return a;
+        r = a % b;
+        a = b;
+        b = r;
+    }
+}
+
 /* display_lock must be held */
 static UINT monitor_get_dpi( struct monitor *monitor, MONITOR_DPI_TYPE type, UINT *dpi_x, UINT *dpi_y )
 {
     struct source *source = monitor->source;
-    float scale_x = 1.0, scale_y = 1.0;
-    UINT dpi;
+    UINT dpi, dpi_ret;
 
     if (!source || !(dpi = source->dpi)) dpi = system_dpi;
     if (source && type != MDT_EFFECTIVE_DPI)
     {
-        scale_x = source->physical.dmPelsWidth / (float)source->current.dmPelsWidth;
-        scale_y = source->physical.dmPelsHeight / (float)source->current.dmPelsHeight;
-    }
+        UINT num, den, d;
 
-    *dpi_x = round( dpi * scale_x );
-    *dpi_y = round( dpi * scale_y );
-    return min( *dpi_x, *dpi_y );
+        num = source->physical.dmPelsWidth;
+        den = source->current.dmPelsWidth;
+        d = gcd( num * dpi, den );
+        assert( num * dpi / d < 65536 );
+        assert( den / d < 65536 );
+        den /= d;
+        if (den == 1) den = 0;
+        *dpi_x = (den << 16) | (num * dpi / d);
+
+        num = source->physical.dmPelsHeight;
+        den = source->current.dmPelsHeight;
+        d = gcd( num * dpi, den );
+        assert( num * dpi / d < 65536 );
+        assert( den / d < 65536 );
+        den /= d;
+        if (den == 1) den = 0;
+        *dpi_y = (den << 16) | (num * dpi / d);
+        if (source->physical.dmPelsWidth * source->current.dmPelsHeight <=
+            source->physical.dmPelsHeight * source->current.dmPelsWidth)
+            dpi_ret = *dpi_x;
+        else
+            dpi_ret = *dpi_y;
+    }
+    else dpi_ret = *dpi_x = *dpi_y = dpi;
+
+    return dpi_ret;
 }
 
 /* display_lock must be held */
@@ -2343,7 +2559,7 @@ static RECT map_monitor_rect( struct monitor *monitor, RECT rect, UINT dpi_from,
         if (!dpi_from) dpi_from = dpi;
         if (!dpi_to) dpi_to = dpi;
 
-        if (type_from == MDT_RAW_DPI)
+        if (type_from == MDT_RAW_DPI || type_from == MDT_WINE_RAW_DPI)
         {
             monitor_virt_to_raw_ratio( monitor, &den, &num );
             from[0] = physical_mode.dmPosition.x + physical_mode.dmPelsWidth / 2.0;
@@ -2380,10 +2596,26 @@ static RECT map_monitor_rect( struct monitor *monitor, RECT rect, UINT dpi_from,
     return map_dpi_rect( rect, dpi_from, dpi_to );
 }
 
+/* winehua: record / report the per-process simulated display mode. */
+static void set_resolution_override( const DEVMODEW *mode )
+{
+    resolution_override_valid = simulate_resolution && !!mode;
+    if (resolution_override_valid) resolution_override = *mode;
+}
+
+static BOOL get_resolution_override( DEVMODEW *mode )
+{
+    if (!resolution_override_valid) return FALSE;
+    memcpy( &mode->dmFields, &resolution_override.dmFields,
+            offsetof(DEVMODEW, dmICMMethod) - offsetof(DEVMODEW, dmFields) );
+    return TRUE;
+}
+
 /* display_lock must be held */
 static RECT monitor_get_rect( struct monitor *monitor, UINT dpi, MONITOR_DPI_TYPE type )
 {
     DEVMODEW current_mode = {.dmSize = sizeof(DEVMODEW)};
+    DEVMODEW override_mode;
     RECT rect = {0, 0, 1024, 768};
     struct source *source;
     UINT dpi_from, x, y;
@@ -2391,6 +2623,18 @@ static RECT monitor_get_rect( struct monitor *monitor, UINT dpi, MONITOR_DPI_TYP
 
     /* services do not have any adapters, only a virtual monitor */
     if (!(source = monitor->source)) return rect;
+
+    /* winehua: report the simulated resolution in the app-visible MDT_DEFAULT
+     * space only; MDT_RAW_DPI / MDT_EFFECTIVE_DPI stay real so the driver keeps
+     * placing windows at the correct raw coordinates */
+    if (type == MDT_DEFAULT && get_resolution_override( &override_mode ))
+    {
+        SetRect( &rect, override_mode.dmPosition.x, override_mode.dmPosition.y,
+                 override_mode.dmPosition.x + override_mode.dmPelsWidth,
+                 override_mode.dmPosition.y + override_mode.dmPelsHeight );
+        dpi_from = monitor_get_dpi( monitor, type, &x, &y );
+        return map_dpi_rect( rect, dpi_from, dpi );
+    }
 
     SetRectEmpty( &rect );
     if (!(source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) return rect;
@@ -2852,6 +3096,8 @@ static BOOL lock_display_devices( BOOL force )
 
     init_display_driver(); /* make sure to load the driver before anything else */
 
+    if (user_driver->pHasWindowManager( "steamcompmgr" )) emulate_modeset = FALSE;
+
     pthread_mutex_lock( &display_lock );
 
     serial = get_monitor_update_serial();
@@ -2958,14 +3204,19 @@ static struct monitor *get_monitor_from_rect( RECT rect, UINT flags, UINT dpi, M
     LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
     {
         RECT intersect, monitor_rect;
+        UINT density, raw_dpi, x, y;
 
         if (!is_monitor_active( monitor ) || monitor->is_clone) continue;
+        raw_dpi = monitor_get_dpi( monitor, MDT_RAW_DPI, &x, &y );
+        x = round_fractional_dpi( x );
+        y = round_fractional_dpi( y );
+        density = raw_dpi * raw_dpi / 96 / 96;
 
         monitor_rect = monitor_get_rect( monitor, dpi, type );
         if (intersect_rect( &intersect, &monitor_rect, &rect ))
         {
             /* check for larger intersecting area */
-            UINT area = (intersect.right - intersect.left) * (intersect.bottom - intersect.top);
+            UINT area = (intersect.right - intersect.left) * (intersect.bottom - intersect.top) * density;
             if (area > max_area)
             {
                 max_area = area;
@@ -3174,11 +3425,10 @@ static BOOL is_valid_dpi_awareness_context( UINT context, UINT dpi )
 
 UINT get_thread_dpi_awareness_context(void)
 {
-    struct user_thread_info *info = get_user_thread_info();
+    struct ntuser_thread_info *info = NtUserGetThreadInfo();
     UINT context;
 
-    if (!info->client_info || !(context = info->client_info->dpi_context))
-        context = ReadNoFence( &dpi_context );
+    if (!(context = info->dpi_context)) context = ReadNoFence( &dpi_context );
     return context ? context : NTUSER_DPI_UNAWARE;
 }
 
@@ -3211,7 +3461,7 @@ UINT get_system_dpi(void)
 /* keep in sync with user32 */
 UINT set_thread_dpi_awareness_context( UINT context )
 {
-    struct user_thread_info *info = get_user_thread_info();
+    struct ntuser_thread_info *info = NtUserGetThreadInfo();
     UINT prev;
 
     if (!is_valid_dpi_awareness_context( context, system_dpi ))
@@ -3220,13 +3470,25 @@ UINT set_thread_dpi_awareness_context( UINT context )
         return 0;
     }
 
-    if (!info->client_info) return 0;
-    if (!(prev = info->client_info->dpi_context))
-        prev = NtUserGetProcessDpiAwarenessContext( GetCurrentProcess() ) | NTUSER_DPI_CONTEXT_FLAG_PROCESS;
-    if (NTUSER_DPI_CONTEXT_GET_FLAGS( context ) & NTUSER_DPI_CONTEXT_FLAG_PROCESS) info->client_info->dpi_context = 0;
-    else info->client_info->dpi_context = context;
+    if (!(prev = info->dpi_context)) prev = NtUserGetProcessDpiAwarenessContext( GetCurrentProcess() ) | NTUSER_DPI_CONTEXT_FLAG_PROCESS;
+    if (NTUSER_DPI_CONTEXT_GET_FLAGS( context ) & NTUSER_DPI_CONTEXT_FLAG_PROCESS) info->dpi_context = 0;
+    else info->dpi_context = context;
 
     return prev;
+}
+
+static void get_dpi_num_den( UINT dpi, UINT *num, UINT *den )
+{
+    if (!(*den = (dpi >> 16))) *den = 1;
+    *num = dpi & 0xffff;
+}
+
+UINT round_fractional_dpi( UINT dpi )
+{
+    UINT num, den;
+
+    get_dpi_num_den( dpi, &num, &den );
+    return (num + den / 2) / den;
 }
 
 /**********************************************************************
@@ -3234,12 +3496,16 @@ UINT set_thread_dpi_awareness_context( UINT context )
  */
 RECT map_dpi_rect( RECT rect, UINT dpi_from, UINT dpi_to )
 {
+    UINT from_num, from_den, to_num, to_den;
+
     if (dpi_from && dpi_to && dpi_from != dpi_to)
     {
-        rect.left   = muldiv( rect.left, dpi_to, dpi_from );
-        rect.top    = muldiv( rect.top, dpi_to, dpi_from );
-        rect.right  = muldiv( rect.right, dpi_to, dpi_from );
-        rect.bottom = muldiv( rect.bottom, dpi_to, dpi_from );
+        get_dpi_num_den( dpi_from, &from_num, &from_den );
+        get_dpi_num_den( dpi_to, &to_num, &to_den );
+        rect.left   = muldiv( rect.left, to_num * from_den, from_num * to_den );
+        rect.top    = muldiv( rect.top, to_num * from_den, from_num * to_den );
+        rect.right  = muldiv( rect.right, to_num * from_den, from_num * to_den );
+        rect.bottom = muldiv( rect.bottom, to_num * from_den, from_num * to_den );
     }
     return rect;
 }
@@ -3283,10 +3549,14 @@ struct window_rects map_dpi_window_rects( struct window_rects rects, UINT dpi_fr
  */
 POINT map_dpi_point( POINT pt, UINT dpi_from, UINT dpi_to )
 {
+    UINT from_num, from_den, to_num, to_den;
+
     if (dpi_from && dpi_to && dpi_from != dpi_to)
     {
-        pt.x = muldiv( pt.x, dpi_to, dpi_from );
-        pt.y = muldiv( pt.y, dpi_to, dpi_from );
+        get_dpi_num_den( dpi_from, &from_num, &from_den );
+        get_dpi_num_den( dpi_to, &to_num, &to_den );
+        pt.x = muldiv( pt.x, to_num * from_den, from_num * to_den );
+        pt.y = muldiv( pt.y, to_num * from_den, from_num * to_den );
     }
     return pt;
 }
@@ -4377,7 +4647,7 @@ static LONG apply_display_settings( struct source *target, const DEVMODEW *devmo
     struct source *primary, *source;
     DEVMODEW *mode, *displays;
     HWND restorer_window;
-    LONG ret;
+    UINT ret;
 
     if (!lock_display_devices( FALSE )) return DISP_CHANGE_FAILED;
     if (!(displays = get_display_settings( target, devmode )))
@@ -4406,7 +4676,10 @@ static LONG apply_display_settings( struct source *target, const DEVMODEW *devmo
 
     /* use the default implementation in virtual desktop mode */
     if (is_virtual_desktop() || emulate_modeset) ret = DISP_CHANGE_SUCCESSFUL;
+    /* HACK: Gamescope doesn't really changes the display mode, no point even trying as it sometimes fails with emulated mode list */
+    else if (user_driver->pHasWindowManager( "steamcompmgr" )) ret = DISP_CHANGE_SUCCESSFUL;
     else ret = user_driver->pChangeDisplaySettings( displays, primary_name, hwnd, flags, lparam );
+    if (ret != DISP_CHANGE_SUCCESSFUL) WARN( "Failed to change display settings, ret %d\n", ret );
 
     if (ret == DISP_CHANGE_SUCCESSFUL)
     {
@@ -4445,6 +4718,19 @@ LONG WINAPI NtUserChangeDisplaySettings( UNICODE_STRING *devname, DEVMODEW *devm
     DEVMODEW full_mode = {.dmSize = sizeof(DEVMODEW)};
     int ret = DISP_CHANGE_SUCCESSFUL;
     struct source *source;
+
+    /* winehua: 模拟分辨率开启时, CDS 即"记录请求模式" (虚拟桌面语义: 不真正
+     * 切换)。不依赖 apply_display_settings 的虚拟桌面分支 — is_virtual_desktop()
+     * 在本环境可能为 FALSE, 分支永不命中 → 记录从未生效 (实测 vd=0)。
+     * 这里直接短路: 记录 devmode 并返回成功 (游戏靠查询 EnumCURRENT 拿到
+     * 模拟分辨率, 不广播 WM_DISPLAYCHANGE — 避免 serial 联动其他进程重建
+     * display cache); CDS_TEST 保持原逻辑 (纯查询不改状态);
+     * devmode==NULL 清除 override (恢复真实模式)。 */
+    if (simulate_resolution && !(flags & CDS_TEST))
+    {
+        set_resolution_override( devmode );
+        return DISP_CHANGE_SUCCESSFUL;
+    }
 
     TRACE( "%s %p %p %#x %p\n", debugstr_us(devname), devmode, hwnd, flags, lparam );
     TRACE( "flags=%s\n", _CDS_flags(flags) );
@@ -4517,7 +4803,11 @@ BOOL WINAPI NtUserEnumDisplaySettings( UNICODE_STRING *device, DWORD index, DEVM
     devmode->dmDriverExtra = 0;
 
     if (index == ENUM_REGISTRY_SETTINGS) ret = source_get_registry_settings( source, devmode );
-    else if (index == ENUM_CURRENT_SETTINGS) ret = source_get_current_settings( source, devmode );
+    else if (index == ENUM_CURRENT_SETTINGS)
+    {
+        /* winehua: report the simulated mode in this process, if any */
+        if (!(ret = get_resolution_override( devmode ))) ret = source_get_current_settings( source, devmode );
+    }
     else if (index == WINE_ENUM_PHYSICAL_SETTINGS) ret = FALSE;
     else ret = source_enum_display_settings( source, index, devmode, flags );
     source_release( source );
@@ -4770,7 +5060,7 @@ MONITORINFO monitor_info_from_window( HWND hwnd, UINT flags )
  */
 ULONG WINAPI NtUserGetSystemDpiForProcess( HANDLE process )
 {
-    if (process && process != GetCurrentProcess() && NtCompareObjects( GetCurrentProcess(), process ))
+    if (process && process != GetCurrentProcess())
     {
         FIXME( "not supported on other process %p\n", process );
         return 0;
@@ -5670,7 +5960,7 @@ static WCHAR desk_wallpaper_path[MAX_PATH];
 static PATH_ENTRY( DESKPATTERN, DESKTOP_KEY, "Pattern", desk_pattern_path );
 static PATH_ENTRY( DESKWALLPAPER, DESKTOP_KEY, "Wallpaper", desk_wallpaper_path );
 
-static BYTE user_prefs[8] = { 0x10, 0x00, 0x00, 0x80, 0x12, 0x00, 0x00, 0x00 };
+static BYTE user_prefs[8] = { 0x30, 0x00, 0x00, 0x80, 0x12, 0x00, 0x00, 0x00 };
 static BINARY_ENTRY( USERPREFERENCESMASK, user_prefs, DESKTOP_KEY, "UserPreferencesMask" );
 
 static FONT_ENTRY( CAPTIONLOGFONT, FW_BOLD, METRICS_KEY, "CaptionFont" );
@@ -5891,6 +6181,8 @@ void sysparams_init(void)
     pthread_mutex_init( &user_mutex, &attr );
     pthread_mutexattr_destroy( &attr );
 
+    init_default_gamma_ramp();
+
     if ((hkey = reg_create_ascii_key( hkcu_key, "Keyboard Layout\\Preload", 0, NULL )))
     {
         if (NtUserGetKeyboardLayoutName( layout ))
@@ -5943,7 +6235,7 @@ void sysparams_init(void)
 
     /* open the app-specific key */
 
-    appname = RtlGetCurrentPeb()->ProcessParameters->ImagePathName.Buffer;
+    appname = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
     if ((p = wcsrchr( appname, '/' ))) appname = p + 1;
     if ((p = wcsrchr( appname, '\\' ))) appname = p + 1;
     len = lstrlenW( appname );
@@ -5978,8 +6270,29 @@ void sysparams_init(void)
         grab_fullscreen = IS_OPTION_TRUE( buffer[0] );
     if (!get_config_key( hkey, appkey, "Decorated", buffer, sizeof(buffer) ))
         decorated_mode = IS_OPTION_TRUE( buffer[0] );
+    if (!get_config_key( hkey, appkey, "EmulateModelist", buffer, sizeof(buffer) ))
+        emulate_modelist = !IS_OPTION_TRUE( buffer[0] );
     if (!get_config_key( hkey, appkey, "EmulateModeset", buffer, sizeof(buffer) ))
-        emulate_modeset = IS_OPTION_TRUE( buffer[0] );
+        emulate_modeset = !IS_OPTION_TRUE( buffer[0] );
+
+    {
+        const char *s;
+
+        if ((s = getenv( "PROTON_LIMIT_RESOLUTIONS" )))
+        {
+            limit_resolutions = atoi( s );
+            ERR( "HACK: limit_resolutions %u.\n", limit_resolutions );
+        }
+    }
+
+    /* winehua: WINEHUA_SIMULATE_RESOLUTION enables the per-process simulated
+     * display settings, default off (unset or "0" keeps the original behavior):
+     *   "1" / "true" → record mode: simulated mode follows ChangeDisplaySettings */
+    {
+        const char *simulate = getenv( "WINEHUA_SIMULATE_RESOLUTION" );
+        if (simulate && *simulate && IS_OPTION_TRUE( simulate[0] ))
+            simulate_resolution = TRUE;
+    }
 
 #undef IS_OPTION_TRUE
 
@@ -6594,12 +6907,7 @@ BOOL WINAPI NtUserSystemParametersInfo( UINT action, UINT val, void *ptr, UINT w
     WINE_SPI_FIXME(SPI_SETICONS);
 
     case SPI_GETDEFAULTINPUTLANG:
-        if (ptr)
-        {
-            HKL layout = NtUserGetKeyboardLayout(0);
-            *(HKL*)ptr = layout;
-            ret = layout != 0;
-        }
+        ret = NtUserGetKeyboardLayout(0) != 0;
         break;
 
     WINE_SPI_FIXME(SPI_SETDEFAULTINPUTLANG);
@@ -7392,7 +7700,7 @@ ULONG WINAPI NtUserGetProcessDpiAwarenessContext( HANDLE process )
 {
     ULONG context;
 
-    if (process && process != GetCurrentProcess() && NtCompareObjects( GetCurrentProcess(), process ))
+    if (process && process != GetCurrentProcess())
     {
         WARN( "not supported on other process %p\n", process );
         return NTUSER_DPI_UNAWARE;
@@ -7471,7 +7779,6 @@ static void thread_detach(void)
     if (thread_info->idle_event) NtClose( thread_info->idle_event );
     free( thread_info->session_data );
     free( thread_info->mouse_tracking_info );
-    free( thread_info );
 
     exiting_thread_id = 0;
 }
@@ -7580,6 +7887,9 @@ ULONG_PTR WINAPI NtUserCallOneParam( ULONG_PTR arg, ULONG code )
     case NtUserCallOneParam_GetAsyncKeyboardState:
         return get_async_keyboard_state( (void *)arg );
 
+    case NtUserCallOneParam_UnregisterTouchWindow:
+        return unregister_touch_window( (HWND)arg );
+
     /* temporary exports */
     case NtUserGetDeskPattern:
         return get_entry( &entry_DESKPATTERN, 256, (WCHAR *)arg );
@@ -7611,6 +7921,9 @@ ULONG_PTR WINAPI NtUserCallTwoParam( ULONG_PTR arg1, ULONG_PTR arg2, ULONG code 
 
     case NtUserCallTwoParam_MonitorFromRect:
         return HandleToUlong( monitor_from_rect( (const RECT *)arg1, arg2, get_thread_dpi() ));
+
+    case NtUserCallTwoParam_RegisterTouchWindow:
+        return register_touch_window( (HWND)arg1, arg2 );
 
     case NtUserCallTwoParam_SetIconParam:
         return set_icon_param( UlongToHandle(arg1), UlongToHandle(arg2) );
