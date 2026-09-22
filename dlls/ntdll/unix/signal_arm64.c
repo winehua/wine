@@ -1149,6 +1149,9 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     else if (esr & 0x40) rec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
     else rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
     rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
+    if (is_arm64ec())
+        steam_trace_fault_sample( (void *)PC_sig(context), (void *)SP_sig(context),
+                                  siginfo->si_addr, (void *)LR_sig(context), siginfo->si_code );
     if (!virtual_handle_fault( &rec, (void *)SP_sig(context) )) return;
     if (handle_syscall_fault( context, &rec )) return;
     setup_exception( context, &rec );
@@ -1350,6 +1353,7 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *context = sigcontext;
 
+    write( 2, "[QUIT-PROBE] signal-enter\n", sizeof("[QUIT-PROBE] signal-enter\n") - 1 );
     if (!is_inside_syscall( SP_sig(context) )) user_mode_abort_thread( 0, get_syscall_frame() );
     abort_thread(0);
 }

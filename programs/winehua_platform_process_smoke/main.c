@@ -36,10 +36,95 @@ struct process_metrics
     BOOL inherited_handle;
     BOOL unquoted_image_path;
     BOOL loopback;
+    BOOL auto_reset_event;
+    BOOL thread_callback;
+    BOOL critical_section;
     DWORD last_error;
     char failed_stage[64];
     char peer_arch[16];
 };
+
+struct thread_probe
+{
+    HANDLE wake;
+    HANDLE done;
+    CRITICAL_SECTION lock;
+    LONG counter;
+};
+
+static DWORD WINAPI probe_thread(void *arg)
+{
+    struct thread_probe *probe = arg;
+    unsigned int i, j;
+
+    for (i = 0; i < 2; ++i)
+    {
+        if (WaitForSingleObject(probe->wake, IPC_TIMEOUT_MS) != WAIT_OBJECT_0) return 1;
+        for (j = 0; j < 256; ++j)
+        {
+            EnterCriticalSection(&probe->lock);
+            ++probe->counter;
+            LeaveCriticalSection(&probe->lock);
+        }
+        if (!SetEvent(probe->done)) return 2;
+    }
+    return 0;
+}
+
+static BOOL test_thread_and_auto_reset(struct process_metrics *metrics)
+{
+    struct thread_probe probe = {0};
+    HANDLE thread = NULL;
+    DWORD exit_code = STILL_ACTIVE;
+    unsigned int i, j;
+    BOOL passed = FALSE;
+
+    probe.wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+    probe.done = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!probe.wake || !probe.done) goto done;
+    InitializeCriticalSection(&probe.lock);
+    thread = CreateThread(NULL, 0, probe_thread, &probe, 0, NULL);
+    if (!thread) goto done_lock;
+
+    for (i = 0; i < 2; ++i)
+    {
+        if (!SetEvent(probe.wake)) goto done_lock;
+        for (j = 0; j < 256; ++j)
+        {
+            EnterCriticalSection(&probe.lock);
+            ++probe.counter;
+            LeaveCriticalSection(&probe.lock);
+        }
+        if (WaitForSingleObject(probe.done, IPC_TIMEOUT_MS) != WAIT_OBJECT_0)
+            goto done_lock;
+        if (WaitForSingleObject(probe.done, 0) != WAIT_TIMEOUT) goto done_lock;
+    }
+    metrics->auto_reset_event = TRUE;
+    if (WaitForSingleObject(thread, IPC_TIMEOUT_MS) != WAIT_OBJECT_0 ||
+        !GetExitCodeThread(thread, &exit_code) || exit_code) goto done_lock;
+    metrics->thread_callback = TRUE;
+    metrics->critical_section = probe.counter == 1024;
+    passed = metrics->critical_section;
+
+done_lock:
+    if (!passed && thread && exit_code == STILL_ACTIVE)
+    {
+        SetEvent(probe.wake);
+        if (WaitForSingleObject(thread, IPC_TIMEOUT_MS) == WAIT_TIMEOUT)
+        {
+            SetEvent(probe.wake);
+            if (WaitForSingleObject(thread, IPC_TIMEOUT_MS) == WAIT_TIMEOUT)
+                TerminateThread(thread, ERROR_TIMEOUT);
+        }
+    }
+    if (thread) CloseHandle(thread);
+    DeleteCriticalSection(&probe.lock);
+done:
+    if (!passed) metrics->last_error = GetLastError();
+    if (probe.wake) CloseHandle(probe.wake);
+    if (probe.done) CloseHandle(probe.done);
+    return passed;
+}
 
 static const char *pe_architecture(void)
 {
@@ -489,18 +574,27 @@ int main(int argc, char **argv)
             passed = FALSE;
         }
     }
+    if (passed && !test_thread_and_auto_reset(&metrics))
+    {
+        lstrcpynA(metrics.failed_stage, "thread-auto-reset", sizeof(metrics.failed_stage));
+        passed = FALSE;
+    }
     if (metrics.create_process_count != IPC_ROUNDS || metrics.child_exit_count != IPC_ROUNDS)
         passed = FALSE;
     snprintf(json, sizeof(json),
              "{\"parentArchitecture\":\"%s\",\"peerArchitecture\":\"%s\","
              "\"createProcessCount\":%u,\"childExitCount\":%u,\"namedPipeDuplex\":%s,"
              "\"sharedMemory\":%s,\"eventSynchronization\":%s,\"handleInheritance\":%s,"
-             "\"unquotedImagePath\":%s,\"loopback\":%s,\"lastError\":%lu,\"failedStage\":\"%s\"}",
+             "\"unquotedImagePath\":%s,\"loopback\":%s,\"autoResetEvent\":%s,"
+             "\"threadCallback\":%s,\"criticalSection\":%s,\"lastError\":%lu,\"failedStage\":\"%s\"}",
              pe_architecture(), metrics.peer_arch, metrics.create_process_count,
              metrics.child_exit_count, metrics.named_pipe ? "true" : "false",
              metrics.shared_memory ? "true" : "false", metrics.named_event ? "true" : "false",
              metrics.inherited_handle ? "true" : "false",
              metrics.unquoted_image_path ? "true" : "false", metrics.loopback ? "true" : "false",
+             metrics.auto_reset_event ? "true" : "false",
+             metrics.thread_callback ? "true" : "false",
+             metrics.critical_section ? "true" : "false",
              (unsigned long)metrics.last_error, metrics.failed_stage);
     winehua_smoke_write_result(&smoke, passed ? "PASS" : "FAIL",
                                passed ? "complete" : metrics.failed_stage,

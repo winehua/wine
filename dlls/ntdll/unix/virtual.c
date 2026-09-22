@@ -4291,6 +4291,23 @@ NTSTATUS virtual_relocate_module( void *module )
 }
 
 
+/* Temporary candidate-only TEB lifetime trace; never dereference the
+ * suspect TEB while logging. All callers hold virtual_mutex. */
+static void ohos_teb_probe( const char *event, void *ptr, SIZE_T size, ULONG value )
+{
+#ifdef __OHOS__
+    static unsigned int count;
+    char buf[240];
+    int n, saved_errno = errno;
+    if (++count > 8192) return;
+    n = snprintf( buf, sizeof(buf),
+                  "[TEB-PROBE] pid=%d tid=%ld event=%s ptr=%p size=%lx value=%x current=%p\n",
+                  getpid(), syscall( SYS_gettid ), event, ptr, size, value, NtCurrentTeb() );
+    if (n > 0) write( 2, buf, n < sizeof(buf) ? n : sizeof(buf) - 1 );
+    errno = saved_errno;
+#endif
+}
+
 /* set some initial values in a new TEB */
 static TEB *init_teb( void *ptr, BOOL is_wow )
 {
@@ -4345,6 +4362,7 @@ static TEB *init_teb( void *ptr, BOOL is_wow )
     thread_data->wait_fd[0] = -1;
     thread_data->wait_fd[1] = -1;
     thread_data->alert_fd   = -1;
+    ohos_teb_probe( "add", teb, 0, is_wow );
     list_add_head( &teb_list, &thread_data->entry );
     thread_data->fsync_apc_futex = NULL;
     return teb;
@@ -4426,8 +4444,9 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
             teb_block_pos = 32;
         }
         ptr = ((char *)teb_block + --teb_block_pos * block_size);
-        NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &block_size,
-                                 MEM_COMMIT, PAGE_READWRITE );
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &block_size,
+                                          MEM_COMMIT, PAGE_READWRITE );
+        ohos_teb_probe( "commit", ptr, block_size, status );
     }
     *ret_teb = teb = init_teb( ptr, is_wow64() );
 
@@ -4477,6 +4496,7 @@ void virtual_free_teb( TEB *teb )
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     signal_free_thread( teb );
+    ohos_teb_probe( "remove", teb, 0, 0 );
     list_remove( &thread_data->entry );
     ptr = teb;
     if (!is_win64) ptr = (char *)ptr - teb_offset;
@@ -4620,12 +4640,23 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
     struct ntdll_thread_data *thread_data;
     sigset_t sigset;
 
+    if (index >= TLS_MINIMUM_AVAILABLE + 8 * sizeof(peb->TlsExpansionBitmapBits))
+        return STATUS_INVALID_PARAMETER;
+
+    /* NtTerminateProcess(NULL) has stopped the other threads before process
+     * detach callbacks run. Their native thread resources may already be
+     * unmapped, while abort_thread() leaves their entries in teb_list.
+     * A detach-time TlsFree must not walk those dead threads. TlsAlloc clears
+     * the caller's slot if a subsequent detach callback reuses the index. */
+    if (process_exiting) return STATUS_SUCCESS;
+
     if (index < TLS_MINIMUM_AVAILABLE)
     {
         server_enter_uninterrupted_section( &virtual_mutex, &sigset );
         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
         {
             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+            ohos_teb_probe( "tls-clear", teb, 0, index );
 #ifdef _WIN64
             WOW_TEB *wow_teb = get_wow_teb( teb );
             if (wow_teb) wow_teb->TlsSlots[index] = 0;
@@ -4644,6 +4675,7 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
         {
             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+            ohos_teb_probe( "tls-clear", teb, 0, index );
 #ifdef _WIN64
             WOW_TEB *wow_teb = get_wow_teb( teb );
             if (wow_teb)
@@ -5032,6 +5064,8 @@ void *virtual_setup_exception( void *stack_ptr, size_t size, EXCEPTION_RECORD *r
     {
         if (is_inside_signal_stack( stack ))
         {
+            static const char reason[] = "[steam-thread] nested exception on signal stack\n";
+            steam_trace_signal_abort( reason, sizeof(reason) - 1 );
             ERR( "nested exception on signal stack addr %p stack %p\n", rec->ExceptionAddress, stack );
             abort_thread(1);
         }
@@ -5046,6 +5080,11 @@ void *virtual_setup_exception( void *stack_ptr, size_t size, EXCEPTION_RECORD *r
     if (stack < stack_info.start + host_page_size)
     {
         /* stack overflow on last page, unrecoverable */
+        static const char reason[] = "[steam-thread] unrecoverable thread stack overflow\n";
+        steam_trace_stack_overflow( rec->ExceptionAddress, stack_ptr, stack,
+                                    stack_info.start, stack_info.limit, stack_info.end,
+                                    size, host_page_size, rec->ExceptionCode, stack_info.is_wow );
+        steam_trace_signal_abort( reason, sizeof(reason) - 1 );
         UINT diff = stack_info.start + host_page_size - stack;
         ERR( "stack overflow %u bytes addr %p stack %p (%p-%p-%p)\n",
              diff, rec->ExceptionAddress, stack, stack_info.start, stack_info.limit, stack_info.end );
@@ -5892,10 +5931,12 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     else switch (type)
     {
     case MEM_DECOMMIT:
+        if ((ULONG_PTR)base < 0x1000000) ohos_teb_probe( "decommit-low", base, size, type );
         status = decommit_pages( view, base, size );
         break;
     case MEM_RELEASE:
         if (!size) size = view->size;
+        if ((ULONG_PTR)base < 0x1000000) ohos_teb_probe( "release-low", base, size, type );
         status = free_pages( view, base, size );
         break;
     case MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER:

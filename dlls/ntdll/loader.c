@@ -3605,10 +3605,17 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
          * runtime paths.  The x64 OHOS WoW64 path now supplies the former
          * explicitly; continue with the latter for dependencies such as
          * vulkan-1.dll and Wine builtin imports. */
-        if (status == STATUS_DLL_NOT_FOUND && load_path && default_load_path &&
+        if ((status == STATUS_DLL_NOT_FOUND || status == STATUS_NOT_SUPPORTED) &&
+            load_path && default_load_path &&
             wcscmp( load_path, default_load_path ))
-            status = search_dll_file( default_load_path, libname, nt_name, pwm,
-                                      mapping, image_info, id );
+        {
+            NTSTATUS fallback = search_dll_file( default_load_path, libname, nt_name, pwm,
+                                                 mapping, image_info, id );
+            /* An incompatible app-local DLL must not hide a compatible system
+             * DLL (e.g. CEF's AMD64 Vulkan loader imported by ARM64X DXVK).
+             * Retain the architecture error if neither path has a usable DLL. */
+            if (fallback != STATUS_DLL_NOT_FOUND) status = fallback;
+        }
         if (status == STATUS_DLL_NOT_FOUND)
             status = find_builtin_without_file( libname, nt_name, pwm, mapping, image_info, id );
     }

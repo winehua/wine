@@ -2273,7 +2273,7 @@ static void pop_default_fbo_buffers( TEB *teb )
     struct opengl_drawable *draw, *read;
     GLenum dst[MAX_DRAW_BUFFERS], buf;
     struct context *ctx;
-    unsigned int i, n;
+    unsigned int i, n, count = 1;
     BOOL change = FALSE;
 
     if (!(ctx = get_current_context( teb, &draw, &read ))) return;
@@ -2297,10 +2297,17 @@ static void pop_default_fbo_buffers( TEB *teb )
         {
             dst[i] = drawable_buffer_from_buffer( draw, ctx->color_buffer.draw_buffers[i] );
             funcs->p_glGetIntegerv( GL_DRAW_BUFFER0 + i, (GLint *)&buf );
-            if (!dst[i]) dst[i] = buf;
+            if (dst[i]) count = i + 1;
             if (dst[i] != buf) change = TRUE;
         }
-        if (change) funcs->p_glDrawBuffers( n, dst );
+        /* glDrawBuffer accepts aggregate enums such as GL_BACK and GL_FRONT.
+         * Passing that saved state to glDrawBuffers is invalid on legacy GL
+         * contexts, and GL_BACK also requires n == 1 on newer contexts. */
+        if (change)
+        {
+            if (count == 1) funcs->p_glDrawBuffer( dst[0] );
+            else funcs->p_glDrawBuffers( count, dst );
+        }
     }
     if (!ctx->read_fbo && (buf = drawable_buffer_from_buffer( read, ctx->pixel_mode.read_buffer )))
         funcs->p_glReadBuffer( buf );

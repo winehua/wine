@@ -85,6 +85,101 @@ WINE_DECLARE_DEBUG_CHANNEL(threadname);
 pthread_key_t teb_key = 0;
 
 static LONG nb_threads = 1;
+static int steam_boundary_trace;
+
+void steam_init_boundary_trace(void)
+{
+    const char *value = getenv( "WINEHUA_STEAM_BOUNDARY_TRACE" );
+    steam_boundary_trace = value && value[0] == '1' && !value[1];
+}
+
+void steam_trace_server_abort( const char *reason )
+{
+    if (steam_boundary_trace) write( 2, reason, strlen( reason ) );
+}
+
+void steam_trace_signal_abort( const char *reason, size_t length )
+{
+    if (steam_boundary_trace) write( 2, reason, length );
+}
+
+static char *steam_trace_hex( char *dst, uintptr_t value )
+{
+    static const char digits[] = "0123456789abcdef";
+    int shift;
+    for (shift = 8 * sizeof(value) - 4; shift >= 0; shift -= 4)
+        *dst++ = digits[(value >> shift) & 15];
+    return dst;
+}
+
+void steam_trace_stack_overflow( const void *fault, const void *frame_sp, const void *stack_sp,
+                                 const void *start, const void *limit, const void *end,
+                                 size_t frame_size, size_t page_size, unsigned int code, int is_wow )
+{
+    char buf[384], *p = buf;
+    const char *label;
+    if (!steam_boundary_trace) return;
+#define APPEND_HEX(name, value) do { \
+    label = name; while (*label) *p++ = *label++; \
+    *p++ = '0'; *p++ = 'x'; p = steam_trace_hex( p, (uintptr_t)(value) ); *p++ = ' '; \
+} while (0)
+    label = "[steam-stack] ";
+    while (*label) *p++ = *label++;
+    APPEND_HEX( "fault=", fault );
+    APPEND_HEX( "frame_sp=", frame_sp );
+    APPEND_HEX( "stack_sp=", stack_sp );
+    APPEND_HEX( "start=", start );
+    APPEND_HEX( "limit=", limit );
+    APPEND_HEX( "end=", end );
+    APPEND_HEX( "frame_size=", frame_size );
+    APPEND_HEX( "page_size=", page_size );
+    APPEND_HEX( "code=", code );
+    APPEND_HEX( "wow=", is_wow );
+#undef APPEND_HEX
+    p[-1] = '\n';
+    write( 2, buf, p - buf );
+}
+
+void steam_trace_fault_sample( const void *pc, const void *sp, const void *fault,
+                               const void *lr, int signal_code )
+{
+    static unsigned int counts[256];
+    char buf[256], *p = buf;
+    const char *label;
+    unsigned int tid, count;
+    if (!steam_boundary_trace) return;
+    tid = syscall( __NR_gettid );
+    count = __atomic_add_fetch( &counts[tid % 256], 1, __ATOMIC_RELAXED );
+    if (count & (count - 1)) return;
+#define APPEND_HEX(name, value) do { \
+    label = name; while (*label) *p++ = *label++; \
+    *p++ = '0'; *p++ = 'x'; p = steam_trace_hex( p, (uintptr_t)(value) ); *p++ = ' '; \
+} while (0)
+    label = "[steam-fault] ";
+    while (*label) *p++ = *label++;
+    APPEND_HEX( "host_tid=", tid );
+    APPEND_HEX( "win_tid=", NtCurrentTeb()->ClientId.UniqueThread );
+    APPEND_HEX( "count=", count );
+    APPEND_HEX( "pc=", pc );
+    APPEND_HEX( "sp=", sp );
+    APPEND_HEX( "fault=", fault );
+    APPEND_HEX( "lr=", lr );
+    APPEND_HEX( "si_code=", signal_code );
+#undef APPEND_HEX
+    p[-1] = '\n';
+    write( 2, buf, p - buf );
+}
+
+static void steam_trace_thread( const char *reason, int status, const void *caller )
+{
+    TEB *teb;
+    if (!steam_boundary_trace) return;
+    teb = NtCurrentTeb();
+    fprintf( stderr, "[steam-thread] %s host_pid=%ld host_tid=%ld win_pid=%04x win_tid=%04x status=%08x caller=%p abort_fn=%p\n",
+             reason, (long)getpid(), (long)syscall( __NR_gettid ),
+             teb ? (unsigned int)(ULONG_PTR)teb->ClientId.UniqueProcess : 0,
+             teb ? (unsigned int)(ULONG_PTR)teb->ClientId.UniqueThread : 0, status, caller, abort_thread );
+}
 
 static inline int get_unix_exit_code( NTSTATUS status )
 {
@@ -1105,6 +1200,7 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
  */
 static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
 {
+    write( 2, "[QUIT-PROBE] pthread-exit-wrapper\n", sizeof("[QUIT-PROBE] pthread-exit-wrapper\n") - 1 );
     close( ntdll_get_thread_data()->alert_fd );
     close( ntdll_get_thread_data()->wait_fd[0] );
     close( ntdll_get_thread_data()->wait_fd[1] );
@@ -1129,6 +1225,7 @@ static void start_thread( TEB *teb )
     thread_data->pthread_id = pthread_self();
     pthread_setspecific( teb_key, teb );
     server_init_thread( thread_data->start, &suspend );
+    steam_trace_thread( "start", 0, NULL );
     signal_start_thread( thread_data->start, thread_data->param, suspend, teb );
 }
 
@@ -1582,6 +1679,8 @@ done:
  */
 void abort_thread( int status )
 {
+    write( 2, "[QUIT-PROBE] abort-thread\n", sizeof("[QUIT-PROBE] abort-thread\n") - 1 );
+    steam_trace_thread( "abort", status, __builtin_extract_return_addr( __builtin_return_address(0) ) );
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
     if (InterlockedDecrement( &nb_threads ) <= 0) abort_process( status );
     pthread_exit_wrapper( status );
@@ -1604,6 +1703,8 @@ static DECLSPEC_NORETURN void exit_thread( int status )
 {
     static void *prev_teb;
     TEB *teb;
+
+    steam_trace_thread( "exit", status, NULL );
 
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
 
@@ -1859,6 +1960,8 @@ NTSTATUS WINAPI NtTerminateThread( HANDLE handle, LONG exit_code )
 {
     unsigned int ret;
     BOOL self;
+
+    steam_trace_thread( "terminate-request", exit_code, NULL );
 
     SERVER_START_REQ( terminate_thread )
     {

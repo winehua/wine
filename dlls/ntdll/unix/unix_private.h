@@ -281,6 +281,12 @@ extern void *get_cpu_area( USHORT machine );
 extern void set_thread_id( TEB *teb, DWORD pid, DWORD tid );
 extern NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size );
 extern void DECLSPEC_NORETURN abort_thread( int status );
+extern void steam_trace_signal_abort( const char *reason, size_t length );
+extern void steam_trace_stack_overflow( const void *fault, const void *frame_sp, const void *stack_sp,
+                                        const void *start, const void *limit, const void *end,
+                                        size_t frame_size, size_t page_size, unsigned int code, int is_wow );
+extern void steam_trace_fault_sample( const void *pc, const void *sp, const void *fault,
+                                      const void *lr, int signal_code );
 extern void DECLSPEC_NORETURN abort_process( int status );
 extern void DECLSPEC_NORETURN exit_process( int status );
 extern void wait_suspend( CONTEXT *context );

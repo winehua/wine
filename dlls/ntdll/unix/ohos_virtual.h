@@ -37,6 +37,12 @@ static inline void ohos_jit_enable(void)
     prctl( 0x6a6974, 0, 0 );
 }
 
+/* 2026-09-20 诊断: 需要知道 prctl 是否真的生效 (返回值) 时用这个变体。 */
+static inline int ohos_jit_enable_rc(void)
+{
+    return prctl( 0x6a6974, 0, 0 );
+}
+
 static inline void ohos_jit_disable(void)
 {
     prctl( 0x6a6974, 0, 1 );

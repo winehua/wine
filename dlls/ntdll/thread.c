@@ -256,6 +256,15 @@ void set_native_thread_name( DWORD tid, const char *name )
 void WINAPI RtlExitUserThread( ULONG status )
 {
     ULONG last;
+    UNICODE_STRING name = RTL_CONSTANT_STRING( L"WINEHUA_STEAM_BOUNDARY_TRACE" );
+    WCHAR buffer[2];
+    UNICODE_STRING trace = {0, sizeof(buffer), buffer};
+
+    if (!RtlQueryEnvironmentVariable_U( NULL, &name, &trace ) &&
+        trace.Length == sizeof(WCHAR) && buffer[0] == '1')
+        MESSAGE( "[steam-thread] user-exit pid=%04x tid=%04x status=0x%08x\n",
+                 (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess,
+                 (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, status );
 
     NtQueryInformationThread( GetCurrentThread(), ThreadAmILastThread, &last, sizeof(last), NULL );
     /* TEMP-DIAG(EXIT): last thread of the process → whole process exits. */

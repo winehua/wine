@@ -2913,6 +2913,7 @@ static void check_command_line( int argc, char *argv[] )
  */
 DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
 {
+    extern void steam_init_boundary_trace(void);
     main_argc = argc;
     main_argv = argv;
 
@@ -2932,6 +2933,7 @@ DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
 
     virtual_init();
     init_environment();
+    steam_init_boundary_trace();
 
 #ifdef __APPLE__
     apple_main_thread();

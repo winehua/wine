@@ -34,6 +34,9 @@
 #include <limits.h>
 #include <signal.h>
 #include <sys/types.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #ifdef HAVE_SYS_SYSCALL_H
@@ -1176,6 +1179,107 @@ NTSTATUS WINAPI NtOpenEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_AT
 }
 
 
+/* Opt-in read-only snapshots for the browser main thread's low-valued wait
+ * handles. Handle numbers are meaningful only within this process lifetime. */
+static HANDLE winehua_wait_object_handles[128];
+static unsigned int winehua_wait_object_count;
+static unsigned int winehua_wait_object_ops;
+
+static int winehua_wait_object_enabled(void)
+{
+    static int cached = -1;
+    int enabled = __atomic_load_n( &cached, __ATOMIC_RELAXED );
+    if (enabled < 0)
+    {
+        const char *v = getenv( "WINEHUA_WAIT_OBJECT_TRACE" );
+        enabled = (v && v[0] == '1') ? 1 : 0;
+        __atomic_store_n( &cached, enabled, __ATOMIC_RELAXED );
+    }
+    return enabled;
+}
+
+static void winehua_wait_object_snapshot( HANDLE handle, const char *operation, NTSTATUS result )
+{
+    int saved_errno = errno;
+    EVENT_BASIC_INFORMATION event;
+    NTSTATUS status = NtQueryEvent( handle, EventBasicInformation, &event, sizeof(event), NULL );
+    char buf[240];
+    int n = snprintf( buf, sizeof(buf), "[wait-object] pid=%d tid=%ld handle=%p op=%s "
+                      "result=%#x query=%#x event_type=%d event_state=%d ticks=%llu\n",
+                      getpid(), (long)syscall( SYS_gettid ), handle, operation, result, status,
+                      status ? -1 : event.EventType, status ? -1 : event.EventState,
+                      (unsigned long long)monotonic_counter() );
+    if (n > 0) write( 2, buf, n < sizeof(buf) ? n : sizeof(buf) - 1 );
+    errno = saved_errno;
+}
+
+static void winehua_wait_object_operation( HANDLE handle, const char *operation, NTSTATUS status )
+{
+    unsigned int i, count;
+    int saved_errno = errno;
+    if (!winehua_wait_object_enabled()) goto done;
+    count = __atomic_load_n( &winehua_wait_object_count, __ATOMIC_ACQUIRE );
+    for (i = 0; i < count; ++i)
+        if (winehua_wait_object_handles[i] == handle) break;
+    if (i == count || __atomic_fetch_add( &winehua_wait_object_ops, 1, __ATOMIC_RELAXED ) >= 256) goto done;
+    winehua_wait_object_snapshot( handle, operation, status );
+done:
+    errno = saved_errno;
+}
+
+static void winehua_wait_object_register( const HANDLE *handles, DWORD count, const LARGE_INTEGER *timeout )
+{
+#ifdef __linux__
+    char thread_name[16] = {0};
+    unsigned int i, j, tracked;
+    int saved_errno = errno;
+
+    if ((timeout && timeout->QuadPart != TIMEOUT_INFINITE) || !winehua_wait_object_enabled() ||
+        prctl( PR_GET_NAME, thread_name ) || strcmp( thread_name, "CrBrowserMain" ))
+    {
+        errno = saved_errno;
+        return;
+    }
+    for (i = 0; i < count; ++i)
+    {
+        HANDLE handle = handles[i];
+        union { OBJECT_TYPE_INFORMATION info; char bytes[sizeof(OBJECT_TYPE_INFORMATION) + 128]; } type_buf;
+        union { OBJECT_NAME_INFORMATION info; char bytes[sizeof(OBJECT_NAME_INFORMATION) + 512]; } name_buf;
+        OBJECT_TYPE_INFORMATION *type = &type_buf.info;
+        OBJECT_NAME_INFORMATION *name = &name_buf.info;
+        char type_text[32] = {0}, name_text[96] = {0}, buf[300];
+        NTSTATUS type_status, name_status;
+        int n;
+
+        if ((ULONG_PTR)handle > 0x200 || !handle) continue;
+        tracked = __atomic_load_n( &winehua_wait_object_count, __ATOMIC_RELAXED );
+        for (j = 0; j < tracked; ++j)
+            if (winehua_wait_object_handles[j] == handle) break;
+        if (j < tracked || tracked >= sizeof(winehua_wait_object_handles) / sizeof(winehua_wait_object_handles[0])) continue;
+        type_status = NtQueryObject( handle, ObjectTypeInformation, type_buf.bytes, sizeof(type_buf), NULL );
+        name_status = NtQueryObject( handle, ObjectNameInformation, name_buf.bytes, sizeof(name_buf), NULL );
+        if (!type_status)
+            for (j = 0; j < type->TypeName.Length / sizeof(WCHAR) && j < sizeof(type_text) - 1; ++j)
+                type_text[j] = type->TypeName.Buffer[j] < 128 && type->TypeName.Buffer[j] >= 32 ?
+                               type->TypeName.Buffer[j] : '?';
+        if (!name_status && name->Name.Buffer)
+            for (j = 0; j < name->Name.Length / sizeof(WCHAR) && j < sizeof(name_text) - 1; ++j)
+                name_text[j] = name->Name.Buffer[j] < 128 && name->Name.Buffer[j] >= 32 ?
+                               name->Name.Buffer[j] : '?';
+        winehua_wait_object_handles[tracked] = handle;
+        __atomic_store_n( &winehua_wait_object_count, tracked + 1, __ATOMIC_RELEASE );
+        n = snprintf( buf, sizeof(buf), "[wait-object] pid=%d tid=%ld handle=%p op=identify "
+                      "type_status=%#x type=%s name_status=%#x name=%s ticks=%llu\n",
+                      getpid(), (long)syscall( SYS_gettid ), handle, type_status, type_text,
+                      name_status, name_text, (unsigned long long)monotonic_counter() );
+        if (n > 0) write( 2, buf, n < sizeof(buf) ? n : sizeof(buf) - 1 );
+        if (!type_status && !strcmp( type_text, "Event" ))
+            winehua_wait_object_snapshot( handle, "wait-before", STATUS_SUCCESS );
+    }
+    errno = saved_errno;
+#endif
+}
+
 /******************************************************************************
  *              NtSetEvent (NTDLL.@)
  */
@@ -1186,7 +1290,10 @@ NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
     TRACE( "handle %p, prev_state %p\n", handle, prev_state );
 
     if ((ret = inproc_set_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
+    {
+        winehua_wait_object_operation( handle, "set-inproc", ret );
         return ret;
+    }
 
     SERVER_START_REQ( event_op )
     {
@@ -1196,6 +1303,7 @@ NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
         if (!ret && prev_state) *prev_state = reply->state;
     }
     SERVER_END_REQ;
+    winehua_wait_object_operation( handle, "set-server", ret );
     return ret;
 }
 
@@ -1219,7 +1327,10 @@ NTSTATUS WINAPI NtResetEvent( HANDLE handle, LONG *prev_state )
     TRACE( "handle %p, prev_state %p\n", handle, prev_state );
 
     if ((ret = inproc_reset_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
+    {
+        winehua_wait_object_operation( handle, "reset-inproc", ret );
         return ret;
+    }
 
     SERVER_START_REQ( event_op )
     {
@@ -1229,6 +1340,7 @@ NTSTATUS WINAPI NtResetEvent( HANDLE handle, LONG *prev_state )
         if (!ret && prev_state) *prev_state = reply->state;
     }
     SERVER_END_REQ;
+    winehua_wait_object_operation( handle, "reset-server", ret );
     return ret;
 }
 
@@ -2332,12 +2444,19 @@ NTSTATUS WINAPI NtQueryTimer( HANDLE handle, TIMER_INFORMATION_CLASS class,
 /******************************************************************
  *		NtWaitForMultipleObjects (NTDLL.@)
  */
+static unsigned int winehua_wait_trace_begin( const char *api, const HANDLE *handles, DWORD count,
+                                               WAIT_TYPE type, BOOLEAN alertable, const LARGE_INTEGER *timeout,
+                                               ULONGLONG *start );
+static void winehua_wait_trace_end( unsigned int id, ULONGLONG start, const char *backend, NTSTATUS status );
+
 NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WAIT_TYPE type,
                                           BOOLEAN alertable, const LARGE_INTEGER *timeout )
 {
     union select_op select_op;
     UINT i, flags = SELECT_INTERRUPTIBLE;
     unsigned int ret;
+    ULONGLONG trace_start = 0;
+    unsigned int trace_id;
 
     if (!count || count > MAXIMUM_WAIT_OBJECTS) return STATUS_INVALID_PARAMETER_1;
     if (type != WaitAll && type != WaitAny) FIXME( "Unsupported wait type %u\n", type );
@@ -2355,8 +2474,10 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
         if (is_pseudo_handle( handles[i] )) return STATUS_INVALID_HANDLE;
     }
 
+    trace_id = winehua_wait_trace_begin( "multiple", handles, count, type, alertable, timeout, &trace_start );
     if ((ret = inproc_wait( count, handles, type, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
     {
+        if (trace_id) winehua_wait_trace_end( trace_id, trace_start, do_fsync() ? "fsync" : "ntsync", ret );
         TRACE( "-> %#x\n", ret );
         return ret;
     }
@@ -2365,6 +2486,7 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
     select_op.wait.op = type == WaitAll ? SELECT_WAIT_ALL : SELECT_WAIT;
     for (i = 0; i < count; i++) select_op.wait.handles[i] = wine_server_obj_handle( handles[i] );
     ret = server_wait( &select_op, offsetof( union select_op, wait.handles[count] ), flags, timeout );
+    winehua_wait_trace_end( trace_id, trace_start, "server", ret );
     TRACE( "-> %#x\n", ret );
     return ret;
 }
@@ -2373,21 +2495,74 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
 /******************************************************************
  *		NtWaitForSingleObject (NTDLL.@)
  */
-/* WineHua TEMP-DIAG (2026-09-19): 无限等待的调用者定位。
- * Steam 客户端 CreateResponse 之后等不到 BrowserReady、全体线程空闲,
- * 需要知道"谁在无限等哪个句柄、调用者是谁"。WINEHUA_WAIT_TRACE=1 打开,
- * 每进程最多 64 条, 只记无超时的等待。 */
-extern void ohos_prof_dump_guest_context( void );
-static int winehua_wait_trace_count;
+/* Trace indefinite waits, including both timeout forms. After the initial window,
+ * sample one call in 128 so a busy main thread cannot exhaust late-stage coverage.
+ * A missing exit for a recorded call_id means it was still in progress at capture. */
+static unsigned int winehua_wait_trace_count;
 static int winehua_wait_trace_enabled(void)
 {
     static int cached = -1;
-    if (cached < 0)
+    int enabled = __atomic_load_n( &cached, __ATOMIC_RELAXED );
+    if (enabled < 0)
     {
         const char *v = getenv( "WINEHUA_WAIT_TRACE" );
-        cached = (v && v[0] == '1') ? 1 : 0;
+        enabled = (v && v[0] == '1') ? 1 : 0;
+        __atomic_store_n( &cached, enabled, __ATOMIC_RELAXED );
     }
-    return cached;
+    return enabled;
+}
+
+static unsigned int winehua_wait_trace_begin( const char *api, const HANDLE *handles, DWORD count,
+                                               WAIT_TYPE type, BOOLEAN alertable, const LARGE_INTEGER *timeout,
+                                               ULONGLONG *start )
+{
+    unsigned int id;
+    int saved_errno = errno, n;
+    char buf[256];
+
+    winehua_wait_object_register( handles, count, timeout );
+    if ((timeout && timeout->QuadPart != TIMEOUT_INFINITE) || !winehua_wait_trace_enabled())
+    {
+        errno = saved_errno;
+        return 0;
+    }
+    id = __atomic_add_fetch( &winehua_wait_trace_count, 1, __ATOMIC_RELAXED );
+    if (id > 2048 && (id & 127))
+    {
+        if (id == 2049)
+        {
+            static const char limit[] = "[wait-trace] first=2048 complete; sampling 1/128 thereafter\n";
+            write( 2, limit, sizeof(limit) - 1 );
+        }
+        errno = saved_errno;
+        return 0;
+    }
+    *start = monotonic_counter();
+    n = snprintf( buf, sizeof(buf), "[wait-trace] pid=%d tid=%ld id=%u api=%s phase=enter "
+                  "count=%u h0=%p h1=%p type=%u alertable=%u timeout=%s ticks=%llu\n",
+                  getpid(), (long)syscall( SYS_gettid ), id, api, count, handles[0],
+                  count > 1 ? handles[1] : NULL, type, alertable,
+                  timeout ? "explicit-infinite" : "null", (unsigned long long)*start );
+    if (n > 0) write( 2, buf, n < sizeof(buf) ? n : sizeof(buf) - 1 );
+    errno = saved_errno;
+    return id;
+}
+
+static void winehua_wait_trace_end( unsigned int id, ULONGLONG start, const char *backend, NTSTATUS status )
+{
+    ULONGLONG end;
+    int saved_errno, n;
+    char buf[192];
+
+    if (!id) return;
+    saved_errno = errno;
+    end = monotonic_counter();
+    n = snprintf( buf, sizeof(buf), "[wait-trace] pid=%d tid=%ld id=%u phase=exit "
+                  "backend=%s status=%#x elapsed_100ns=%llu ticks=%llu\n",
+                  getpid(), (long)syscall( SYS_gettid ), id, backend, status,
+                  (unsigned long long)(end - start), (unsigned long long)end );
+    if (n > 0) write( 2, buf, n < sizeof(buf) ? n : sizeof(buf) - 1 );
+    errno = saved_errno;
 }
 
 NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout )
@@ -2395,20 +2570,15 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
     union select_op select_op;
     UINT flags = SELECT_INTERRUPTIBLE;
     unsigned int ret;
+    ULONGLONG trace_start = 0;
+    unsigned int trace_id;
 
     TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
 
-    if (!timeout && winehua_wait_trace_enabled() && winehua_wait_trace_count++ < 64)
-    {
-        char b[128];
-        int n = snprintf( b, sizeof(b), "[wait-trace] pid=%d tid=%ld handle=%p\n",
-                          getpid(), (long)syscall( SYS_gettid ), handle );
-        if (n > 0) write( 2, b, (size_t)n );
-        ohos_prof_dump_guest_context();
-    }
-
+    trace_id = winehua_wait_trace_begin( "single", &handle, 1, WaitAny, alertable, timeout, &trace_start );
     if ((ret = inproc_wait( 1, &handle, WaitAny, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
     {
+        if (trace_id) winehua_wait_trace_end( trace_id, trace_start, do_fsync() ? "fsync" : "ntsync", ret );
         TRACE( "-> %#x\n", ret );
         return ret;
     }
@@ -2417,6 +2587,7 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
     select_op.wait.op = SELECT_WAIT;
     select_op.wait.handles[0] = wine_server_obj_handle( handle );
     ret = server_wait( &select_op, offsetof( union select_op, wait.handles[1] ), flags, timeout );
+    winehua_wait_trace_end( trace_id, trace_start, "server", ret );
     TRACE( "-> %#x\n", ret );
     return ret;
 }
@@ -2431,19 +2602,28 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
     union select_op select_op;
     UINT flags = SELECT_INTERRUPTIBLE;
     NTSTATUS ret;
+    HANDLE handles[2] = { signal, wait };
+    ULONGLONG trace_start = 0;
+    unsigned int trace_id;
 
     TRACE( "signal %p, wait %p, alertable %u, timeout %s\n", signal, wait, alertable, debugstr_timeout(timeout) );
 
     if (!signal) return STATUS_INVALID_HANDLE;
 
+    trace_id = winehua_wait_trace_begin( "signal-wait", handles, 2, WaitAny, alertable, timeout, &trace_start );
     if ((ret = inproc_signal_and_wait( signal, wait, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+    {
+        if (trace_id) winehua_wait_trace_end( trace_id, trace_start, do_fsync() ? "fsync" : "ntsync", ret );
         return ret;
+    }
 
     if (alertable) flags |= SELECT_ALERTABLE;
     select_op.signal_and_wait.op = SELECT_SIGNAL_AND_WAIT;
     select_op.signal_and_wait.wait = wine_server_obj_handle( wait );
     select_op.signal_and_wait.signal = wine_server_obj_handle( signal );
-    return server_wait( &select_op, sizeof(select_op.signal_and_wait), flags, timeout );
+    ret = server_wait( &select_op, sizeof(select_op.signal_and_wait), flags, timeout );
+    winehua_wait_trace_end( trace_id, trace_start, "server", ret );
+    return ret;
 }
 
 

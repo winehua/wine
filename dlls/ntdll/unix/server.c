@@ -239,7 +239,12 @@ static unsigned int send_request( const struct __server_request_info *req )
         }
     }
 
-    if (errno == EPIPE) abort_thread(0);
+    if (errno == EPIPE)
+    {
+        extern void steam_trace_server_abort( const char *reason );
+        steam_trace_server_abort( "[steam-thread] server write EPIPE\n" );
+        abort_thread(0);
+    }
     if (errno == EFAULT) return STATUS_ACCESS_VIOLATION;
     server_protocol_perror( "write" );
 }
@@ -268,7 +273,11 @@ static void read_reply_data( void *buffer, size_t size )
         server_protocol_perror("read");
     }
     /* the server closed the connection; time to die... */
-    abort_thread(0);
+    {
+        extern void steam_trace_server_abort( const char *reason );
+        steam_trace_server_abort( "[steam-thread] server reply EOF\n" );
+        abort_thread(0);
+    }
 }
 
 
@@ -367,7 +376,12 @@ static int wait_select_reply( void *cookie )
         ret = read( ntdll_get_thread_data()->wait_fd[0], &reply, sizeof(reply) );
         if (ret == sizeof(reply))
         {
-            if (!reply.cookie) abort_thread( reply.signaled );  /* thread got killed */
+            if (!reply.cookie)
+            {
+                extern void steam_trace_server_abort( const char *reason );
+                steam_trace_server_abort( "[steam-thread] server killed waiting thread\n" );
+                abort_thread( reply.signaled );
+            }
             if (wine_server_get_ptr(reply.cookie) == cookie) return reply.signaled;
             /* we stole another reply, wait for the real one */
             signaled = wait_select_reply( cookie );
@@ -1597,6 +1611,7 @@ static int init_thread_pipe(void)
 void process_exit_wrapper( int status )
 {
     close( fd_socket );
+    fprintf( stderr, "[EXIT-PROBE] pid=%d phase=libc-exit status=%d\n", getpid(), status );
     exit( status );
 }
 
