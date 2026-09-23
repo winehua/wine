@@ -1536,6 +1536,25 @@ sym_not_found:
     return FALSE;
 }
 
+#ifdef __OHOS__
+static void load_ohos_windows_fonts(void)
+{
+    const char *prefix = getenv( "WINEPREFIX" );
+    char font_dir[PATH_MAX];
+
+    /* C:\windows\fonts is reached through the DOS drive map. That scan does
+     * not yield user-imported TTFs in the NAPI sandbox, while POSIX opendir
+     * of the same directory (as used for /system/fonts) does. */
+    if (!prefix || !prefix[0])
+        prefix = "/data/storage/el2/base/files/.wine";
+
+    snprintf( font_dir, sizeof(font_dir), "%s/drive_c/windows/fonts", prefix );
+    ReadFontDir( font_dir, FALSE );
+    snprintf( font_dir, sizeof(font_dir), "%s/drive_c/windows/Fonts", prefix );
+    ReadFontDir( font_dir, FALSE );
+}
+#endif
+
 /*************************************************************
  * freetype_load_fonts
  */
@@ -1559,6 +1578,9 @@ static void freetype_load_fonts(void)
     load_mac_fonts();
 #elif defined(__ANDROID__)
     ReadFontDir("/system/fonts", TRUE);
+#endif
+#ifdef __OHOS__
+    load_ohos_windows_fonts();
 #endif
 }
 
