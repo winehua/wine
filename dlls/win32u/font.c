@@ -1243,13 +1243,14 @@ static UINT ohos_effective_ansi_cp(void)
     const char *lang;
     UINT acp = ansi_cp.CodePage;
 
-    if (acp == 936 || acp == 950) return acp;
+    /* A prefix created in another language can retain its old ACP. An
+     * explicit launch locale must win for TextOutA and fallback matching. */
     lang = getenv( "LC_ALL" );
     if (ohos_is_c_unix_locale( lang )) lang = getenv( "LANG" );
     if (lang)
     {
         if (!strncmp( lang, "en_US", 5 ) || !strncmp( lang, "en-US", 5 ))
-            return acp;
+            return 1252;
         if (!strncmp( lang, "zh_CN", 5 ) || !strncmp( lang, "zh_Hans", 7 ) ||
             !strncmp( lang, "zh-CN", 5 ) || !strncmp( lang, "zh-Hans", 7 ))
             return 936;
@@ -1261,8 +1262,8 @@ static UINT ohos_effective_ansi_cp(void)
         if (!strncmp( lang, "ja", 2 ))
             return 932;
     }
-    /* Product default is Simplified Chinese even when musl reports C.UTF-8
-     * and LANG is not visible to win32u. */
+    if (acp == 932 || acp == 936 || acp == 950) return acp;
+    /* Product default is Simplified Chinese when no locale was selected. */
     return 936;
 }
 #else
@@ -2375,6 +2376,8 @@ static struct gdi_font_face *find_locale_fallback_face( const LOGFONTW *lf, BOOL
         {'H','a','r','m','o','n','y','O','S',' ','S','a','n','s',' ','S','C',0};
     static const WCHAR sc_notoW[] =
         {'N','o','t','o',' ','S','a','n','s',' ','C','J','K',' ','S','C',0};
+    /* HarmonyOS_Sans_TC.ttf registers as 鴻蒙黑體 on this device. */
+    static const WCHAR tc_harmonyW[] = { 0x9d3b, 0x8499, 0x9ed1, 0x9ad4, 0 };
     static const WCHAR tc_harmony_enW[] =
         {'H','a','r','m','o','n','y','O','S',' ','S','a','n','s',' ','T','C',0};
     static const WCHAR tc_notoW[] =
@@ -2392,6 +2395,7 @@ static struct gdi_font_face *find_locale_fallback_face( const LOGFONTW *lf, BOOL
         names[n++] = sc_notoW;
         break;
     case 950:
+        names[n++] = tc_harmonyW;
         names[n++] = tc_harmony_enW;
         names[n++] = tc_notoW;
         names[n++] = sc_harmonyW;

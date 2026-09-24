@@ -743,6 +743,46 @@ static const NLS_LOCALE_DATA *get_win_locale( const NLS_LOCALE_HEADER *header, c
 }
 
 
+#ifdef __OHOS__
+static BOOL ohos_env_locale_is( const char *env, const char *locale )
+{
+    size_t len = strlen( locale );
+    return !strncmp( env, locale, len ) &&
+           (!env[len] || env[len] == '.' || env[len] == '@');
+}
+
+/* OHOS musl may accept C.UTF-8 while the selected Wine locale exists only in
+ * LC_ALL/LANG. Keep the NTDLL system/user LCIDs aligned with that selection;
+ * the first Wine process then updates the prefix locale and ACP registry. */
+static LCID ohos_requested_locale( char *win_name )
+{
+    const char *env = unix_locale_from_env();
+    if (!env) return 0;
+    if (ohos_env_locale_is( env, "zh_TW" ) || ohos_env_locale_is( env, "zh-TW" ))
+    {
+        strcpy( win_name, "zh-TW" );
+        return 0x0404;
+    }
+    if (ohos_env_locale_is( env, "zh_CN" ) || ohos_env_locale_is( env, "zh-CN" ))
+    {
+        strcpy( win_name, "zh-CN" );
+        return 0x0804;
+    }
+    if (ohos_env_locale_is( env, "ja_JP" ) || ohos_env_locale_is( env, "ja-JP" ))
+    {
+        strcpy( win_name, "ja-JP" );
+        return 0x0411;
+    }
+    if (ohos_env_locale_is( env, "en_US" ) || ohos_env_locale_is( env, "en-US" ))
+    {
+        strcpy( win_name, "en-US" );
+        return 0x0409;
+    }
+    return 0;
+}
+#endif
+
+
 /******************************************************************
  *		init_locale
  */
@@ -835,22 +875,19 @@ static void init_locale(void)
     }
     if (!system_lcid) system_lcid = MAKELANGID( LANG_ENGLISH, SUBLANG_DEFAULT );
 #ifdef __OHOS__
-    if (system_lcid == MAKELANGID( LANG_ENGLISH, SUBLANG_DEFAULT ))
     {
-        const char *env = unix_locale_from_env();
-        if (!env || !strncmp( env, "zh_CN", 5 ) || !strncmp( env, "zh-CN", 5 ) ||
-            !strncmp( env, "zh_Hans", 7 ))
+        char selected_locale[LOCALE_NAME_MAX_LENGTH];
+        LCID selected_lcid = ohos_requested_locale( selected_locale );
+        if (selected_lcid)
         {
-            if ((header = read_nls_file( "locale.nls" )))
-            {
-                locale_table = (const NLS_LOCALE_HEADER *)((char *)header + header->locales);
-                locale = get_win_locale( locale_table, "zh-CN" );
-                if (locale && locale->idefaultlanguage != LOCALE_CUSTOM_UNSPECIFIED)
-                    system_lcid = locale->idefaultlanguage;
-                free( header );
-            }
-            if (system_lcid == MAKELANGID( LANG_ENGLISH, SUBLANG_DEFAULT ))
-                system_lcid = MAKELANGID( LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED );
+            system_lcid = user_lcid = selected_lcid;
+            strcpy( system_locale, selected_locale );
+            strcpy( user_locale, selected_locale );
+        }
+        else if (system_lcid == MAKELANGID( LANG_ENGLISH, SUBLANG_DEFAULT ) &&
+                 !unix_locale_from_env())
+        {
+            system_lcid = MAKELANGID( LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED );
             if (!user_lcid) user_lcid = system_lcid;
         }
     }
