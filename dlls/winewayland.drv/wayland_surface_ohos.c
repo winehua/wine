@@ -43,7 +43,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
  * the HarmonyOS side.
  *
  * Logic:
- *   WS_THICKFRAME && !WS_DLGFRAME → resizable (min=small, max=0=unlimited)
+ *   WS_THICKFRAME with frame bits other than a plain DLGFRAME → resizable
+ *   (min=small, max=0=unlimited)
  *   otherwise (dialog / message box etc.) → non-resizable (min == max == current size)
  *
  * Called from wayland_surface_reconfigure() after each xdg_toplevel
@@ -63,8 +64,9 @@ void wayland_surface_update_min_max( struct wayland_surface *surface )
     cur_h = surface->window.rect.bottom - surface->window.rect.top;
     wayland_surface_coords_from_window( surface, cur_w, cur_h, &cur_w, &cur_h );
 
-    /* WS_THICKFRAME without WS_DLGFRAME → resizable, otherwise lock size */
-    if ((style & WS_THICKFRAME) && !(style & WS_DLGFRAME))
+    /* A titled window always carries WS_DLGFRAME (WS_CAPTION = WS_BORDER | WS_DLGFRAME),
+     * so testing that bit alone would mark every standard window as fixed-size. */
+    if ((style & WS_THICKFRAME) && (style & (WS_DLGFRAME | WS_BORDER)) != WS_DLGFRAME)
     {
         /* resizable: set a small min to avoid window collapse, max=0 unlimited */
         surface->min_width  = max( 1, cur_w / 4 );
