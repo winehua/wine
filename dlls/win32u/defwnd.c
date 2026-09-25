@@ -1123,8 +1123,9 @@ static void draw_nc_frame( HDC  hdc, RECT  *rect, BOOL  active, DWORD style, DWO
         width  = get_system_metrics( SM_CXFRAME ) - get_system_metrics( SM_CXDLGFRAME );
         height = get_system_metrics( SM_CYFRAME ) - get_system_metrics( SM_CYDLGFRAME );
 
-        NtGdiSelectBrush( hdc, get_sys_color_brush( active ? COLOR_ACTIVEBORDER :
-                                                    COLOR_INACTIVEBORDER ));
+        /* 扁平化: 边框区填标题栏色, 与标题栏连成一体 (原来是一圈深色粗边) */
+        NtGdiSelectBrush( hdc, get_sys_color_brush( active ? COLOR_ACTIVECAPTION :
+                                                    COLOR_INACTIVECAPTION ));
         /* Draw frame */
         NtGdiPatBlt( hdc, rect->left, rect->top, rect->right - rect->left, height, PATCOPY );
         NtGdiPatBlt( hdc, rect->left, rect->top, width, rect->bottom - rect->top, PATCOPY );
@@ -1282,124 +1283,10 @@ static int make_square_rect( RECT *src, RECT *dst )
    return small_diam;
 }
 
-static void draw_checked_rect( HDC dc, RECT *rect )
-{
-    if (get_sys_color( COLOR_BTNHIGHLIGHT ) == RGB( 255, 255, 255 ))
-    {
-      HBRUSH prev_brush;
-      DWORD prev_bg;
-
-      fill_rect( dc, rect, get_sys_color_brush( COLOR_BTNFACE ));
-      NtGdiGetAndSetDCDword( dc, NtGdiSetBkColor, RGB(255, 255, 255), &prev_bg );
-      prev_brush = NtGdiSelectBrush( dc, get_55aa_brush() );
-      NtGdiPatBlt( dc, rect->left, rect->top, rect->right-rect->left,
-                   rect->bottom-rect->top, 0x00fa0089 );
-      NtGdiSelectBrush( dc, prev_brush );
-      NtGdiGetAndSetDCDword( dc, NtGdiSetBkColor, prev_bg, NULL );
-    }
-    else
-    {
-        fill_rect( dc, rect, get_sys_color_brush( COLOR_BTNHIGHLIGHT ));
-    }
-}
-
-static BOOL draw_push_button( HDC dc, RECT *r, UINT flags )
-{
-    RECT rect = *r;
-    UINT edge;
-
-    if (flags & (DFCS_PUSHED | DFCS_CHECKED | DFCS_FLAT))
-        edge = EDGE_SUNKEN;
-    else
-        edge = EDGE_RAISED;
-
-    if (flags & DFCS_CHECKED)
-    {
-        if (flags & DFCS_MONO)
-            draw_rect_edge( dc, &rect, edge, BF_MONO|BF_RECT|BF_ADJUST, 1 );
-        else
-            draw_rect_edge( dc, &rect, edge, (flags & DFCS_FLAT)|BF_RECT|BF_SOFT|BF_ADJUST, 1 );
-        if (!(flags & DFCS_TRANSPARENT)) draw_checked_rect( dc, &rect );
-    }
-    else
-    {
-        if (flags & DFCS_MONO)
-        {
-            draw_rect_edge( dc, &rect, edge, BF_MONO|BF_RECT|BF_ADJUST, 1 );
-            if (!(flags & DFCS_TRANSPARENT))
-                fill_rect( dc, &rect, get_sys_color_brush( COLOR_BTNFACE ));
-        }
-        else
-        {
-            UINT edge_flags = BF_RECT | BF_SOFT | (flags & DFCS_FLAT);
-            if (!(flags & DFCS_TRANSPARENT)) edge_flags |= BF_MIDDLE;
-            draw_rect_edge( dc, r, edge, edge_flags, 1 );
-        }
-    }
-
-    /* Adjust rectangle if asked */
-    if (flags & DFCS_ADJUSTRECT) InflateRect( r, -2, -2 );
-    return TRUE;
-}
-
-static BOOL draw_frame_caption( HDC dc, RECT *r, UINT flags )
-{
-    RECT rect;
-    int small_diam = make_square_rect( r, &rect ) - 2;
-    HFONT prev_font, font;
-    int color_idx = flags & DFCS_INACTIVE ? COLOR_BTNSHADOW : COLOR_BTNTEXT;
-    int xc = (rect.left + rect.right) / 2;
-    int yc = (rect.top + rect.bottom) / 2;
-    LOGFONTW lf = { 0 };
-    WCHAR str[] = {0, 0};
-    DWORD prev_align, prev_bk;
-    COLORREF prev_color;
-    SIZE size;
-
-    static const WCHAR marlettW[] = {'M','a','r','l','e','t','t',0};
-
-    draw_push_button( dc, r, flags & 0xff00 );
-
-    switch (flags & 0xf)
-    {
-    case DFCS_CAPTIONCLOSE:    str[0] = 0x72; break;
-    case DFCS_CAPTIONHELP:     str[0] = 0x73; break;
-    case DFCS_CAPTIONMIN:      str[0] = 0x30; break;
-    case DFCS_CAPTIONMAX:      str[0] = 0x31; break;
-    case DFCS_CAPTIONRESTORE:  str[0] = 0x32; break;
-    default:
-        WARN( "Invalid caption; flags=0x%04x\n", flags );
-        return FALSE;
-    }
-
-    lf.lfHeight = -small_diam;
-    lf.lfWeight = FW_NORMAL;
-    lf.lfCharSet = SYMBOL_CHARSET;
-    lf.lfPitchAndFamily = FIXED_PITCH | FF_DONTCARE;
-    memcpy( lf.lfFaceName, marlettW, sizeof(marlettW) );
-    font = NtGdiHfontCreate( &lf, sizeof(lf), 0, 0, NULL );
-    NtGdiGetAndSetDCDword( dc, NtGdiSetTextAlign, TA_TOP | TA_LEFT, &prev_align );
-    NtGdiGetAndSetDCDword( dc, NtGdiSetBkMode, TRANSPARENT, &prev_bk );
-    NtGdiGetDCDword( dc, NtGdiGetTextColor, &prev_color );
-    prev_font = NtGdiSelectFont( dc, font );
-    NtGdiGetTextExtentExW( dc, str, 1, 0, NULL, NULL, &size, 0 );
-
-    if (flags & DFCS_INACTIVE)
-    {
-        NtGdiGetAndSetDCDword( dc, NtGdiSetTextColor, get_sys_color(COLOR_BTNHIGHLIGHT), NULL );
-        NtGdiExtTextOutW( dc, xc-size.cx/2+1, yc-size.cy/2+1, 0, NULL, str, 1, NULL, 0 );
-    }
-    NtGdiGetAndSetDCDword( dc, NtGdiSetTextColor, get_sys_color( color_idx ), NULL );
-    NtGdiExtTextOutW( dc, xc-size.cx/2, yc-size.cy/2, 0, NULL, str, 1, NULL, 0 );
-
-    NtGdiSelectFont(dc, prev_font);
-    NtGdiGetAndSetDCDword( dc, NtGdiSetTextColor, prev_color, NULL );
-    NtGdiGetAndSetDCDword( dc, NtGdiSetTextAlign, prev_align, NULL );
-    NtGdiGetAndSetDCDword( dc, NtGdiSetBkMode, prev_bk, NULL );
-    NtGdiDeleteObjectApp( font );
-
-    return TRUE;
-}
+/* 原先的经典标题栏按钮绘制链 (draw_checked_rect / draw_push_button /
+ * draw_frame_caption, 后者用 Marlett 字体画 ✕ □ — 字形) 已整体移除:
+ * draw_*_button 现在统一走 draw_menu_button 的主题通道, 主题不可用时由
+ * user32 的 USER_NonClientButtonDraw 回退, 不再经过这条链。 */
 
 void draw_menu_button( HWND hwnd, HDC dc, RECT *r, enum NONCLIENT_BUTTON_TYPE type, BOOL down, BOOL grayed )
 {
@@ -1487,12 +1374,46 @@ BOOL draw_frame_menu( HDC dc, RECT *r, UINT flags )
     return retval;
 }
 
+/* (winehua) 标题栏按钮统一为正方形。
+ * 旧实现三个按钮各自算矩形: 宽 = SM_CXSIZE - 2、高 = SM_CYSIZE - 4。这两个度量
+ * 来源不同 (宽来自注册表 CaptionWidth, 高来自 NONCLIENTMETRICS.iCaptionHeight),
+ * 高 DPI 下宽度明显小于高度, 视觉上是个窄高矩形。这里统一取二者的较大值作为
+ * 正方形边长。绘制 (三个 draw_*_button)、标题布局递推 (draw_nc_caption) 与
+ * 命中测试 (WM_NCHITTEST) 共用本函数, 保证可点区域和画出来的按钮一致。 */
+static int caption_button_size(void)
+{
+    int cx = get_system_metrics( SM_CXSIZE );
+    int cy = get_system_metrics( SM_CYSIZE );
+    int caption = get_system_metrics( SM_CYCAPTION );
+    int size = max( cx - 2, cy - 4 );
+    static int logged;
+
+    if (size > caption - 3) size = caption - 3; /* 竖直方向不超出标题栏 */
+
+    if (logged++ < 3)
+        ERR( "[BTN-DIAG] CXSIZE=%d CYSIZE=%d CYCAPTION=%d size=%d\n",
+             cx, cy, caption, size );
+    return size;
+}
+
+/* 取从右往左第 index 个标题栏按钮的矩形 (0=关闭, 1=最大化, 2=最小化) */
+static void get_caption_button_rect( HWND hwnd, RECT *rect, DWORD style,
+                                     DWORD ex_style, int index )
+{
+    int size = caption_button_size();
+
+    get_inside_rect( hwnd, COORDS_WINDOW, rect, style, ex_style );
+    rect->right -= 2 + index * (size + 2);
+    rect->left = rect->right - size;
+    rect->top += (get_system_metrics( SM_CYCAPTION ) - size) / 2;
+    rect->bottom = rect->top + size;
+}
+
 static void draw_close_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
 {
     RECT rect;
     DWORD style = get_window_long( hwnd, GWL_STYLE );
     DWORD ex_style = get_window_long( hwnd, GWL_EXSTYLE );
-    UINT flags = DFCS_CAPTIONCLOSE;
 
     get_inside_rect( hwnd, COORDS_WINDOW, &rect, style, ex_style );
 
@@ -1512,64 +1433,45 @@ static void draw_close_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
     }
     else
     {
-        rect.left = rect.right - get_system_metrics( SM_CXSIZE );
-        rect.bottom = rect.top + get_system_metrics( SM_CYSIZE ) - 2;
-        rect.top += 2;
-        rect.right -= 2;
+        get_caption_button_rect( hwnd, &rect, style, ex_style, 0 );
     }
 
-    if (down) flags |= DFCS_PUSHED;
-    if (grayed) flags |= DFCS_INACTIVE;
-    draw_frame_caption( hdc, &rect, flags );
+    /* 走 uxtheme 的主题通道: 主题激活时用主题素材 (WP_CLOSEBUTTON 等),
+     * 否则由 user32 的 USER_NonClientButtonDraw 回退到经典 Marlett 画法。
+     * 原先这里直接调 draw_frame_caption, 使标题栏按钮永远无法被主题化。 */
+    draw_menu_button( hwnd, hdc, &rect, MENU_CLOSE_BUTTON, down, grayed );
 }
 
 static void draw_max_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
 {
     RECT rect;
-    UINT flags;
     DWORD style = get_window_long( hwnd, GWL_STYLE );
     DWORD ex_style = get_window_long( hwnd, GWL_EXSTYLE );
 
     /* never draw maximize box when window has WS_EX_TOOLWINDOW style */
     if (ex_style & WS_EX_TOOLWINDOW) return;
 
-    flags = (style & WS_MAXIMIZE) ? DFCS_CAPTIONRESTORE : DFCS_CAPTIONMAX;
-
-    get_inside_rect( hwnd, COORDS_WINDOW, &rect, style, ex_style );
-    if (style & WS_SYSMENU) rect.right -= get_system_metrics( SM_CXSIZE );
-    rect.left = rect.right - get_system_metrics( SM_CXSIZE );
-    rect.bottom = rect.top + get_system_metrics( SM_CYSIZE ) - 2;
-    rect.top += 2;
-    rect.right -= 2;
-    if (down) flags |= DFCS_PUSHED;
-    if (grayed) flags |= DFCS_INACTIVE;
-    draw_frame_caption( hdc, &rect, flags );
+    get_caption_button_rect( hwnd, &rect, style, ex_style, (style & WS_SYSMENU) ? 1 : 0 );
+    draw_menu_button( hwnd, hdc, &rect,
+                      (style & WS_MAXIMIZE) ? MENU_RESTORE_BUTTON : MENU_MAX_BUTTON,
+                      down, grayed );
 }
 
 static void draw_min_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
 {
     RECT rect;
-    UINT flags;
     DWORD style = get_window_long( hwnd, GWL_STYLE );
     DWORD ex_style = get_window_long( hwnd, GWL_EXSTYLE );
 
     /* never draw minimize box when window has WS_EX_TOOLWINDOW style */
     if (ex_style & WS_EX_TOOLWINDOW) return;
 
-    flags = (style & WS_MINIMIZE) ? DFCS_CAPTIONRESTORE : DFCS_CAPTIONMIN;
-
-    get_inside_rect( hwnd, COORDS_WINDOW, &rect, style, ex_style );
-    if (style & WS_SYSMENU)
-        rect.right -= get_system_metrics( SM_CXSIZE );
-    if (style & (WS_MAXIMIZEBOX|WS_MINIMIZEBOX))
-        rect.right -= get_system_metrics( SM_CXSIZE ) - 2;
-    rect.left = rect.right - get_system_metrics( SM_CXSIZE );
-    rect.bottom = rect.top + get_system_metrics( SM_CYSIZE ) - 2;
-    rect.top += 2;
-    rect.right -= 2;
-    if (down) flags |= DFCS_PUSHED;
-    if (grayed) flags |= DFCS_INACTIVE;
-    draw_frame_caption( hdc, &rect, flags );
+    get_caption_button_rect( hwnd, &rect, style, ex_style,
+                             ((style & WS_SYSMENU) ? 1 : 0) +
+                             ((style & (WS_MAXIMIZEBOX|WS_MINIMIZEBOX)) ? 1 : 0) );
+    draw_menu_button( hwnd, hdc, &rect,
+                      (style & WS_MINIMIZE) ? MENU_RESTORE_BUTTON : MENU_MIN_BUTTON,
+                      down, grayed );
 }
 
 static void draw_nc_caption( HDC hdc, RECT *rect, HWND hwnd, DWORD  style,
@@ -1579,7 +1481,6 @@ static void draw_nc_caption( HDC hdc, RECT *rect, HWND hwnd, DWORD  style,
     WCHAR buffer[256];
     HPEN prev_pen;
     HMENU sys_menu;
-    BOOL gradient = FALSE;
     UINT pen_color = COLOR_3DFACE;
     int len;
 
@@ -1591,8 +1492,9 @@ static void draw_nc_caption( HDC hdc, RECT *rect, HWND hwnd, DWORD  style,
     NtGdiSelectPen( hdc, prev_pen );
     r.bottom--;
 
-    NtUserSystemParametersInfo( SPI_GETGRADIENTCAPTIONS, 0, &gradient, 0 );
-    draw_caption_bar( hdc, &r, style, active, gradient );
+    /* 扁平化: 标题栏固定纯色。渐变是"老 Windows 感"的主要来源, 且主题
+     * 无法控制它 (SPI_GETGRADIENTCAPTIONS 由注册表决定)。 */
+    draw_caption_bar( hdc, &r, style, active, FALSE );
 
     if ((style & WS_SYSMENU) && !(ex_style & WS_EX_TOOLWINDOW))
     {
@@ -1603,6 +1505,7 @@ static void draw_nc_caption( HDC hdc, RECT *rect, HWND hwnd, DWORD  style,
     if (style & WS_SYSMENU)
     {
         UINT state;
+        int button_size = caption_button_size(); /* 三个按钮同一尺寸, 只取一次 */
 
         /* Go get the sysmenu */
         sys_menu = NtUserGetSystemMenu( hwnd, FALSE );
@@ -1611,15 +1514,15 @@ static void draw_nc_caption( HDC hdc, RECT *rect, HWND hwnd, DWORD  style,
         /* Draw a grayed close button if disabled or if SC_CLOSE is not there */
         draw_close_button( hwnd, hdc, FALSE,
                            (state & (MF_DISABLED | MF_GRAYED)) || (state == 0xFFFFFFFF) );
-        r.right -= get_system_metrics( SM_CYCAPTION ) - 1;
+        r.right -= button_size + 2;
 
         if ((style & WS_MAXIMIZEBOX) || (style & WS_MINIMIZEBOX))
         {
             draw_max_button( hwnd, hdc, FALSE, !(style & WS_MAXIMIZEBOX) );
-            r.right -= get_system_metrics( SM_CXSIZE ) + 1;
+            r.right -= button_size + 2;
 
             draw_min_button( hwnd, hdc, FALSE, !(style & WS_MINIMIZEBOX) );
-            r.right -= get_system_metrics( SM_CXSIZE ) + 1;
+            r.right -= button_size + 2;
         }
     }
 
@@ -1788,7 +1691,22 @@ static void nc_paint( HWND hwnd, HRGN clip )
     if (has_static_outer_frame( ex_style ))
         draw_rect_edge( hdc, &rect, BDR_SUNKENOUTER, BF_RECT | BF_ADJUST, 1 );
     else if (has_big_frame( style, ex_style ))
-        draw_rect_edge( hdc, &rect, EDGE_RAISED, BF_RECT | BF_ADJUST, 1 );
+    {
+        /* 扁平化: 最外 1px 圈用标题栏色填充 — 去掉原 EDGE_RAISED 的明暗立体
+         * 双线, 但**绘制本身必须保留**: 只做 InflateRect 会让这一圈在整个
+         * nc_paint 里无人绘制 (内侧的 draw_nc_frame / draw_nc_caption 都在
+         * 内缩后的 rect 上工作, 不覆盖它), buffer 重建 (窗口还原 / 子窗口
+         * 重新显示) 后露出未初始化底色 — 实测表现为窗口四周 1px 黑边,
+         * 2026-09-14 "窗口还原后标题栏顶上有黑线"。 */
+        RECT r = rect;
+        NtGdiSelectBrush( hdc, get_sys_color_brush( active ? COLOR_ACTIVECAPTION
+                                                          : COLOR_INACTIVECAPTION ));
+        NtGdiPatBlt( hdc, r.left, r.top, r.right - r.left, 1, PATCOPY );
+        NtGdiPatBlt( hdc, r.left, r.top, 1, r.bottom - r.top, PATCOPY );
+        NtGdiPatBlt( hdc, r.left, r.bottom - 1, r.right - r.left, -1, PATCOPY );
+        NtGdiPatBlt( hdc, r.right - 1, r.top, -1, r.bottom - r.top, PATCOPY );
+        InflateRect( &rect, -1, -1 );
+    }
 
     draw_nc_frame( hdc, &rect, active, style, ex_style );
 
@@ -2032,6 +1950,8 @@ LRESULT handle_nc_hit_test( HWND hwnd, POINT pt )
         if (!PtInRect( &rects.window, pt ))
         {
             BOOL min_or_max_box = (style & WS_SYSMENU) && (style & (WS_MINIMIZEBOX | WS_MAXIMIZEBOX));
+            int button_size = caption_button_size(); /* 三个按钮同一尺寸, 只取一次 */
+
             if (ex_style & WS_EX_LAYOUTRTL)
             {
                 /* Check system menu */
@@ -2045,18 +1965,18 @@ LRESULT handle_nc_hit_test( HWND hwnd, POINT pt )
                 /* Check close button */
                 if (style & WS_SYSMENU)
                 {
-                    rects.window.left += get_system_metrics( SM_CYCAPTION );
+                    rects.window.left += button_size + 2;
                     if (pt.x < rects.window.left) return HTCLOSE;
                 }
 
                 if (min_or_max_box && !(ex_style & WS_EX_TOOLWINDOW))
                 {
                     /* Check maximize box */
-                    rects.window.left += get_system_metrics( SM_CXSIZE );
+                    rects.window.left += button_size + 2;
                     if (pt.x < rects.window.left) return HTMAXBUTTON;
 
                     /* Check minimize box */
-                    rects.window.left += get_system_metrics( SM_CXSIZE );
+                    rects.window.left += button_size + 2;
                     if (pt.x < rects.window.left) return HTMINBUTTON;
                 }
             }
@@ -2073,18 +1993,18 @@ LRESULT handle_nc_hit_test( HWND hwnd, POINT pt )
                 /* Check close button */
                 if (style & WS_SYSMENU)
                 {
-                    rects.window.right -= get_system_metrics( SM_CYCAPTION );
+                    rects.window.right -= button_size + 2;
                     if (pt.x > rects.window.right) return HTCLOSE;
                 }
 
                 if (min_or_max_box && !(ex_style & WS_EX_TOOLWINDOW))
                 {
                     /* Check maximize box */
-                    rects.window.right -= get_system_metrics( SM_CXSIZE );
+                    rects.window.right -= button_size + 2;
                     if (pt.x > rects.window.right) return HTMAXBUTTON;
 
                     /* Check minimize box */
-                    rects.window.right -= get_system_metrics( SM_CXSIZE );
+                    rects.window.right -= button_size + 2;
                     if (pt.x > rects.window.right) return HTMINBUTTON;
                 }
             }
