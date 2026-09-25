@@ -393,6 +393,18 @@ static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen)
     /* child windows are not managed */
     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
+    /* WineHua: 显式设了 owner 的装饰浮层 (分层 + 不激活 + 工具窗) 不是用户感知的
+     * 独立窗口。程序用这类窗口画阴影/外框, Windows 下靠 DWM 按 z 序合成才看起来
+     * 是一体; X11 下靠 WM 识别 WS_EX_TOOLWINDOW 来特殊处理。Wayland 的
+     * xdg_toplevel 没有"工具窗口"概念, 唯一能表达依附关系的就是下面调用处的
+     * owner_hint → wl_subsurface 路径。这类窗口若在这里因 WS_SYSMENU 之类判为
+     * 受管 (企业微信阴影窗口 style 含 WS_POPUP|WS_SYSMENU 即命中), 调用处的
+     * `&&` 会短路丢掉 owner_hint, 装饰窗口就各自变成一个独立顶层窗口。
+     * 限定"有 owner"是为了不误伤无主的浮动面板/迷你窗口等真正独立的窗口。 */
+    ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+    if ((ex_style & (WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW)) ==
+        (WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW) &&
+        NtUserGetWindowRelative(hwnd, GW_OWNER)) return FALSE;
     /* activated windows are managed */
     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
     if (hwnd == get_active_window()) return TRUE;
