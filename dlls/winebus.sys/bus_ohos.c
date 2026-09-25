@@ -1,8 +1,9 @@
 /*
- * WineHua OHOS Controller Hub bus — WHGP AF_UNIX → HID gamepad (DirectInput).
+ * WineHua OHOS Controller Hub bus — WHGP AF_UNIX → HID gamepad
+ * (DirectInput + XInput compat) with haptics rumble back to the host.
  *
- * Activated when WINEHUA_GAMEPAD_ENABLE=1 and WINEHUA_GAMEPAD_MODE!=keyboard_legacy.
- * Socket path: WINEHUA_GAMEPAD_SOCKET.
+ * Inactive only when WINEHUA_GAMEPAD_MODE=keyboard_legacy or ENABLE=0.
+ * Socket path: WINEHUA_GAMEPAD_SOCKET or $WINEPREFIX/whgp.sock.
  */
 
 #if 0
@@ -21,6 +22,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 
 #include "ntstatus.h"
@@ -211,17 +213,72 @@ static void ohos_device_stop(struct unix_device *iface)
     pthread_mutex_unlock(&ohos_cs);
 }
 
+static USHORT max_ushort(USHORT a, USHORT b)
+{
+    return a > b ? a : b;
+}
+
+static BOOL send_whgp_rumble(USHORT low, USHORT high, UINT duration_ms)
+{
+    struct whgp_header hdr;
+    struct whgp_rumble_v1 body;
+    struct iovec iov[2];
+    int fd;
+
+    memset(&hdr, 0, sizeof(hdr));
+    memset(&body, 0, sizeof(body));
+    hdr.magic = WHGP_MAGIC;
+    hdr.version = WHGP_VERSION;
+    hdr.msg_type = WHGP_MSG_RUMBLE;
+    hdr.slot = 0;
+    hdr.payload_size = sizeof(body);
+    body.low = low;
+    body.high = high;
+    body.duration_ms = duration_ms;
+
+    iov[0].iov_base = &hdr;
+    iov[0].iov_len = sizeof(hdr);
+    iov[1].iov_base = &body;
+    iov[1].iov_len = sizeof(body);
+
+    pthread_mutex_lock(&ohos_cs);
+    fd = sock_fd;
+    if (fd < 0)
+    {
+        pthread_mutex_unlock(&ohos_cs);
+        return FALSE;
+    }
+    if (writev(fd, iov, 2) != (ssize_t)(sizeof(hdr) + sizeof(body)))
+    {
+        WARN("WHGP rumble write failed errno=%d\n", errno);
+        if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN || errno == EBADF)
+            close_socket();
+        pthread_mutex_unlock(&ohos_cs);
+        return FALSE;
+    }
+    pthread_mutex_unlock(&ohos_cs);
+    return TRUE;
+}
+
 static NTSTATUS ohos_device_haptics_start(struct unix_device *iface, UINT duration_ms,
                                           USHORT rumble_intensity, USHORT buzz_intensity,
                                           USHORT left_intensity, USHORT right_intensity)
 {
-    TRACE("iface %p duration %u (stub)\n", iface, duration_ms);
-    return STATUS_NOT_SUPPORTED;
+    USHORT low = max_ushort(rumble_intensity, left_intensity);
+    USHORT high = max_ushort(buzz_intensity, right_intensity);
+
+    TRACE("iface %p duration %u rumble %u buzz %u left %u right %u\n",
+          iface, duration_ms, rumble_intensity, buzz_intensity, left_intensity, right_intensity);
+
+    if (!duration_ms) duration_ms = 250;
+    send_whgp_rumble(low, high, duration_ms);
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS ohos_device_haptics_stop(struct unix_device *iface)
 {
-    TRACE("iface %p (stub)\n", iface);
+    TRACE("iface %p\n", iface);
+    send_whgp_rumble(0, 0, 0);
     return STATUS_SUCCESS;
 }
 
@@ -276,7 +333,7 @@ static BOOL create_virtual_gamepad(UINT slot)
         .input = -1,
         .uid = 0x57484750, /* 'WHGP' */
         .bus_type = BUS_TYPE_USB,
-        .is_gamepad = FALSE, /* Generic HID → DirectInput path */
+        .is_gamepad = TRUE, /* XInput compat GUID + DirectInput HID */
         .manufacturer = {'W','i','n','e','H','u','a',0},
         .product = {'W','i','n','e','H','u','a',' ','V','i','r','t','u','a','l',' ','G','a','m','e','p','a','d',0},
         .serialnumber = {'0','0','0','1',0},
@@ -292,6 +349,7 @@ static BOOL create_virtual_gamepad(UINT slot)
 
     if (!hid_device_begin_report_descriptor(&impl->unix_device, &device_usage) ||
         !hid_device_add_gamepad(&impl->unix_device) ||
+        !hid_device_add_haptics(&impl->unix_device) ||
         !hid_device_end_report_descriptor(&impl->unix_device))
     {
         ERR("failed to build gamepad descriptor\n");

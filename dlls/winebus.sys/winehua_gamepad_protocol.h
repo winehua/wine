@@ -11,6 +11,7 @@
 #define WHGP_VERSION 1
 #define WHGP_MSG_STATE 1
 #define WHGP_MSG_RESET 2
+#define WHGP_MSG_RUMBLE 3
 
 #pragma pack(push, 1)
 struct whgp_header
@@ -34,6 +35,14 @@ struct whgp_state_v1
     int8_t hat_x; /* -1/0/+1 */
     int8_t hat_y;
     uint8_t reserved[2];
+};
+
+/* Wine → host. duration_ms 0 means "until next update". */
+struct whgp_rumble_v1
+{
+    uint16_t low;
+    uint16_t high;
+    uint32_t duration_ms;
 };
 #pragma pack(pop)
 
