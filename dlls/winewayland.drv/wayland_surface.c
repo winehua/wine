@@ -323,6 +323,11 @@ void wayland_surface_destroy(struct wayland_surface *surface)
      * this surface if it is recreated). */
     NtUserSetProp(surface->hwnd, winehua_window_surface_prop, NULL);
 
+#ifdef __OHOS__
+    /* WineHua: 释放前上报模态解除 (wl_surface 仍在, 合成器按 id 清理) */
+    winehua_modal_release(surface);
+#endif
+
     if (surface->wp_viewport)
     {
         wp_viewport_destroy(surface->wp_viewport);

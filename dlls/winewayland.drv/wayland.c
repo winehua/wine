@@ -200,6 +200,13 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
             wl_registry_bind(registry, id, &wp_cursor_shape_manager_v1_interface,
                              version < 2 ? version : 2);
     }
+#ifdef __OHOS__
+    else if (strcmp(interface, "winehua_toplevel") == 0)
+    {
+        process_wayland.winehua_toplevel =
+            wl_registry_bind(registry, id, &winehua_toplevel_interface, 1);
+    }
+#endif
 }
 
 static void registry_handle_global_remove(void *data, struct wl_registry *registry,
