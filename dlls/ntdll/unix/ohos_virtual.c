@@ -66,6 +66,106 @@ int ohos_call_pe_fault( void *fn, void *teb, int sig, int si_code, void *addr,
 
 
 /***********************************************************************
+ *           ohos_anon_replace_page
+ *
+ * Replace one file-backed page with an anonymous page, keeping content.
+ *
+ * OHOS noexec filesystems refuse PROT_EXEC on pages that come from a file
+ * mapping (EACCES).  The JIT prctl does not help there — it only unlocks
+ * anonymous pages.  Packed executables remap their whole image RWX to
+ * decrypt, which hits any section that is still file-backed (.data, .edata,
+ * .rdata ...), not just the executable ones handled by
+ * ohos_map_exec_section().  noexec only forbids PROT_EXEC, RW stays
+ * allowed, so the page can be copied out first, remapped anonymous, and
+ * copied back — afterwards adding PROT_EXEC succeeds.
+ *
+ * len must not exceed one page: tmp is a single-page scratch buffer and the
+ * MAP_FIXED remap rounds up to a page boundary, so a larger len would both
+ * overflow tmp and clobber memory past the intended range.
+ */
+static int ohos_anon_replace_page( char *page, size_t len, int unix_prot, char *tmp )
+{
+    if (mprotect( page, len, PROT_READ | PROT_WRITE ))
+    {
+        fprintf( stderr, "[OHOS-VIRT] cannot make %p readable: %s\n", page, strerror( errno ) );
+        return -1;
+    }
+    memcpy( tmp, page, len );
+
+    if (mmap( page, len, PROT_READ | PROT_WRITE,
+              MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0 ) == MAP_FAILED)
+    {
+        fprintf( stderr, "[OHOS-VIRT] cannot remap %p anonymous: %s\n", page, strerror( errno ) );
+        return -1;
+    }
+    memcpy( page, tmp, len );
+
+    if (mprotect( page, len, unix_prot ))
+    {
+        fprintf( stderr, "[OHOS-VIRT] cannot set prot %#x on %p: %s\n",
+                 unix_prot, page, strerror( errno ) );
+        return -1;
+    }
+    return 0;
+}
+
+
+/***********************************************************************
+ *           ohos_anon_replace_range
+ *
+ * Page-by-page fallback for ohos_mprotect_exec(): every page whose
+ * mprotect() still fails gets swapped to anonymous memory.  Pages that
+ * succeed are left untouched, so a range mixing anon and file-backed
+ * pages only pays for the file-backed ones.
+ *
+ * Note the page loses MAP_SHARED semantics if it had any.  PE image
+ * mapping is MAP_PRIVATE (write-copy), so sections are safe; a shared
+ * section remapped executable would silently become process-local.  That
+ * combination has not been observed, and the alternative is the failure
+ * this function exists to work around.
+ */
+static int ohos_anon_replace_range( char *addr, size_t size, int unix_prot )
+{
+    long page_size = sysconf( _SC_PAGESIZE );
+    char *tmp;
+    size_t done, replaced = 0;
+
+    if (page_size <= 0) page_size = 4096;
+    /* mprotect_range() always passes page-aligned ranges; a partial page
+     * would make MAP_FIXED clobber memory outside the range. */
+    if (size % page_size) return -1;
+
+    tmp = mmap( NULL, page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0 );
+    if (tmp == MAP_FAILED) return -1;
+
+    for (done = 0; done < size; done += page_size)
+    {
+        char *page = addr + done;
+
+        if (mprotect( page, page_size, unix_prot ) == 0) continue;  /* already anon */
+
+        if (errno != EACCES && errno != EPERM)
+        {
+            fprintf( stderr, "[OHOS-VIRT] mprotect %p failed: %s\n", page, strerror( errno ) );
+            munmap( tmp, page_size );
+            return -1;
+        }
+        if (ohos_anon_replace_page( page, page_size, unix_prot, tmp ))
+        {
+            munmap( tmp, page_size );
+            return -1;
+        }
+        replaced++;
+    }
+
+    fprintf( stderr, "[OHOS-VIRT] %p-%p: replaced %zu/%zu pages with anon\n",
+             addr, addr + size, replaced, size / page_size );
+    munmap( tmp, page_size );
+    return 0;
+}
+
+
+/***********************************************************************
  *           ohos_mprotect_exec
  *
  * mprotect wrapper for OHOS noexec filesystem.
@@ -95,6 +195,27 @@ int ohos_mprotect_exec( void *base, size_t size, int unix_prot )
         return 0;
     }
     const int first_errno = errno;
+
+    /* 文件映射页在 noexec 文件系统上加 PROT_EXEC 会被拒 (EACCES/EPERM) ——
+     * 加壳程序把整个模块 (含 .data/.edata/.rdata) 改 RWX 解密时命中, 且壳不
+     * 检查返回值继续写 → 只读页写入 → Access Violation。逐页换匿名页能保留
+     * 请求的保护位 (含 EXEC), 比下面的 RW 降级更完整, 所以先试它; 只有换页
+     * 也失败 (非 EACCES/EPERM 的硬错误) 才落到降级分支。 */
+    if ((first_errno == EACCES || first_errno == EPERM) &&
+        !ohos_anon_replace_range( base, size, unix_prot ))
+    {
+        if (wx_log_count < 32)
+        {
+            char buf[208];
+            int n = snprintf( buf, sizeof(buf),
+                              "[WX-MPROTECT] pid=%d req=0x%x rwx=%d jit_rc=%d first=FAIL errno=%d "
+                              "anon_replace=OK base=%p size=%zu\n",
+                              getpid(), unix_prot, want_rwx, jit_rc, first_errno, base, size );
+            wx_log_count++;
+            if (n > 0) write( 2, buf, (size_t)(n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1) );
+        }
+        return 0;
+    }
 
     /* Anonymous RWX mmap is EPERM on OHOS. mprotect(RWX) is often rejected
      * too (W^X). Dynarec unprotect only needs the guest page writable —
