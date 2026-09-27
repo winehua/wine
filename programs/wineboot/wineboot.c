@@ -1990,6 +1990,21 @@ int __cdecl main( int argc, char *argv[] )
 
     WINE_TRACE("Operation done\n");
 
+#if defined(__aarch64__) && defined(__WINE_PE_BUILD)
+    /* WineHua keeps wineserver alive across the session.  Its normal exit
+     * path therefore cannot persist a new prefix's registry before the app
+     * checks that wineboot completed.  Flush both required branches while the
+     * Wine client can still serialize them through NtFlushKey. */
+    if (init)
+    {
+        LONG status;
+        if ((status = RegFlushKey( HKEY_LOCAL_MACHINE )) != ERROR_SUCCESS)
+            WINE_ERR( "failed to flush system registry: %ld\n", status );
+        if ((status = RegFlushKey( HKEY_CURRENT_USER )) != ERROR_SUCCESS)
+            WINE_ERR( "failed to flush user registry: %ld\n", status );
+    }
+#endif
+
     SetEvent( event );
     return 0;
 }

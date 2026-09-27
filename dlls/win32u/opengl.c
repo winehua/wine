@@ -3648,6 +3648,12 @@ const struct opengl_funcs *__wine_get_opengl_driver( UINT version )
 BOOL get_opengl_gpus( struct list *gpus )
 {
     struct egl_platform *egl;
+    const char *vulkan_backend = getenv( "WINEHUA_VULKAN_BACKEND" );
+
+    /* A Direct Vulkan process does not need the VirGL/EGL device inventory.
+     * Initializing it here can abort before an offscreen Vulkan app reaches
+     * vkCreateInstance when the separate VirGL service is unavailable. */
+    if (vulkan_backend && !strcmp( vulkan_backend, "direct" )) return TRUE;
 
     if (!__wine_get_opengl_driver( WINE_OPENGL_DRIVER_VERSION )) return FALSE;
 

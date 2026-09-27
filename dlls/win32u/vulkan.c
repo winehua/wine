@@ -64,9 +64,16 @@ static int fshack_enabled = -1;
 #define WINEHUA_VULKAN_SURFACE_TAG UINT64_C(0x5748530000000000)
 #define WINEHUA_VULKAN_SWAPCHAIN_TAG UINT64_C(0x5748430000000000)
 
+static BOOL winehua_direct_vulkan_enabled(void)
+{
+    const char *value = getenv("WINEHUA_VULKAN_BACKEND");
+    return value && !strcmp(value, "direct");
+}
+
 static BOOL winehua_vulkan_present_enabled(void)
 {
     const char *value = getenv("WINEHUA_VULKAN_PRESENT");
+    if (winehua_direct_vulkan_enabled()) return FALSE;
     if (value && value[0] && strcmp(value, "0")) return TRUE;
     value = getenv("WINEHUA_PRESENT_BACKEND");
     if (value && (!strcmp(value, "venus_broker_present") ||
@@ -5204,8 +5211,14 @@ static void vulkan_init_once(void)
     fshack_enabled = !env || !atoi( env );
 
 #ifdef SONAME_LIBVULKAN
-    vulkan_handle = dlopen( SONAME_LIBVULKAN, RTLD_NOW );
-    if (!vulkan_handle) ERR( "Failed to load %s\n", SONAME_LIBVULKAN );
+    {
+        const char *loader = winehua_direct_vulkan_enabled() ?
+            "/system/lib64/libvulkan.so" : SONAME_LIBVULKAN;
+        vulkan_handle = dlopen( loader, RTLD_NOW );
+        if (!vulkan_handle) ERR( "Failed to load %s: %s\n", loader, dlerror() );
+        else WARN( "WineHua Vulkan backend=%s loader=%s\n",
+                   winehua_direct_vulkan_enabled() ? "direct" : "venus", loader );
+    }
 #else
     ERR( "Wine was built without Vulkan support.\n" );
 #endif

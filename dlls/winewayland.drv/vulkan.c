@@ -44,9 +44,16 @@ static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
  * is later paired with the client pid by the Host presenter. */
 #define WINEHUA_VULKAN_SURFACE_TAG UINT64_C(0x5748530000000000)
 
+static BOOL winehua_direct_vulkan_enabled(void)
+{
+    const char *value = getenv("WINEHUA_VULKAN_BACKEND");
+    return value && !strcmp(value, "direct");
+}
+
 static BOOL winehua_vulkan_present_enabled(void)
 {
     const char *value = getenv("WINEHUA_VULKAN_PRESENT");
+    if (winehua_direct_vulkan_enabled()) return FALSE;
     if (value && value[0] && strcmp(value, "0")) return TRUE;
     value = getenv("WINEHUA_PRESENT_BACKEND");
     if (value && (!strcmp(value, "venus_broker_present") ||
@@ -79,6 +86,11 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct 
     (void)raw;  /* 11.10 baseline had no "raw" parameter; OHOS present path ignores it */
 
     TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
+
+    /* The Direct loader is usable for offscreen Wine Vulkan now.  Win32 WSI
+     * remains unavailable until the App passes this window's producer via IPC.
+     * Never hand a WineHua private tag to the system Vulkan loader. */
+    if (winehua_direct_vulkan_enabled()) return VK_ERROR_EXTENSION_NOT_PRESENT;
 
     if (winehua_vulkan_present_enabled())
     {
@@ -127,6 +139,8 @@ static VkBool32 wayland_get_physical_device_presentation_support(struct vulkan_p
 
     TRACE("%p %u\n", physical_device, index);
 
+    if (winehua_direct_vulkan_enabled()) return VK_FALSE;
+
     /* The WineHua surface is not a Host Wayland WSI object.  Presentation is
      * performed by the private Venus/Broker path, and every graphics queue
      * accepted by DXVK is present-capable from the Win32 application's point
@@ -140,6 +154,11 @@ static VkBool32 wayland_get_physical_device_presentation_support(struct vulkan_p
 
 static void wayland_map_instance_extensions(struct vulkan_instance_extensions *extensions)
 {
+    if (winehua_direct_vulkan_enabled())
+    {
+        extensions->has_VK_KHR_win32_surface = 0;
+        return;
+    }
     if (winehua_vulkan_present_enabled())
     {
         if (extensions->has_VK_KHR_surface) extensions->has_VK_KHR_win32_surface = 1;
