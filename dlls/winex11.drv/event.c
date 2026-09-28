@@ -1283,6 +1283,11 @@ static void handle_wm_hints_notify( HWND hwnd, XPropertyEvent *event )
 
     if (!(data = get_win_data( hwnd ))) return;
     hints = event->state == PropertyNewValue ? XGetWMHints( event->display, event->window ) : &empty;
+    /* property absent (or unreadable): XGetWMHints returns NULL — treat as
+     * all-zero hints. A NULL here would crash downstream (debugstr and the
+     * state machine both dereference the value); real apps routinely remove
+     * WM_HINTS. */
+    if (!hints) hints = &empty;
     window_wm_hints_notify( data, event->serial, hints );
     if (hints != &empty) XFree( hints );
     release_win_data( data );
