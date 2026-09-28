@@ -1030,6 +1030,26 @@ static void load_display_driver(void)
             }
             ERR("OHOS: Wayland driver bypass FAILED, falling back to null driver\n");
         }
+        else if (getenv("DISPLAY"))
+        {
+            /* X route (displayroute): DISPLAY set means winex11. Placed
+             * after WAYLAND_DISPLAY so a doubly-set environment picks
+             * wayland (conservative default); route selection relies on
+             * mutually exclusive env injection (the X profile sets DISPLAY
+             * only), not on branch order. Same KeUserModeCallback contract
+             * as the wayland branch above: 0 return = driver loaded. */
+            static const WCHAR winex11W[] = {'w','i','n','e','x','1','1','.','d','r','v',0};
+            void *ret_ptr;
+            ULONG ret_len;
+            ERR("OHOS: attempting direct X11 driver load (bypass PnP)\n");
+            if (!KeUserModeCallback( NtUserLoadDriver, winex11W, sizeof(winex11W),
+                                     &ret_ptr, &ret_len ))
+            {
+                ERR("OHOS: X11 driver loaded successfully via bypass\n");
+                return;
+            }
+            ERR("OHOS: X11 driver bypass FAILED, falling back to null driver\n");
+        }
 #endif
         winstation = NtUserGetProcessWindowStation();
         if (!NtUserGetObjectInformation( winstation, UOI_FLAGS, &flags, sizeof(flags), NULL )

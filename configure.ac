@@ -1421,7 +1421,12 @@ This probably prevents linking to OpenGL. Try deleting the file and restarting c
 			    $X_LIBS -lm -dylib_file /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib:/System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib)],
 		     $X_LIBS -lm)
     fi
-    WINE_WARNING_WITH(opengl,[test -n "$opengl_msg"],[$opengl_msg
+    dnl WineHua (OHOS): no desktop GLX stack on the guest; OpenGL is served
+    dnl through EGL on the wayland driver. With WINEHUA_ALLOW_X11_NO_GLX=1
+    dnl the missing libGL is not fatal: OPENGL_LIBS stays empty and winex11's
+    dnl glx.c compiles out via the SONAME_LIBGL guard, while the wayland
+    dnl driver keeps its EGL OpenGL path. Unset = upstream behavior.
+    WINE_WARNING_WITH(opengl,[test -n "$opengl_msg" -a "$WINEHUA_ALLOW_X11_NO_GLX" != "1"],[$opengl_msg
 OpenGL and Direct3D won't be supported.])
 
     CPPFLAGS="$ac_save_CPPFLAGS"
