@@ -1010,6 +1010,34 @@ static void load_display_driver(void)
     USEROBJECTFLAGS flags;
     HWINSTA winstation;
 
+#ifdef __OHOS__
+    /* X route (displayroute): WINEHUA_DISPLAY_ROUTE=x11 is a per-process
+     * override that takes precedence over the desktop registry's
+     * GraphicsDriver (which holds the session bootstrap's choice, e.g.
+     * winewayland). Descendant processes load the driver from the registry
+     * long before the env-based bypass below can fire (that branch only
+     * runs when the registry load FAILS), so the route key must be honored
+     * here. Unset = upstream behavior. DISPLAY itself is injected via the
+     * per-process environment; failure falls through to the normal path. */
+    {
+        const char *route = getenv( "WINEHUA_DISPLAY_ROUTE" );
+        if (route && !strcmp( route, "x11" ))
+        {
+            static const WCHAR winex11W[] = {'w','i','n','e','x','1','1','.','d','r','v',0};
+            void *ret_ptr;
+            ULONG ret_len;
+            ERR("OHOS: display route=x11, loading winex11 (per-process override)\n");
+            if (!KeUserModeCallback( NtUserLoadDriver, winex11W, sizeof(winex11W),
+                                     &ret_ptr, &ret_len ))
+            {
+                ERR("OHOS: X11 driver loaded successfully via route override\n");
+                return;
+            }
+            ERR("OHOS: X11 driver route override FAILED, falling back to registry path\n");
+        }
+    }
+#endif
+
     if (is_service_process() || !load_desktop_driver( get_desktop_window() ) || user_driver == &lazy_load_driver)
     {
 #ifdef __OHOS__
