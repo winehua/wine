@@ -1,0 +1,7 @@
+MODULE    = winehua_glx_bridge_probe.exe
+IMPORTS   = opengl32 user32 gdi32
+
+EXTRADLLFLAGS = -mconsole
+
+SOURCES = \
+	main.c
