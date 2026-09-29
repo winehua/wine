@@ -2842,11 +2842,14 @@ static UINT update_display_devices( struct device_manager_ctx *ctx )
 {
     UINT status;
 
+    TRACE( "winehua: update_display_devices (driver callback)\n" );
     if (!(status = user_driver->pUpdateDisplayDevices( &device_manager, ctx )))
     {
+        TRACE( "winehua: update_display_devices done (status %u)\n", status );
         if (ctx->source_count && is_virtual_desktop()) return add_virtual_source( ctx );
         return status;
     }
+    TRACE( "winehua: update_display_devices done (status %u)\n", status );
 
     if (status == STATUS_NOT_IMPLEMENTED) return default_update_display_devices( ctx );
     return status;
@@ -2908,7 +2911,9 @@ static BOOL lock_display_devices( BOOL force )
 
     pthread_mutex_lock( &display_lock );
 
+    TRACE( "winehua: display cache refresh start (force %d)\n", force );
     serial = get_monitor_update_serial();
+    TRACE( "winehua: display cache serial %I64u (cached %I64u)\n", serial, monitor_update_serial );
     if (!force && monitor_update_serial >= serial) return TRUE;
 
     /* services do not have any adapters, only a virtual monitor */
@@ -2922,8 +2927,10 @@ static BOOL lock_display_devices( BOOL force )
     }
 
     if (!force && !update_display_cache_from_registry( serial )) force = TRUE;
+    TRACE( "winehua: display cache registry check done (force %d)\n", force );
     if (force)
     {
+        TRACE( "winehua: display cache force refresh (gpu enumeration)\n" );
         if (!get_vulkan_gpus( &ctx.vulkan_gpus )) WARN( "Failed to find any Vulkan GPU\n" );
         if (!get_opengl_gpus( &ctx.opengl_gpus )) WARN( "Failed to find any OpenGL GPU\n" );
         if (!(status = update_display_devices( &ctx ))) commit_display_devices( &ctx );

@@ -2846,7 +2846,9 @@ BOOL get_opengl_gpus( struct list *gpus )
 {
     struct egl_platform *egl;
 
+    TRACE( "winehua: get_opengl_gpus\n" );
     if (!__wine_get_opengl_driver( WINE_OPENGL_DRIVER_VERSION )) return FALSE;
+    TRACE( "winehua: opengl driver ready\n" );
 
     LIST_FOR_EACH_ENTRY( egl, &devices_egl, struct egl_platform, entry )
     {

@@ -975,7 +975,9 @@ BOOL get_vulkan_gpus( struct list *gpus )
     struct vk_physdev_info *devinfo;
     UINT i, j;
 
+    TRACE( "winehua: get_vulkan_gpus\n" );
     if (!(instance = get_d3dkmt_vulkan_instance())) return FALSE;
+    TRACE( "winehua: d3dkmt vulkan instance ready (%u devices)\n", instance->physical_device_count );
     if (!(devinfo = calloc( instance->physical_device_count, sizeof(*devinfo) ))) return FALSE;
 
     for (i = 0; i < instance->physical_device_count; ++i)

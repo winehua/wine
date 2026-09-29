@@ -33,33 +33,11 @@
 
 #include "wine/vulkan.h"
 #include "wine/vulkan_driver.h"
+#include "wine/winehua_vulkan.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
 static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
-
-/* WineHua keeps Vulkan WSI private: the Guest never receives a native
- * VkSurfaceKHR. The tagged value carries only the Wayland proxy id, which
- * is later paired with the client pid by the Host presenter. */
-#define WINEHUA_VULKAN_SURFACE_TAG UINT64_C(0x5748530000000000)
-
-static BOOL winehua_vulkan_present_enabled(void)
-{
-    const char *value = getenv("WINEHUA_VULKAN_PRESENT");
-    if (value && value[0] && strcmp(value, "0")) return TRUE;
-    value = getenv("WINEHUA_PRESENT_BACKEND");
-    if (value && (!strcmp(value, "venus_broker_present") ||
-                  !strcmp(value, "venus_direct_present"))) return TRUE;
-    /* See win32u/vulkan.c.  Child processes can retain the stable VirGL
-     * marker even when per-launch present variables are not forwarded. */
-    value = getenv("WINEHUA_GRAPHICS_BACKEND");
-    if (value && !strcmp(value, "virgl"))
-    {
-        TRACE("WineHua: enabling private Wayland/Vulkan present from VirGL runtime marker\n");
-        return TRUE;
-    }
-    return FALSE;
-}
 
 static VkResult wayland_vulkan_surface_create(HWND hwnd, const struct vulkan_instance *instance, VkSurfaceKHR *handle,
                                               struct client_surface **client)
