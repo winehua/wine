@@ -250,6 +250,10 @@ struct wayland_client_surface
     struct wl_surface *wl_surface;
     struct wl_subsurface *wl_subsurface;
     struct wp_viewport *wp_viewport;
+#ifdef __OHOS__
+    void *winehua_direct_window;
+    void (*winehua_direct_window_release)(void *);
+#endif
 };
 
 struct wayland_shm_buffer

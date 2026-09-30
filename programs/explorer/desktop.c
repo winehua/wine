@@ -1342,6 +1342,24 @@ void manage_desktop( WCHAR *arg )
             ERR( "failed to create desktop %s error %ld\n", debugstr_w(name), GetLastError() );
             ExitProcess( 1 );
         }
+        /* App-managed desktops end on an explicit close/session shutdown.
+         * A fresh OHOS NCP may take longer to join than Wine's idle timeout;
+         * a keep-alive child alone cannot anchor the startup interval. */
+        if (!wcsicmp( name, L"shell" ))
+        {
+            char persistent[2];
+            DWORD timeout = INFINITE;
+            if (!__wine_get_unix_env( "WINEHUA_DESKTOP_PERSISTENT", persistent, sizeof(persistent) ) &&
+                persistent[0] == '1')
+            {
+                if (!SetUserObjectInformationW( desktop, 1000, &timeout, sizeof(timeout) ))
+                {
+                    ERR( "failed to set persistent desktop lifetime error %lu\n", GetLastError() );
+                    ExitProcess( 1 );
+                }
+                WARN( "App-managed shell desktop: idle close disabled\n" );
+            }
+        }
         SetThreadDesktop( desktop );
     }
 

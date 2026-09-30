@@ -55,6 +55,7 @@ static PFN_vkEnumerateInstanceExtensionProperties p_vkEnumerateInstanceExtension
 
 static void *vulkan_handle;
 static struct vulkan_funcs vulkan_funcs;
+static BOOL winehua_host_ohos_surface_supported;
 
 WINE_DECLARE_DEBUG_CHANNEL(fps);
 
@@ -682,6 +683,7 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
     const VkDebugReportCallbackCreateInfoEXT *debug_report_callback;
     const char **extensions;
     uint32_t count = 0;
+    BOOL requested_win32_surface = instance->obj.extensions.has_VK_KHR_win32_surface;
 
     while ((header = find_next_struct( header->pNext, VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT )))
     {
@@ -709,7 +711,12 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
     }
 
     driver_funcs->p_map_instance_extensions( &instance->obj.extensions );
-    instance->obj.extensions.has_VK_KHR_win32_surface = 0;
+    /* Keep the default/private route unchanged. The Direct route maps the
+     * client Win32 surface request to the system loader's OHOS WSI extension. */
+    instance->obj.extensions.has_VK_KHR_win32_surface =
+        requested_win32_surface && winehua_direct_vulkan_enabled() &&
+        winehua_host_ohos_surface_supported &&
+        instance->obj.extensions.has_VK_KHR_surface;
 
     if (instance->obj.extensions.has_VK_EXT_debug_utils || instance->obj.extensions.has_VK_EXT_debug_report)
     {
@@ -729,9 +736,11 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
     instance->obj.extensions.has_VK_KHR_external_semaphore_capabilities = 1;
 
     if (!(extensions = mem_alloc( pool, sizeof(instance->obj.extensions) * 8 * sizeof(*extensions) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
-#define USE_VK_EXT(x) if (instance->obj.extensions.has_ ## x) extensions[count++] = #x;
+#define USE_VK_EXT(x) if (instance->obj.extensions.has_ ## x && strcmp( #x, "VK_KHR_win32_surface" )) extensions[count++] = #x;
     ALL_VK_INSTANCE_EXTS
 #undef USE_VK_EXT
+    if (instance->obj.extensions.has_VK_KHR_win32_surface)
+        extensions[count++] = "VK_OHOS_surface";
 
     TRACE( "Enabling %u host instance extensions\n", count );
     for (const char **extension = extensions, **end = extension + count; extension < end; extension++)
@@ -5259,6 +5268,12 @@ static void vulkan_init_once(void)
     for (uint32_t i = 0; i < count; i++)
     {
         const char *extension = properties[i].extensionName;
+        if (winehua_direct_vulkan_enabled() && !strcmp( extension, "VK_OHOS_surface" ))
+        {
+            winehua_host_ohos_surface_supported = TRUE;
+            TRACE( "  - %s (mapped to VK_KHR_win32_surface)\n", extension );
+            continue;
+        }
 #define USE_VK_EXT(x)                           \
         if (!strcmp( extension, #x ))           \
         {                                       \
@@ -5273,6 +5288,9 @@ static void vulkan_init_once(void)
 
     /* map host instance extensions for VK_KHR_win32_surface */
     driver_funcs->p_map_instance_extensions( &extensions );
+    if (winehua_direct_vulkan_enabled() && winehua_host_ohos_surface_supported &&
+        extensions.has_VK_KHR_surface)
+        extensions.has_VK_KHR_win32_surface = 1;
 
     /* filter out unsupported client instance extensions */
 #define USE_VK_EXT(x) vulkan_funcs.client_extensions.has_ ## x = extensions.has_ ## x;

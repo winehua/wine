@@ -453,7 +453,8 @@ static void remove_desktop_user( struct desktop *desktop, struct thread *thread 
     desktop->users--;
 
     /* if we have one remaining user, it has to be the manager of the desktop window */
-    if ((process = get_top_window_owner( desktop )) && desktop->users == process->running_threads && !desktop->close_timeout)
+    if (desktop->close_timeout_val != TIMEOUT_INFINITE &&
+        (process = get_top_window_owner( desktop )) && desktop->users == process->running_threads && !desktop->close_timeout)
         desktop->close_timeout = add_timeout_user( desktop->close_timeout_val, close_desktop_timeout, desktop );
 }
 
@@ -902,7 +903,15 @@ DECL_HANDLER(set_user_object_info)
             }
             SHARED_WRITE_END;
         }
-        if (req->flags & SET_USER_OBJECT_SET_CLOSE_TIMEOUT) desktop->close_timeout_val = req->close_timeout;
+        if (req->flags & SET_USER_OBJECT_SET_CLOSE_TIMEOUT)
+        {
+            desktop->close_timeout_val = req->close_timeout;
+            if (req->close_timeout == TIMEOUT_INFINITE && desktop->close_timeout)
+            {
+                remove_timeout_user( desktop->close_timeout );
+                desktop->close_timeout = NULL;
+            }
+        }
     }
     else if (obj->ops == &winstation_ops)
     {

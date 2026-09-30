@@ -26,6 +26,7 @@
 
 #include <dlfcn.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -49,6 +50,116 @@ static BOOL winehua_direct_vulkan_enabled(void)
     const char *value = getenv("WINEHUA_VULKAN_BACKEND");
     return value && !strcmp(value, "direct");
 }
+
+#ifdef __OHOS__
+typedef void *(*winehua_direct_acquire_fn)(uint32_t, uint32_t *, uint64_t *, int32_t *, int32_t *);
+typedef void (*winehua_direct_release_fn)(void *);
+typedef VkResult (VKAPI_PTR *winehua_create_surface_ohos_fn)(VkInstance, const void *,
+                                                              const VkAllocationCallbacks *, VkSurfaceKHR *);
+static pthread_once_t winehua_direct_wsi_once = PTHREAD_ONCE_INIT;
+static winehua_direct_acquire_fn winehua_direct_acquire;
+static winehua_direct_release_fn winehua_direct_release;
+static PFN_vkGetInstanceProcAddr winehua_system_get_instance_proc_addr;
+
+static void winehua_direct_wsi_init(void)
+{
+    void *child = dlopen("libwine_child.so", RTLD_NOW | RTLD_NOLOAD);
+    void *vulkan = dlopen("/system/lib64/libvulkan.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!child) child = dlopen("libwine_child.so", RTLD_NOW);
+    if (!vulkan) vulkan = dlopen("/system/lib64/libvulkan.so", RTLD_NOW);
+    if (child)
+    {
+        winehua_direct_acquire = (winehua_direct_acquire_fn)
+            dlsym(child, "WineHua_DirectSurfaceAcquireByWlSurface");
+        winehua_direct_release = (winehua_direct_release_fn)
+            dlsym(child, "WineHua_DirectSurfaceRelease");
+    }
+    if (vulkan)
+        winehua_system_get_instance_proc_addr = (PFN_vkGetInstanceProcAddr)
+            dlsym(vulkan, "vkGetInstanceProcAddr");
+    if (!winehua_direct_acquire || !winehua_direct_release ||
+        !winehua_system_get_instance_proc_addr)
+        ERR("WineHua Direct WSI symbols unavailable child=%p acquire=%p release=%p vulkan=%p\n",
+            child, winehua_direct_acquire, winehua_direct_release,
+            winehua_system_get_instance_proc_addr);
+}
+
+static uint32_t winehua_window_surface_id(HWND hwnd)
+{
+    struct wayland_win_data *data;
+    uint32_t id = 0;
+    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+    if ((data = wayland_win_data_get(root ? root : hwnd)))
+    {
+        if (data->wayland_surface && data->wayland_surface->wl_surface)
+            id = wl_proxy_get_id((struct wl_proxy *)data->wayland_surface->wl_surface);
+        wayland_win_data_release(data);
+    }
+    return id;
+}
+
+static VkResult winehua_direct_surface_create(HWND hwnd, const struct vulkan_instance *instance,
+                                               VkSurfaceKHR *handle, struct client_surface **client)
+{
+    struct wayland_client_surface *surface;
+    winehua_create_surface_ohos_fn create_surface;
+    uint32_t owner_id, toplevel_id = 0;
+    uint64_t generation = 0;
+    int32_t width = 0, height = 0;
+    void *window = NULL;
+    VkResult res;
+    struct {
+        VkStructureType sType;
+        const void *pNext;
+        VkFlags flags;
+        void *window;
+    } create_info = {(VkStructureType)1000685000, NULL, 0, NULL};
+
+    pthread_once(&winehua_direct_wsi_once, winehua_direct_wsi_init);
+    if (!winehua_direct_acquire || !winehua_direct_release ||
+        !winehua_system_get_instance_proc_addr)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    create_surface = (winehua_create_surface_ohos_fn)winehua_system_get_instance_proc_addr(
+        instance->host.instance, "vkCreateSurfaceOHOS");
+    if (!create_surface) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (!(surface = wayland_client_surface_create(hwnd))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    owner_id = winehua_window_surface_id(hwnd);
+    wl_display_flush(process_wayland.wl_display);
+    if (!owner_id)
+    {
+        client_surface_release(&surface->client);
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+    for (unsigned i = 0; i < 200 && !window; ++i)
+    {
+        window = winehua_direct_acquire(owner_id, &toplevel_id, &generation, &width, &height);
+        if (!window) usleep(10000);
+    }
+    if (!window)
+    {
+        WARN("WineHua Direct producer unavailable owner_wl=%u pid=%u\n", owner_id, getpid());
+        client_surface_release(&surface->client);
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+    create_info.window = window;
+    res = create_surface(instance->host.instance, &create_info, NULL, handle);
+    if (res != VK_SUCCESS)
+    {
+        ERR("WineHua Direct vkCreateSurfaceOHOS failed res=%d owner_wl=%u\n", res, owner_id);
+        winehua_direct_release(window);
+        client_surface_release(&surface->client);
+        return res;
+    }
+    surface->winehua_direct_window = window;
+    surface->winehua_direct_window_release = winehua_direct_release;
+    set_client_surface(hwnd, surface);
+    *client = &surface->client;
+    TRACE("WineHua Direct OHOS surface=0x%s owner_wl=%u top=%u gen=%llu size=%dx%d\n",
+          wine_dbgstr_longlong(*handle), owner_id, toplevel_id,
+          (unsigned long long)generation, width, height);
+    return VK_SUCCESS;
+}
+#endif
 
 static BOOL winehua_vulkan_present_enabled(void)
 {
@@ -87,10 +198,14 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct 
 
     TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
 
-    /* The Direct loader is usable for offscreen Wine Vulkan now.  Win32 WSI
-     * remains unavailable until the App passes this window's producer via IPC.
-     * Never hand a WineHua private tag to the system Vulkan loader. */
-    if (winehua_direct_vulkan_enabled()) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (winehua_direct_vulkan_enabled())
+    {
+#ifdef __OHOS__
+        return winehua_direct_surface_create(hwnd, instance, handle, client);
+#else
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+#endif
+    }
 
     if (winehua_vulkan_present_enabled())
     {
@@ -139,7 +254,22 @@ static VkBool32 wayland_get_physical_device_presentation_support(struct vulkan_p
 
     TRACE("%p %u\n", physical_device, index);
 
-    if (winehua_direct_vulkan_enabled()) return VK_FALSE;
+    if (winehua_direct_vulkan_enabled())
+    {
+        uint32_t count = 0;
+        VkQueueFamilyProperties *properties;
+        VkBool32 supported = VK_FALSE;
+        instance->p_vkGetPhysicalDeviceQueueFamilyProperties(
+            physical_device->host.physical_device, &count, NULL);
+        if (!count || index >= count || !(properties = calloc(count, sizeof(*properties))))
+            return VK_FALSE;
+        instance->p_vkGetPhysicalDeviceQueueFamilyProperties(
+            physical_device->host.physical_device, &count, properties);
+        if (index < count && (properties[index].queueFlags & VK_QUEUE_GRAPHICS_BIT))
+            supported = VK_TRUE;
+        free(properties);
+        return supported;
+    }
 
     /* The WineHua surface is not a Host Wayland WSI object.  Presentation is
      * performed by the private Venus/Broker path, and every graphics queue
@@ -156,7 +286,8 @@ static void wayland_map_instance_extensions(struct vulkan_instance_extensions *e
 {
     if (winehua_direct_vulkan_enabled())
     {
-        extensions->has_VK_KHR_win32_surface = 0;
+        /* win32u maps the requested Win32 extension to VK_OHOS_surface after
+         * confirming that the system loader advertises it. */
         return;
     }
     if (winehua_vulkan_present_enabled())

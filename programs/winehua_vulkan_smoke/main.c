@@ -1,9 +1,8 @@
 /*
- * WineHua Win32 Vulkan offscreen smoke.
+ * WineHua Win32 Vulkan offscreen and WSI smoke.
  *
- * This intentionally avoids WSI.  It proves the Windows Vulkan ->
- * winevulkan -> x86_64 Vulkan Loader -> Mesa Venus chain before presentation
- * is introduced.
+ * The optional present path checks Wine's Vulkan swapchain, including an
+ * explicit running-window resize when WINEHUA_VULKAN_RESIZE=1.
  */
 
 #include <stdint.h>
@@ -50,6 +49,11 @@ struct probe_state
     uint32_t expected_sampled_value;
     BOOL present_ok;
     uint32_t present_frames;
+    BOOL resize_requested;
+    BOOL resize_completed;
+    uint32_t swapchain_rebuilds;
+    VkExtent2D initial_extent;
+    VkExtent2D resized_extent;
     BOOL fallback_detected;
     unsigned int queue_submits;
     char vulkan_module[MAX_PATH];
@@ -216,6 +220,9 @@ static void write_state(const struct probe_state *state, const char *status,
              "\"cpuReadBytes\":%u,\"cpuUploadBytes\":%u,"
              "\"gpuCopyCount\":%u,\"queueSubmitCount\":%u,"
              "\"presentFrames\":%u,"
+             "\"resizeRequested\":%s,\"resizeCompleted\":%s,"
+             "\"swapchainRebuilds\":%u,"
+             "\"initialExtent\":[%u,%u],\"resizedExtent\":[%u,%u],"
              "\"presentFailureFrame\":%u,"
              "\"presentAcquireResult\":%d,"
              "\"presentAcquireWaitResult\":%d,"
@@ -256,6 +263,11 @@ static void write_state(const struct probe_state *state, const char *status,
              state->smoke.present ? 0u : 4096u,
              state->smoke.present ? 1u : 2u, state->queue_submits,
              state->present_frames,
+             state->resize_requested ? "true" : "false",
+             state->resize_completed ? "true" : "false",
+             state->swapchain_rebuilds,
+             state->initial_extent.width, state->initial_extent.height,
+             state->resized_extent.width, state->resized_extent.height,
              state->present_fail_frame,
              state->present_acquire_result,
              state->present_acquire_wait_result,
@@ -687,13 +699,16 @@ static BOOL run_present(struct probe_state *state, VkInstance instance,
     VkImage *images = NULL;
     uint32_t image_count = 0;
     VkSemaphore acquire_semaphore = VK_NULL_HANDLE;
-    VkResult result;
+    VkResult result = VK_ERROR_INITIALIZATION_FAILED;
     VkSurfaceCapabilitiesKHR capabilities;
     VkSurfaceFormatKHR surface_format;
     VkExtent2D extent;
     uint32_t frame_count = state->smoke.seconds ? state->smoke.seconds * 30 : 30;
     BOOL initialized[8] = {0};
     BOOL ok = FALSE;
+    const char *resize = getenv("WINEHUA_VULKAN_RESIZE");
+
+    state->resize_requested = resize && !strcmp(resize, "1");
 
     memset(&window_class, 0, sizeof(window_class));
     window_class.lpfnWndProc = winehua_vulkan_smoke_wndproc;
@@ -726,12 +741,13 @@ static BOOL run_present(struct probe_state *state, VkInstance instance,
     {
         uint32_t count = 1;
         result = vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &count, &surface_format);
-        if (result != VK_SUCCESS && result != VK_INCOMPLETE || !count) goto cleanup;
+        if ((result != VK_SUCCESS && result != VK_INCOMPLETE) || !count) goto cleanup;
     }
     extent = capabilities.currentExtent;
     if (extent.width == UINT32_MAX || extent.height == UINT32_MAX)
         extent = (VkExtent2D){640, 480};
     if (!extent.width || !extent.height) extent = (VkExtent2D){1, 1};
+    state->initial_extent = extent;
 
     {
         VkSwapchainCreateInfoKHR info = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
@@ -782,6 +798,83 @@ static BOOL run_present(struct probe_state *state, VkInstance instance,
         {
             TranslateMessage(&message);
             DispatchMessageA(&message);
+        }
+        if (state->resize_requested && frame == frame_count / 2)
+        {
+            VkSwapchainKHR replacement = VK_NULL_HANDLE;
+            VkImage *replacement_images = NULL;
+            uint32_t replacement_count = 0;
+            VkSwapchainCreateInfoKHR info = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+
+            if (!SetWindowPos(hwnd, NULL, 0, 0, 800, 600,
+                              SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE))
+            {
+                snprintf(state->present_error, sizeof(state->present_error),
+                         "resize SetWindowPos failed error=%lu", GetLastError());
+                goto cleanup;
+            }
+            while (PeekMessageA(&message, NULL, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&message);
+                DispatchMessageA(&message);
+            }
+            result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, surface, &capabilities);
+            if (result != VK_SUCCESS) goto cleanup;
+            extent = capabilities.currentExtent;
+            if (extent.width == UINT32_MAX || extent.height == UINT32_MAX ||
+                !extent.width || !extent.height ||
+                (extent.width == state->initial_extent.width &&
+                 extent.height == state->initial_extent.height))
+            {
+                snprintf(state->present_error, sizeof(state->present_error),
+                         "resize extent unchanged or invalid: %ux%u", extent.width, extent.height);
+                goto cleanup;
+            }
+            state->resized_extent = extent;
+            result = vkQueueWaitIdle(queue);
+            if (result != VK_SUCCESS) goto cleanup;
+            info.surface = surface;
+            info.minImageCount = capabilities.minImageCount < 3 ? 3 : capabilities.minImageCount;
+            if (capabilities.maxImageCount && info.minImageCount > capabilities.maxImageCount)
+                info.minImageCount = capabilities.maxImageCount;
+            info.imageFormat = surface_format.format;
+            info.imageColorSpace = surface_format.colorSpace;
+            info.imageExtent = extent;
+            info.imageArrayLayers = 1;
+            info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            info.preTransform = capabilities.currentTransform;
+            info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+            info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+            info.clipped = VK_TRUE;
+            info.oldSwapchain = swapchain;
+            result = vkCreateSwapchainKHR(device, &info, NULL, &replacement);
+            if (result != VK_SUCCESS) goto cleanup;
+            result = vkGetSwapchainImagesKHR(device, replacement, &replacement_count, NULL);
+            if (result == VK_SUCCESS && replacement_count &&
+                replacement_count <= sizeof(initialized) / sizeof(initialized[0]))
+            {
+                replacement_images = calloc(replacement_count, sizeof(*replacement_images));
+                if (replacement_images)
+                    result = vkGetSwapchainImagesKHR(device, replacement,
+                                                     &replacement_count, replacement_images);
+                else result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+            else if (result == VK_SUCCESS) result = VK_ERROR_INITIALIZATION_FAILED;
+            if (result != VK_SUCCESS)
+            {
+                free(replacement_images);
+                vkDestroySwapchainKHR(device, replacement, NULL);
+                goto cleanup;
+            }
+            free(images);
+            vkDestroySwapchainKHR(device, swapchain, NULL);
+            swapchain = replacement;
+            images = replacement_images;
+            image_count = replacement_count;
+            memset(initialized, 0, sizeof(initialized));
+            state->swapchain_rebuilds++;
+            state->resize_completed = TRUE;
         }
         result = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX,
                                        acquire_semaphore, VK_NULL_HANDLE, &image_index);
@@ -1053,10 +1146,10 @@ int main(int argc, char **argv)
         if (!run_present(&state, instance, physical, device, queue, pool, command, fence))
         {
             failure = state.present_error[0] ? state.present_error :
-                                               "Wine Vulkan private present failed";
+                                               "Wine Vulkan swapchain present failed";
             goto cleanup;
         }
-        write_state(&state, "PASS", "present", "Wine Vulkan private BrokerPresent fixed-frame check passed");
+        write_state(&state, "PASS", "present", "Wine Vulkan swapchain present check passed");
         exit_code = 0;
         /* The Harmony Venus private swapchain may block in vkDestroyDevice
          * after a successful present sequence while the NCP drains its

@@ -479,7 +479,7 @@ static void write_state(struct smoke_state *state, const char *status,
              "{\"d3dBackend\":\"%s\",\"dxvkVersion\":\"%s\","
              "\"d3d11Module\":\"%s\",\"dxgiModule\":\"%s\","
              "\"featureLevel\":\"%u.%u\",\"adapter\":\"DXVK Vulkan\","
-             "\"vulkanDevice\":\"via winevulkan/Venus\",\"cpuReadBytes\":0,"
+             "\"vulkanDevice\":\"via winevulkan\",\"cpuReadBytes\":0,"
              "\"cpuUploadBytes\":0,\"gpuCopyCount\":1,\"queueSubmitCount\":%u,"
              "\"presentFrames\":%u,\"presentFailureFrame\":%u,"
              "\"presentResult\":%ld,\"fallbackDetected\":%s,"

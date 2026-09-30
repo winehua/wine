@@ -777,7 +777,8 @@ BOOL WINAPI NtUserSetObjectInformation( HANDLE handle, INT index, void *info, DW
             RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
             return FALSE;
         }
-        close_timeout = -(*(DWORD *)info * (ULONG64)TICKSPERSEC / 1000);
+        close_timeout = *(DWORD *)info == INFINITE ? TIMEOUT_INFINITE :
+                        -(*(DWORD *)info * (ULONG64)TICKSPERSEC / 1000);
     }
     else if (index != UOI_FLAGS || !info || len < sizeof(*obj_flags))
     {

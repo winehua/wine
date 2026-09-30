@@ -1173,6 +1173,11 @@ static void wayland_client_surface_destroy(struct client_surface *client)
 
     TRACE("%s\n", debugstr_client_surface(client));
 
+#ifdef __OHOS__
+    if (surface->winehua_direct_window && surface->winehua_direct_window_release)
+        surface->winehua_direct_window_release(surface->winehua_direct_window);
+#endif
+
     if (surface->wp_viewport)
         wp_viewport_destroy(surface->wp_viewport);
     if (surface->wl_subsurface)
