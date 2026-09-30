@@ -1152,6 +1152,7 @@ SOURCES = \
 	wine/wined3d.h \
 	wine/winedmo.h \
 	wine/winedxgi.idl \
+	wine/winehua_present.h \
 	wine/winehua_vulkan.h \
 	wine/wingdi16.h \
 	wine/winnet16.h \

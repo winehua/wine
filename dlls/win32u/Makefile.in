@@ -56,4 +56,5 @@ SOURCES = \
 	vertical.c \
 	vulkan.c \
 	window.c \
+	winehua_present.c \
 	winstation.c

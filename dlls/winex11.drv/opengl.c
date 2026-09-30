@@ -1545,10 +1545,18 @@ static const struct opengl_drawable_funcs x11drv_egl_surface_funcs =
 
 /**********************************************************************
  *           X11DRV_OpenglInit
+ *
+ * No GLX on this platform (SONAME_LIBGL absent), so upstream has nothing to
+ * offer here and win32u's generic EGL driver takes over — whose swap is a
+ * no-op, i.e. GL renders but never presents.  The WineHua private present
+ * driver (opengl_winehua.c) covers that: it keeps the surfaceless EGL render
+ * and hands the frame to the host over the route's present channel.  It
+ * returns STATUS_NOT_IMPLEMENTED when the channel is not armed, which keeps
+ * the upstream fallback behavior unchanged.
  */
 UINT X11DRV_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs )
 {
-    return STATUS_NOT_IMPLEMENTED;
+    return winehua_x11_gl_init( version, opengl_funcs, driver_funcs );
 }
 
 void sync_gl_drawable( HWND hwnd )

@@ -269,6 +269,13 @@ struct client_surface
 };
 
 W32KAPI void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd );
+/* Driver-visible: the surface with no driver-specific behavior (no X child
+ * window, no wl_surface) that win32u's own EGL/FBO drawables use.  WineHua's
+ * X-route GL driver uses it for the same reason: the present goes over the
+ * private channel, so the drawable needs a window-bound surface for win32u's
+ * bookkeeping and nothing else — creating the x11drv one would add a child X
+ * window that nothing renders into. */
+W32KAPI struct client_surface *nulldrv_client_surface_create( HWND hwnd );
 W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
 W32KAPI void client_surface_present( struct client_surface *surface );

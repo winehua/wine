@@ -917,6 +917,11 @@ extern void xim_set_result_string( HWND hwnd, const char *str, UINT count );
 extern XIC X11DRV_get_ic( HWND hwnd );
 extern void xim_set_focus( HWND hwnd, BOOL focus );
 
+/* WineHua private GL present for the X route (opengl_winehua.c): installed by
+ * X11DRV_OpenGLInit when no GLX is compiled in. */
+extern UINT winehua_x11_gl_init( UINT version, const struct opengl_funcs *opengl_funcs,
+                                 const struct opengl_driver_funcs **driver_funcs );
+
 #define XEMBED_MAPPED  (1 << 0)
 
 static inline BOOL is_window_rect_mapped( const RECT *rect )

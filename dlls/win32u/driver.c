@@ -1562,7 +1562,7 @@ static const struct client_surface_funcs nulldrv_surface_funcs =
     .present = nulldrv_surface_present,
 };
 
-struct client_surface *nulldrv_client_surface_create( HWND hwnd )
+W32KAPI struct client_surface *nulldrv_client_surface_create( HWND hwnd )
 {
     return client_surface_create( sizeof(struct client_surface), &nulldrv_surface_funcs, hwnd );
 }

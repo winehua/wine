@@ -24,17 +24,16 @@
 
 #include "config.h"
 
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 #include "waylanddrv.h"
 #include "wine/opengl_driver.h"
+#include "wine/winehua_present.h"
 #include "opengl_diag.h"
 #include "opengl_readback.h"
 
@@ -49,87 +48,14 @@ extern const struct egl_platform *egl;
 extern const struct opengl_funcs *funcs;
 extern EGLConfig egl_config_for_format(int format);
 
-/* ---- Present surface page (zero-copy fast path) ---- */
+/* ---- Present surface id (zero-copy fast path) ---- */
 
-#define WINEHUA_PRESENT_SURFACE_MAGIC 0x57535053u
-#define WINEHUA_PRESENT_SURFACE_VERSION 1u
-
-struct winehua_present_surface_page
-{
-    uint32_t magic;
-    uint32_t version;
-    uint32_t surface_id;
-    uint32_t reserved;
-};
-
-static pthread_once_t winehua_present_surface_once = PTHREAD_ONCE_INIT;
-static pthread_mutex_t winehua_present_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
-static struct winehua_present_surface_page *winehua_present_surface_page;
-
+/* 本路线的一把钥匙: wl_surface 的 Wayland proxy id。发布/握手机制在
+ * win32u/winehua_present.c (两条路线共用), 这里只负责取 id。 */
 static uint32_t winehua_prepare_present_surface(struct wayland_client_surface *client)
 {
     return client && client->wl_surface
         ? wl_proxy_get_id((struct wl_proxy *)client->wl_surface) : 0;
-}
-
-static void winehua_init_present_surface_page(void)
-{
-    const char *tmp_dir = getenv("TMPDIR");
-    struct winehua_present_surface_page *page;
-    char path[256];
-    int fd;
-
-    if (!tmp_dir || !tmp_dir[0] ||
-        snprintf(path, sizeof(path), "%s/winehua_present_surface_%u.shm",
-                 tmp_dir, (uint32_t)getpid()) >= sizeof(path))
-        return;
-    if ((fd = open(path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0600)) < 0)
-        return;
-    if (ftruncate(fd, sizeof(*page)) ||
-        (page = mmap(NULL, sizeof(*page), PROT_READ | PROT_WRITE,
-                     MAP_SHARED, fd, 0)) == MAP_FAILED)
-    {
-        close(fd);
-        return;
-    }
-    close(fd);
-
-    page->version = WINEHUA_PRESENT_SURFACE_VERSION;
-    page->reserved = 0;
-    __atomic_store_n(&page->surface_id, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&page->magic, WINEHUA_PRESENT_SURFACE_MAGIC, __ATOMIC_RELEASE);
-    winehua_present_surface_page = page;
-}
-
-static void winehua_begin_present_surface(uint32_t surface_id)
-{
-    pthread_once(&winehua_present_surface_once, winehua_init_present_surface_page);
-    pthread_mutex_lock(&winehua_present_surface_mutex);
-    if (winehua_present_surface_page)
-        __atomic_store_n(&winehua_present_surface_page->surface_id,
-                         surface_id, __ATOMIC_RELEASE);
-}
-
-static void winehua_finish_present_surface(void)
-{
-    if (winehua_present_surface_page)
-        __atomic_store_n(&winehua_present_surface_page->surface_id,
-                         0, __ATOMIC_RELEASE);
-    pthread_mutex_unlock(&winehua_present_surface_mutex);
-}
-
-static BOOL winehua_surface_zero_copy_ready(uint32_t surface_id)
-{
-    const char *ready_dir = getenv("WINEHUA_ZERO_COPY_READY_DIR");
-    char path[256];
-    uint64_t surface_key;
-
-    if (!surface_id || !ready_dir || !ready_dir[0]) return FALSE;
-    surface_key = ((uint64_t)(uint32_t)getpid() << 32) | surface_id;
-    if (snprintf(path, sizeof(path), "%s/winehua_zc_surface_%llu.ready",
-                 ready_dir, (unsigned long long)surface_key) >= sizeof(path))
-        return FALSE;
-    return access(path, F_OK) == 0;
 }
 
 /* ---- Readback drawable / state / slot ---- */
@@ -346,14 +272,14 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     }
     surface_id = winehua_prepare_present_surface(client);
 
-    if (surface_id && winehua_surface_zero_copy_ready(surface_id))
+    if (surface_id && winehua_present_surface_ready(surface_id))
     {
-        winehua_begin_present_surface(surface_id);
+        winehua_present_surface_begin(surface_id);
         /* Pbuffer swap alone does not reliably flush the front resource. */
         funcs->p_glFlush();
         swap_ok = funcs->p_eglSwapBuffers(egl->display, base->surface);
         presents = InterlockedIncrement(&winehua_gl_zero_copy_presents);
-        winehua_finish_present_surface();
+        winehua_present_surface_end();
         if (presents == 1 || !(presents % 120))
         {
             fprintf(stderr,
@@ -414,9 +340,9 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
     winehua_gl_stage_end(WINEHUA_GL_SWAP_ENTER, stage_started);
     stage_started = winehua_gl_stage_begin(WINEHUA_GL_FLUSH, base->client->hwnd,
                                            gl->state->in_flight);
-    winehua_begin_present_surface(surface_id);
+    winehua_present_surface_begin(surface_id);
     funcs->p_glFlush();
-    winehua_finish_present_surface();
+    winehua_present_surface_end();
     winehua_gl_stage_end(WINEHUA_GL_FLUSH, stage_started);
     stage_started = winehua_gl_stage_begin(WINEHUA_GL_READBACK, base->client->hwnd,
                                            gl->state->in_flight);
@@ -442,17 +368,17 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
 
     /* Keep the pbuffer's WSI present semantics active so the virpipe winsys
      * receives the exact front resource while readback remains the fallback. */
-    winehua_begin_present_surface(surface_id);
+    winehua_present_surface_begin(surface_id);
     if (!funcs->p_eglSwapBuffers(egl->display, base->surface))
         winehua_wayland_diag("readback pbuffer swap failed hwnd=%p error=%#x",
                              base->client->hwnd, funcs->p_eglGetError());
-    winehua_finish_present_surface();
+    winehua_present_surface_end();
     if (readbacks == 1 || !(readbacks % 120))
     {
         fprintf(stderr,
                 "winehua_gl_present_bridge: readbacks=%d pid=%u surface=%u mapped=%s\n",
                 (int)readbacks, (uint32_t)getpid(), surface_id,
-                winehua_present_surface_page ? "yes" : "no");
+                winehua_present_surface_mapped() ? "yes" : "no");
         fflush(stderr);
     }
 
@@ -549,7 +475,7 @@ BOOL winehua_readback_surface_create(HWND hwnd, int format, struct opengl_drawab
 
     if ((previous = *drawable) && previous->format == format) return TRUE;
     if (!(client = wayland_client_surface_create(hwnd))) return FALSE;
-    pthread_once(&winehua_present_surface_once, winehua_init_present_surface_page);
+    winehua_present_surface_init();
     if (!(gl = opengl_drawable_create(sizeof(*gl), &winehua_readback_drawable_funcs,
                                       format, &client->client)))
     {
