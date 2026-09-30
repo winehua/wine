@@ -54,6 +54,16 @@ struct app_state
     unsigned long long display_sequence;
     BOOL display_sequence_seen;
     BOOL has_display_fps;
+    /* 归属证据 (见 entry/src/main/cpp/common/display_fps.h): 宿主显示序列行
+     * 里的路线与 surface key。**归属不在 guest 判**: key 高 32 位是 Unix
+     * getpid() (mesa/win32u 填的), 而本进程只拿得到 Wine ptid
+     * (GetCurrentProcessId) —— 两者不等 (实测 key pid=10765 vs ptid=596),
+     * guest 侧比对恒假。归属断言由判定层做: 用运行器记录的 spawn pid 比 key
+     * 的 pid (automation/checks presented-route)。 */
+    char presented_route[16];
+    char requested_route[16];
+    char expected_route[16];
+    unsigned long long presented_key;
 };
 
 enum seven_segment_bits
@@ -100,18 +110,32 @@ static void load_graphics_env(struct app_state *state)
     state->frame_transport = getenv("WINEHUA_FRAME_TRANSPORT");
     state->graphics_note = getenv("WINEHUA_GRAPHICS_NOTE");
     state->display_fps_file = getenv("WINEHUA_DISPLAY_FPS_FILE");
+    /* 本进程被要求走哪条显示路线 (未设 = wayland 默认; 判据侧拿它跟宿主的
+     * presentedRoute 对照, 抓"声明测 X 路线、实际落在 wayland"的漂移) */
+    force_gl = getenv("WINEHUA_DISPLAY_ROUTE");
+    lstrcpynA(state->requested_route,
+              force_gl && force_gl[0] ? force_gl : "wayland",
+              sizeof(state->requested_route));
+    /* harness 声明的期望路线 (smoke.py build_job 注入)。判据以它为准:
+     * 环境被丢时这个变量也会丢, 判据据此判 FAIL 而不是默认成 wayland。 */
+    force_gl = getenv("WINEHUA_SMOKE_EXPECT_ROUTE");
+    lstrcpynA(state->expected_route,
+              force_gl && force_gl[0] ? force_gl : "-",
+              sizeof(state->expected_route));
     force_gl = getenv("WINEHUA_GRAPHICS_FORCE_GL");
     state->force_gl = force_gl && !lstrcmpA(force_gl, "1");
 }
 
 static BOOL update_display_fps(struct app_state *state)
 {
-    char buffer[128];
+    char buffer[256];
+    char route[16] = "-";
     DWORD bytes_read;
     HANDLE file;
-    unsigned long long sequence;
+    unsigned long long sequence, surface_key = 0;
     unsigned int toplevel_id;
     double fps;
+    int fields;
 
     if (!state->display_fps_file || !state->display_fps_file[0]) return FALSE;
     file = CreateFileA(state->display_fps_file, GENERIC_READ,
@@ -121,7 +145,10 @@ static BOOL update_display_fps(struct app_state *state)
     if (!ReadFile(file, buffer, sizeof(buffer) - 1, &bytes_read, NULL)) bytes_read = 0;
     CloseHandle(file);
     buffer[bytes_read] = 0;
-    if (sscanf(buffer, "%llu %lf %u", &sequence, &fps, &toplevel_id) != 3) return FALSE;
+    /* 3 字段 = 老格式 (无归属), 5 字段 = 带 route/surface_key */
+    fields = sscanf(buffer, "%llu %lf %u %15s %llu", &sequence, &fps, &toplevel_id,
+                    route, &surface_key);
+    if (fields < 3) return FALSE;
 
     if (!state->display_sequence_seen)
     {
@@ -134,6 +161,15 @@ static BOOL update_display_fps(struct app_state *state)
         state->display_sequence = sequence;
         state->display_fps = fps;
         state->has_display_fps = TRUE;
+        if (fields >= 5)
+        {
+            lstrcpynA(state->presented_route, route, sizeof(state->presented_route));
+            state->presented_key = surface_key;
+        }
+        else
+        {
+            lstrcpynA(state->presented_route, "-", sizeof(state->presented_route));
+        }
     }
     return state->has_display_fps;
 }
@@ -822,8 +858,11 @@ int main(int argc, char **argv)
             else if (!state.display_fps_file) state.current_fps = state.producer_fps;
             if (state.has_display_fps)
                 fprintf(stderr,
-                        "winehua_graphics_smoke: producer_fps=%.2f displayed_fps=%.2f size=%dx%d frames=%u\n",
-                        state.producer_fps, state.display_fps, state.width, state.height, frames);
+                        "winehua_graphics_smoke: producer_fps=%.2f displayed_fps=%.2f size=%dx%d frames=%u "
+                        "presented_route=%s presented_key=%llu expected_route=%s requested_route=%s\n",
+                        state.producer_fps, state.display_fps, state.width, state.height, frames,
+                        state.presented_route, state.presented_key,
+                        state.expected_route, state.requested_route);
             else
                 fprintf(stderr,
                         "winehua_graphics_smoke: producer_fps=%.2f displayed_fps=unavailable size=%dx%d frames=%u\n",
@@ -855,9 +894,14 @@ int main(int argc, char **argv)
              "\"renderWaitUs\":-1,\"presentWaitUs\":-1,\"frameLatency\":-1,"
              "\"p50FrameMs\":-1,\"p95FrameMs\":-1,\"p99FrameMs\":-1,"
              "\"swapchainRecreateCount\":0,\"surfaceQueueBacklog\":-1,"
-             "\"fallbackDetected\":false,\"fixedFrame\":\"rgba-quadrants-v1\"}",
+             "\"fallbackDetected\":false,\"fixedFrame\":\"rgba-quadrants-v1\","
+             "\"expectedRoute\":\"%s\",\"requestedRoute\":\"%s\","
+             "\"presentedRoute\":\"%s\","
+             "\"presentedKey\":%llu}",
              frames, state.producer_fps, state.has_display_fps ? state.display_fps : -1.0,
-             state.width, state.height);
+             state.width, state.height,
+             state.expected_route, state.requested_route, state.presented_route,
+             state.presented_key);
     {
         BOOL displayed = !smoke.automation || !state.display_fps_file || state.has_display_fps;
         BOOL passed = frames && displayed;
