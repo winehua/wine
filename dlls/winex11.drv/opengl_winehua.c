@@ -78,6 +78,7 @@ struct winehua_x11_gl_drawable
     uint64_t presents;      /* 已 present 帧数 */
     uint64_t unpresented;   /* 无目标/无窗口而丢弃的帧数 */
     uint64_t lastReported;  /* 上次降级日志所在的 presents 位置 */
+    BOOL warned_child;      /* 子窗落位限制只提示一次 (见 swap) */
 };
 
 static struct winehua_x11_gl_drawable *impl_from_drawable(struct opengl_drawable *base)
@@ -97,12 +98,64 @@ static void winehua_x11_drawable_destroy(struct opengl_drawable *base)
 
     TRACE("%s: presents=%llu unpresented=%llu\n", debugstr_opengl_drawable(base),
           (unsigned long long)gl->presents, (unsigned long long)gl->unpresented);
-    if (base->surface) funcs->p_eglDestroySurface(egl_platform->display, base->surface);
+    /* EGLSurface 不在这里销毁: 上游约定由 win32u 的 opengl_drawable_release 统一
+     * 销毁 (egldrv / winewayland 的 destroy 回调都只做自己的事)。这里再销毁一次
+     * 就是二次销毁 —— 第二次传入已释放的句柄: 释放后读 + EGL 显示表 last error
+     * 被污染 (驱动失败路径打出的错误码会是上一次 destroy 的残留)。 */
 }
 
+/* 窗口几何变化 (GL_FLUSH_UPDATED) ⇒ pbuffer 必须跟随 client rect: 尺寸若在
+ * drawable 创建时冻结、之后永不更新, 应用改窗/最大化/DPI 变化后就会一直渲染
+ * 到旧尺寸 —— 超出部分被裁、剩下的被主机按窗几何拉伸, 而 guest 侧零错误
+ * (review 2026-10-01)。win32u 在窗口几何变化时给 client surface 置 updated,
+ * 下一次 swap 会带 GL_FLUSH_UPDATED 调到这里; 做法与 winewayland.drv/
+ * opengl_readback.c 的重建路径一致 (新建 pbuffer + 重绑当前 context, 保留
+ * buffer 映射表 —— 映射与 EGLSurface 无关)。 */
 static void winehua_x11_drawable_flush(struct opengl_drawable *base, UINT flags)
 {
+    struct winehua_x11_gl_drawable *gl = impl_from_drawable(base);
+    EGLint attribs[5];
+    EGLSurface new_surface;
+    EGLContext ctx;
+    RECT rect;
+    int width, height;
+
     TRACE("%s, flags %#x\n", debugstr_opengl_drawable(base), flags);
+    if (!(flags & GL_FLUSH_UPDATED) || !base->surface || !base->client) return;
+
+    NtUserGetClientRect(base->client->hwnd, &rect, NtUserGetDpiForWindow(base->client->hwnd));
+    width = max(1, rect.right - rect.left);
+    height = max(1, rect.bottom - rect.top);
+    if (width == gl->width && height == gl->height) return;
+
+    attribs[0] = EGL_WIDTH;
+    attribs[1] = width;
+    attribs[2] = EGL_HEIGHT;
+    attribs[3] = height;
+    attribs[4] = EGL_NONE;
+    new_surface = funcs->p_eglCreatePbufferSurface(egl_platform->display,
+                                                   wx11_config_for_format(base->format), attribs);
+    if (!new_surface)
+    {
+        WARN("pbuffer resize alloc failed hwnd=%p size=%dx%d error=%#x\n",
+             base->client->hwnd, width, height, funcs->p_eglGetError());
+        return;
+    }
+    ctx = funcs->p_eglGetCurrentContext();
+    if (ctx == EGL_NO_CONTEXT ||
+        !funcs->p_eglMakeCurrent(egl_platform->display, new_surface, new_surface, ctx))
+    {
+        WARN("pbuffer rebind failed hwnd=%p error=%#x\n",
+             base->client->hwnd, funcs->p_eglGetError());
+        funcs->p_eglDestroySurface(egl_platform->display, new_surface);
+        return;
+    }
+    funcs->p_eglDestroySurface(egl_platform->display, base->surface);
+    base->surface = new_surface;
+    WARN("pbuffer resized %dx%d -> %dx%d hwnd=%p\n", gl->width, gl->height, width, height,
+         base->client->hwnd);
+    gl->width = width;
+    gl->height = height;
 }
 
 /* 呈现: 发布 id → flush → swap → 摘 id。三步顺序不可换 —— mesa 在 swap 内部
@@ -111,8 +164,24 @@ static void winehua_x11_drawable_flush(struct opengl_drawable *base, UINT flags)
 static BOOL winehua_x11_drawable_swap(struct opengl_drawable *base)
 {
     struct winehua_x11_gl_drawable *gl = impl_from_drawable(base);
-    Window xwindow = X11DRV_get_whole_window(base->client->hwnd);
+    HWND hwnd = base->client->hwnd;
+    HWND toplevel;
+    Window xwindow;
     BOOL ok;
+
+    /* id 取**受管顶层窗**的: 子窗 (WS_CHILD) 自己没有 whole_window ——
+     * is_window_managed 只对 managed toplevel 建窗 —— 直接用子窗 hwnd 会永远
+     * 拿不到 id ⇒ 整条通道静默不呈现 (review 2026-10-01)。GA_ROOT 沿 parent
+     * 上溯到顶层。**已知限制**: 子窗内容按顶层窗矩形落位 (子矩形偏移当前不经
+     * present 通道传递, 见 known-issues §2.11), 首次出现时提示一次。 */
+    toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+    if (toplevel && toplevel != hwnd && !gl->warned_child)
+    {
+        gl->warned_child = TRUE;
+        WARN("hwnd %p is a child window, presenting through its toplevel %p; "
+             "sub-rect offset is not carried by the present channel\n", hwnd, toplevel);
+    }
+    xwindow = X11DRV_get_whole_window(toplevel ? toplevel : hwnd);
 
     if (!xwindow || xwindow == root_window)
     {
@@ -174,6 +243,12 @@ static BOOL winehua_x11_surface_create(HWND hwnd, int format, struct opengl_draw
     if (!(client = nulldrv_client_surface_create(hwnd))) return FALSE;
     /* 页面尽早绑定: mesa 侧第一次 flush_frontbuffer 就该读到有效页 */
     winehua_present_surface_init();
+    /* 页建不起来 (无 TMPDIR / open/mmap 失败) 时整条通道只会"什么都不发生"
+     * (id 恒 0 ⇒ 一帧都不会 present), 而降级告警说的是"宿主没挂接" —— 方向
+     * 相反。这里是唯一能区分"通道断了"与"宿主没挂接"的探针 (header 的约定),
+     * 所以显式探一次并留痕 (review 2026-10-01: 该函数此前无人调用)。 */
+    if (!winehua_present_surface_mapped())
+        ERR("present page not mapped (TMPDIR/mmap failed): frames will never reach the host\n");
     if (!(gl = opengl_drawable_create(sizeof(*gl), &winehua_x11_drawable_funcs,
                                       format, client)))
     {
@@ -246,7 +321,15 @@ UINT winehua_x11_gl_init(UINT version, const struct opengl_funcs *opengl_funcs,
             version, WINE_OPENGL_DRIVER_VERSION);
         return STATUS_INVALID_PARAMETER;
     }
-    if (!opengl_funcs->egl_handle) return STATUS_NOT_SUPPORTED;
+    if (!opengl_funcs->egl_handle)
+    {
+        /* STATUS_NOT_SUPPORTED 的上游含义是"运行期缺 libGL"; 通道已武装但本进程
+         * 没有 egl_handle 时也走这里 —— 按旧含义会被误读 (known-issues §2.11
+         * 小项)。真实原因显式打出来。 */
+        ERR("no EGL handle in this process: private present unavailable "
+            "(channel armed, but no EGL to create the pbuffer with)\n");
+        return STATUS_NOT_SUPPORTED;
+    }
     if (!winehua_x11_gl_enabled()) return STATUS_NOT_IMPLEMENTED;
 
     funcs = opengl_funcs;

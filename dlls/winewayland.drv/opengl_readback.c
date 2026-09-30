@@ -112,7 +112,9 @@ static void winehua_readback_drawable_destroy(struct opengl_drawable *base)
 {
     struct winehua_readback_drawable *gl = winehua_readback_from_drawable(base);
 
-    if (base->surface) funcs->p_eglDestroySurface(egl->display, base->surface);
+    /* EGLSurface 由 win32u 的 opengl_drawable_release 统一销毁 (上游约定:
+     * egldrv 的 destroy 回调不销毁) —— 这里再销毁一次就是二次销毁: 释放后读 +
+     * EGL 显示表 last error 被污染 (review 2026-10-01, X 侧同款一起修)。 */
     free(gl->rgba);
     if (gl->state) winehua_readback_state_unref(gl->state);
 }

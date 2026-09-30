@@ -63,7 +63,11 @@ struct app_state
     char presented_route[16];
     char requested_route[16];
     char expected_route[16];
+    char declared_route[16];        /* job 文件声明的路线 (不被 CLI 覆盖改写) */
     unsigned long long presented_key;
+    unsigned long long last_display_change_ms; /* 显示序列最后一次推进的时刻 */
+    double resize_after_s;          /* >0 = 该时刻改一次窗口尺寸 (验收开关) */
+    BOOL resize_done;
 };
 
 enum seven_segment_bits
@@ -122,8 +126,22 @@ static void load_graphics_env(struct app_state *state)
     lstrcpynA(state->expected_route,
               force_gl && force_gl[0] ? force_gl : "-",
               sizeof(state->expected_route));
+    /* job 文件里声明的路线 (smoke.py build_job 在合并 CLI 覆盖**之前**抄下来)。
+     * 期望值与实跑值同源时, 一个 --env 覆盖能同时改掉两者而不自知; 声明值不会
+     * 被改, 判据拿它兜底 (review F7)。 */
+    force_gl = getenv("WINEHUA_SMOKE_DECLARED_ROUTE");
+    lstrcpynA(state->declared_route,
+              force_gl && force_gl[0] ? force_gl : "-",
+              sizeof(state->declared_route));
     force_gl = getenv("WINEHUA_GRAPHICS_FORCE_GL");
     state->force_gl = force_gl && !lstrcmpA(force_gl, "1");
+    /* 验收开关: N 秒后把自己的窗口改尺寸 (默认关)。X 路线 GL 的 pbuffer 曾在
+     * 创建时冻结尺寸、之后永不更新 —— 窗口 resize 后画面被裁+拉伸而 guest 零
+     * 错误 (review 2026-10-01 P1-1)。触发后应看到 guest stderr 的
+     * "window resized" 紧跟驱动侧的 "pbuffer resized A -> B", 且显示序列继续
+     * 推进。 */
+    force_gl = getenv("WINEHUA_SMOKE_RESIZE_AFTER_S");
+    state->resize_after_s = force_gl && force_gl[0] ? atof(force_gl) : 0.0;
 }
 
 static BOOL update_display_fps(struct app_state *state)
@@ -161,6 +179,7 @@ static BOOL update_display_fps(struct app_state *state)
         state->display_sequence = sequence;
         state->display_fps = fps;
         state->has_display_fps = TRUE;
+        state->last_display_change_ms = GetTickCount64();
         if (fields >= 5)
         {
             lstrcpynA(state->presented_route, route, sizeof(state->presented_route));
@@ -822,6 +841,10 @@ int main(int argc, char **argv)
             {
                 render_fixed_frame(&state);
                 frames++;
+                /* 固定帧阶段也要继续观测显示序列: 否则 displayStallMs 把"最后
+                 * 2 秒没在观测"算成"没在推进" —— 新鲜度判定会假红 (2026-10-01
+                 * 实测: stall=2978ms 而 displayed_fps 明明一路 117)。 */
+                (void)update_display_fps(&state);
                 if (!fixed_frame_announced)
                 {
                     snprintf(metrics, sizeof(metrics),
@@ -843,6 +866,20 @@ int main(int argc, char **argv)
             float angle = (float)(elapsed_seconds * 72.0);
             float phase = (float)(elapsed_seconds * 1.8);
 
+            /* 验收: 窗口改尺寸 ⇒ WM_SIZE 更新 client 尺寸 ⇒ 驱动侧 pbuffer 应
+             * 跟着重建 (WINEHUA_SMOKE_RESIZE_AFTER_S, 默认关)。 */
+            if (state.resize_after_s > 0 && !state.resize_done &&
+                elapsed_seconds >= state.resize_after_s)
+            {
+                state.resize_done = TRUE;
+                if (SetWindowPos(state.hwnd, NULL, 0, 0, 640, 360,
+                                 SWP_NOMOVE | SWP_NOZORDER))
+                    fprintf(stderr, "winehua_graphics_smoke: window resized to 640x360 (client) at %.1fs\n",
+                            elapsed_seconds);
+                else
+                    fprintf(stderr, "winehua_graphics_smoke: SetWindowPos failed: %lu\n",
+                            GetLastError());
+            }
             render_frame(&state, angle, phase);
         }
 
@@ -896,11 +933,18 @@ int main(int argc, char **argv)
              "\"swapchainRecreateCount\":0,\"surfaceQueueBacklog\":-1,"
              "\"fallbackDetected\":false,\"fixedFrame\":\"rgba-quadrants-v1\","
              "\"expectedRoute\":\"%s\",\"requestedRoute\":\"%s\","
-             "\"presentedRoute\":\"%s\","
-             "\"presentedKey\":%llu}",
+             "\"declaredRoute\":\"%s\",\"presentedRoute\":\"%s\","
+             "\"displayStallMs\":%lld,\"presentedKey\":%llu}",
              frames, state.producer_fps, state.has_display_fps ? state.display_fps : -1.0,
              state.width, state.height,
-             state.expected_route, state.requested_route, state.presented_route,
+             state.expected_route, state.requested_route, state.declared_route,
+             state.presented_route,
+             /* 显示序列最后一次推进距结束的时间: 粘性的 displayFps/presentedRoute
+              * 只能证明"曾经出过图", 这个字段才能抓"头 1 秒出过、之后停了"
+              * (review F6)。没观察到序列 = -1。 */
+             state.has_display_fps
+                 ? (long long)(GetTickCount64() - state.last_display_change_ms)
+                 : -1LL,
              state.presented_key);
     {
         BOOL displayed = !smoke.automation || !state.display_fps_file || state.has_display_fps;

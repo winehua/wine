@@ -49,6 +49,16 @@ struct winehua_present_surface_page
 static pthread_once_t winehua_present_surface_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t winehua_present_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct winehua_present_surface_page *winehua_present_surface_page;
+static char winehua_present_page_path[256];   /* 进程退出时删除 (见下) */
+static char winehua_present_ready_dir[192];   /* 读一次的缓存, 见 ready() */
+
+/* 页文件是每进程一个 (名字带 pid), 不删就在沙箱 temp 里逐次累积; 退出时清掉。
+ * SIGKILL 下不会执行 —— 残留页由下一次启动的同 pid/新 pid 覆盖或忽略, 无害。 */
+static void winehua_present_page_cleanup(void)
+{
+    if (winehua_present_page_path[0])
+        unlink(winehua_present_page_path);
+}
 
 static void winehua_init_present_surface_page(void)
 {
@@ -78,6 +88,8 @@ static void winehua_init_present_surface_page(void)
     /* magic last: 写它之前 consumer 读到的是无效页, 不会当半初始化页用 */
     __atomic_store_n(&page->magic, WINEHUA_PRESENT_SURFACE_MAGIC, __ATOMIC_RELEASE);
     winehua_present_surface_page = page;
+    snprintf(winehua_present_page_path, sizeof(winehua_present_page_path), "%s", path);
+    atexit(winehua_present_page_cleanup);
 }
 
 W32KAPI void winehua_present_surface_init(void)
@@ -104,19 +116,32 @@ W32KAPI void winehua_present_surface_end(void)
     pthread_mutex_unlock(&winehua_present_surface_mutex);
 }
 
+static pthread_once_t winehua_present_ready_once = PTHREAD_ONCE_INIT;
+
+static void winehua_init_ready_dir(void)
+{
+    const char *dir = getenv("WINEHUA_ZERO_COPY_READY_DIR");
+
+    if (dir && dir[0])
+        snprintf(winehua_present_ready_dir, sizeof(winehua_present_ready_dir), "%s", dir);
+}
+
 /* 宿主挂接握手: 宿主给这个 (pid, surface_id) 挂好目标后会写 ready 标记
  * (宿主侧 graphics_broker.cpp SetZeroCopySurfaceReady)。未挂接时 present 会被
  * 宿主丢弃 (kPresentNoTarget) —— 驱动据此报降级, 不静默。 */
 W32KAPI BOOL winehua_present_surface_ready(uint32_t surface_id)
 {
-    const char *ready_dir = getenv("WINEHUA_ZERO_COPY_READY_DIR");
     char path[256];
     uint64_t surface_key;
 
-    if (!surface_id || !ready_dir || !ready_dir[0]) return FALSE;
+    /* 目录读一次就够 (它在进程生命周期内不变): 本函数每次 swap 都被调用
+     * (117fps ⇒ 每秒百余次), 原来每次都 getenv —— 既有开销, 又在并发 setenv
+     * 下不线程安全 (调用点在渲染线程上)。getenv 结果缓存到 pthread_once。 */
+    pthread_once(&winehua_present_ready_once, winehua_init_ready_dir);
+    if (!surface_id || !winehua_present_ready_dir[0]) return FALSE;
     surface_key = ((uint64_t)(uint32_t)getpid() << 32) | surface_id;
     if (snprintf(path, sizeof(path), "%s/winehua_zc_surface_%llu.ready",
-                 ready_dir, (unsigned long long)surface_key) >= sizeof(path))
+                 winehua_present_ready_dir, (unsigned long long)surface_key) >= sizeof(path))
         return FALSE;
     return access(path, F_OK) == 0;
 }
