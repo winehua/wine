@@ -6005,6 +6005,22 @@ void sysparams_init(void)
             NtClose( hkey );
         }
     }
+#ifdef __OHOS__
+    /* X 路线 (displayroute) 触屏默认 DPI: x11 路线的 X 屏幕 = 画布物理像素
+     * (2800x1840), wine 默认 96dpi 使 UI 元素只有 ~2-3.5mm, 无法触指
+     * (2026-10-05 人工验收 D2: 任务栏 20px、标题栏 ~35px, 用户主诉
+     * "dpi 太高, 显示太小, 太难操作")。面板物理分辨率即 ~192dpi
+     * (2800px/371mm), 192 = 物理正确值, 等价于老路线 1400x920 逻辑桌面
+     * + 2x 呈现的最终观感。作用域: 仅 WINEHUA_DISPLAY_ROUTE=x11 (fusion /
+     * wayland 路线不带此 env, 保持 96dpi 上游行为); 注册表显式 LogPixels
+     * 优先于本默认 (用户可覆盖)。与 driver.c load_display_driver 的
+     * per-process override 同一判据来源 (env 每进程独立生效)。 */
+    if (!system_dpi)
+    {
+        const char *route = getenv( "WINEHUA_DISPLAY_ROUTE" );
+        if (route && !strcmp( route, "x11" )) system_dpi = 192;
+    }
+#endif
     if (!system_dpi) system_dpi = USER_DEFAULT_SCREEN_DPI;
 
     /* FIXME: what do the DpiScalingVer flags mean? */
