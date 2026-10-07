@@ -469,6 +469,48 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
 
 
 /***********************************************************************
+ *		sync_frame_extents
+ *
+ * WineHua (D31): declare the client-area insets of self-drawn decorations.
+ * In desktop mode wine draws the non-client area itself (managed_mode is
+ * forced FALSE in desktop.c), so only wine knows where the client area
+ * sits inside whole_window.  The host compositor anchors zero-copy
+ * GL/Vulkan faces at the client rect and would otherwise stretch them
+ * over the decorations, hiding the title bar.  _NET_WM_FRAME_EXTENTS is
+ * the standard EWMH property for this (Chromium sets it for the same
+ * client-side-decorations reason); written only for unmanaged windows —
+ * a managed window's decorations belong to the WM and overwriting would
+ * clobber the WM's own value.
+ */
+static void sync_frame_extents( struct x11drv_win_data *data )
+{
+    /* Xlib format=32 契约: 数据按 long[] 提供 (LP64 下每单元 8 字节, 同款
+     * 写法见 sync_window_opacity)。传 CARD32[] 时 Xlib 按 long 步进读输入,
+     * 线上值变成 [v0, v2, 栈垃圾, 栈垃圾] —— D31 实测 wlroots 恰读到
+     * (4,23,垃圾,垃圾), 面被锚成 1px 条带。 */
+    long extents[4];
+    unsigned int i;
+
+    if (!data->whole_window || data->managed) return;
+    /* client/visible live in the same coordinate space.  A client edge can
+     * stick out of the visible rect when the window hangs off-screen —
+     * clamp, the host only needs the on-window client placement. */
+    extents[0] = max( 0, data->rects.client.left - data->rects.visible.left );
+    extents[1] = max( 0, data->rects.visible.right - data->rects.client.right );
+    extents[2] = max( 0, data->rects.client.top - data->rects.visible.top );
+    extents[3] = max( 0, data->rects.visible.bottom - data->rects.client.bottom );
+    for (i = 0; i < 4; i++)
+        if (extents[i] != (long)data->frame_extents_written[i]) break;
+    if (i == 4) return;  /* unchanged — don't spam PropertyNotify */
+    for (i = 0; i < 4; i++)
+        data->frame_extents_written[i] = (CARD32)extents[i];
+    XChangeProperty( data->display, data->whole_window,
+                     x11drv_atom(_NET_WM_FRAME_EXTENTS), XA_CARDINAL, 32,
+                     PropModeReplace, (unsigned char *)extents, 4 );
+}
+
+
+/***********************************************************************
  *		is_window_resizable
  *
  * Check if window should be made resizable by the window manager
@@ -2448,6 +2490,7 @@ static void create_whole_window( struct x11drv_win_data *data )
     x11drv_xinput2_enable( data->display, data->whole_window );
     set_initial_wm_hints( data->display, data->whole_window );
     set_wm_hints( data );
+    sync_frame_extents( data );  /* WineHua D31: before map, so the host reads it on CreateNotify */
 
     XSaveContext( data->display, data->whole_window, winContext, (char *)data->hwnd );
     NtUserSetProp( data->hwnd, whole_window_prop, (HANDLE)data->whole_window );
@@ -3328,6 +3371,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     /* if window was fullscreen and is being hidden, release cursor clipping */
     was_fullscreen &= data->desired_state.wm_state != NormalState;
 
+    sync_frame_extents( data );  /* WineHua D31: client insets follow the rects */
     XFlush( data->display );  /* make sure changes are done before we start painting again */
     release_win_data( data );
 

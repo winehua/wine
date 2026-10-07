@@ -517,6 +517,7 @@ enum x11drv_atoms
     XATOM__NET_SYSTEM_TRAY_OPCODE,
     XATOM__NET_SYSTEM_TRAY_S0,
     XATOM__NET_SYSTEM_TRAY_VISUAL,
+    XATOM__NET_WM_FRAME_EXTENTS,
     XATOM__NET_WM_FULLSCREEN_MONITORS,
     XATOM__NET_WM_ICON,
     XATOM__NET_WM_MOVERESIZE,
@@ -696,6 +697,9 @@ struct x11drv_win_data
     unsigned long wm_normal_hints_serial;/* serial of last pending WM_NORMAL_HINTS request */
     unsigned long configure_serial;    /* serial of last pending configure request */
     unsigned long net_wm_icon_serial;  /* serial of last pending _NET_WM_ICON request */
+    CARD32 frame_extents_written[4];   /* WineHua D31: last values synced to _NET_WM_FRAME_EXTENTS
+                                        * (all-zero means nothing written yet — an all-zero result
+                                        * is exactly the borderless case where skipping is fine) */
 };
 
 extern struct x11drv_win_data *get_win_data( HWND hwnd );
