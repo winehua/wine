@@ -3794,9 +3794,20 @@ static BOOL fixup_swp_flags( WINDOWPOS *winpos, const RECT *old_window_rect, int
 
     if ((win->dwStyle & (WS_POPUP | WS_CHILD)) != WS_CHILD)
     {
+        /* WineHua (D33): an explicit HWND_BOTTOM request is honored even when
+         * the call activates — Windows places the window at the bottom of its
+         * band; activation alone does not raise it back. The unconditional
+         * rewrite below turned SetWindowPos(hwnd, HWND_BOTTOM) without
+         * SWP_NOACTIVATE into a silent no-op (bottom == already-top window
+         * after rewrite → NOZORDER early-out), breaking Z-order management
+         * (实测 2026-10-08 smoke win_zorder send-a-bottom got=ACB expect=CBA,
+         * +win trace 显示 after=1 的调用进入后被改写). Upstream conformance
+         * tests only exercise BOTTOM via child windows (exempt from this
+         * rewrite), so no test pinned the top-level behavior. */
         if (!(winpos->flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW)) && /* Bring to the top when activating */
             (winpos->flags & SWP_NOZORDER ||
-             (winpos->hwndInsertAfter != HWND_TOPMOST && winpos->hwndInsertAfter != HWND_NOTOPMOST)))
+             (winpos->hwndInsertAfter != HWND_TOPMOST && winpos->hwndInsertAfter != HWND_NOTOPMOST &&
+              winpos->hwndInsertAfter != HWND_BOTTOM)))
         {
             winpos->flags &= ~SWP_NOZORDER;
             winpos->hwndInsertAfter = HWND_TOP;
