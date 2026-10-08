@@ -3156,7 +3156,21 @@ void X11DRV_SetCapture( HWND hwnd, UINT flags )
     struct x11drv_thread_data *thread_data = x11drv_thread_data();
     struct x11drv_win_data *data;
 
-    if (!(flags & (GUI_INMOVESIZE | GUI_INMENUMODE))) return;
+    /* WineHua (D34): app-level SetCapture also grabs the X pointer — the
+     * upstream early-return `if (!(flags & (GUI_INMOVESIZE | GUI_INMENUMODE)))
+     * return;` is removed. Upstream only grabs during modal loops and routes
+     * plain capture at the win32 dispatch level, which only works while the
+     * pointer stays over windows of the SAME process: cross-process moves
+     * (desktop / another app) never reach the capturing process, so
+     * WM_MOUSEMOVE stops (实测 2026-10-08 smoke input_capture: SetCapture 后
+     * 窗外 swipe moves=0, 桥侧日志确认 motion 已达 Xwayland 桌面 surface;
+     * flags=0 时本函数从未执行 XGrabPointer). The X grab is the only
+     * mechanism-level redirect on X11 — Xwayland runs pointer events through
+     * dix with the grab active and delivers to whole_window regardless of
+     * position. Grab semantics match Windows capture; the X server releases
+     * grabs automatically when the client or its windows die, so a crashed
+     * capturer cannot wedge the pointer. The release path below tolerates a
+     * NULL grab_hwnd (get_win_data returns NULL). */
 
     if (hwnd)
     {
