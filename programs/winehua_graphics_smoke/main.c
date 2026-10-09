@@ -749,11 +749,24 @@ static BOOL parse_args(struct app_state *state, struct winehua_smoke_options *sm
     return TRUE;
 }
 
-/* 本进程的内核 pid (见 metrics selfPid 字段注释)。/proc/self/stat 首字段;
- * 打不开 = 0 (判定层对 0 走旧路径)。 */
+/* 本进程的内核 pid (见 metrics selfPid 字段注释)。三通道对照 (D49 第二轮
+ * 实测: /proc 直读在 x64/x86 两用例返回同一值 17402 —— 与 key pid 不同且
+ * 两进程相同, 来源未明; 加 Z: 盘通道与 Wine ptid 通道一次拿全事实)。 */
 static unsigned long long d49_unix_pid(void)
 {
     FILE *f = fopen("/proc/self/stat", "r");
+    unsigned int pid = 0;
+    if (f)
+    {
+        if (fscanf(f, "%u", &pid) != 1) pid = 0;
+        fclose(f);
+    }
+    return pid;
+}
+
+static unsigned long long d49_unix_pid_z(void)
+{
+    FILE *f = fopen("Z:/proc/self/stat", "r");
     unsigned int pid = 0;
     if (f)
     {
@@ -948,7 +961,8 @@ int main(int argc, char **argv)
              "\"fallbackDetected\":false,\"fixedFrame\":\"rgba-quadrants-v1\","
              "\"expectedRoute\":\"%s\",\"requestedRoute\":\"%s\","
              "\"declaredRoute\":\"%s\",\"presentedRoute\":\"%s\","
-             "\"displayStallMs\":%lld,\"presentedKey\":%llu,\"selfPid\":%llu}",
+             "\"displayStallMs\":%lld,\"presentedKey\":%llu,"
+             "\"selfPid\":%llu,\"selfPidZ\":%llu,\"winePid\":%lu}",
              frames, state.producer_fps, state.has_display_fps ? state.display_fps : -1.0,
              state.width, state.height,
              state.expected_route, state.requested_route, state.declared_route,
@@ -968,7 +982,9 @@ int main(int argc, char **argv)
               * 里返回 Wine ptid (实测 332/376, D49 第一轮), 与 key 不同源,
               * 不能用。host 侧 spawn 记录 (nativespawn 壳 pid) 在 x86 链
               * 结构性差一层 fork (D49: x64 恒等, x86 恒偏 +21), 也不能用。 */
-             (unsigned long long)d49_unix_pid());
+             (unsigned long long)d49_unix_pid(),
+             (unsigned long long)d49_unix_pid_z(),
+             (unsigned long)GetCurrentProcessId());
     {
         BOOL displayed = !smoke.automation || !state.display_fps_file || state.has_display_fps;
         BOOL passed = frames && displayed;
