@@ -17,9 +17,11 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -481,6 +483,20 @@ static void process_one_message(struct unix_device *iface, int fd)
         apply_neutral(iface);
 }
 
+/* D42: 断连重连退避间隔。hub (GamepadBridge) 为单客户端策略, 竞争实例
+ * 连入即 shutdown 旧连接; poll 对 HUP 立即返回, 无间隔则形成
+ * connect→HUP→EOF→close 微秒级重连风暴 (2026-10-09 实测单日 3.4M 行
+ * stderr / 267MB, 刷屏进程最终 box64 SEGV)。断连后至少间隔此值再重连;
+ * connect 失败 (hub 未起) 不受此限, 仍走 50ms 原节拍。 */
+#define WHGP_RECONNECT_BACKOFF_MS 250
+
+static int64_t whgp_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 NTSTATUS ohos_bus_wait(void *args)
 {
     struct bus_event *result = args;
@@ -489,6 +505,7 @@ NTSTATUS ohos_bus_wait(void *args)
     const char *path;
     struct pollfd pfd;
     int fd;
+    int64_t last_drop_ms = 0;
 
     bus_event_cleanup(result);
     path = resolve_socket_path();
@@ -505,7 +522,11 @@ NTSTATUS ohos_bus_wait(void *args)
             break;
         }
         if (sock_fd < 0 && path)
-            connect_socket(path);
+        {
+            if (whgp_now_ms() - last_drop_ms >= WHGP_RECONNECT_BACKOFF_MS)
+                connect_socket(path);
+            /* 未到退避期限: sock_fd 保持 -1, 落到下方 usleep 分支 */
+        }
         fd = sock_fd;
         dev = NULL;
         if (!list_empty(&device_list))
@@ -521,6 +542,10 @@ NTSTATUS ohos_bus_wait(void *args)
             pfd.events = POLLIN;
             if (poll(&pfd, 1, 20) > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)) && dev)
                 process_one_message(dev, fd);
+            pthread_mutex_lock(&ohos_cs);
+            if (sock_fd < 0)
+                last_drop_ms = whgp_now_ms(); /* 本拍内被断开 */
+            pthread_mutex_unlock(&ohos_cs);
         }
         else
             usleep(50000);
