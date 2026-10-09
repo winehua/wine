@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <process.h>
 
 #include <windows.h>
 #include <GL/gl.h>
@@ -934,7 +935,7 @@ int main(int argc, char **argv)
              "\"fallbackDetected\":false,\"fixedFrame\":\"rgba-quadrants-v1\","
              "\"expectedRoute\":\"%s\",\"requestedRoute\":\"%s\","
              "\"declaredRoute\":\"%s\",\"presentedRoute\":\"%s\","
-             "\"displayStallMs\":%lld,\"presentedKey\":%llu}",
+             "\"displayStallMs\":%lld,\"presentedKey\":%llu,\"selfPid\":%llu}",
              frames, state.producer_fps, state.has_display_fps ? state.display_fps : -1.0,
              state.width, state.height,
              state.expected_route, state.requested_route, state.declared_route,
@@ -945,7 +946,15 @@ int main(int argc, char **argv)
              state.has_display_fps
                  ? (long long)(GetTickCount64() - state.last_display_change_ms)
                  : -1LL,
-             state.presented_key);
+             state.presented_key,
+             /* 本进程的 Unix getpid —— 与 presentedKey 高 32 位同源 (mesa/
+              * win32u 填 key 用的就是它)。归属断言用 guest 事实自洽: key 的
+              * pid == selfPid ⇒ 这一帧是本进程的面。host 侧的 spawn 记录
+              * (nativespawn 壳 pid) 与 guest getpid 在 x86 链上结构性差一
+              * 层 fork (D49: x64 恒等, x86 恒偏 +21), 不能互为断言对象。
+              * msvcrt _getpid 返回 Unix pid (非 GetCurrentProcessId 的
+              * Wine ptid —— 2026-10-01 注释里「只拿得到 ptid」没试过它)。 */
+             (unsigned long long)_getpid());
     {
         BOOL displayed = !smoke.automation || !state.display_fps_file || state.has_display_fps;
         BOOL passed = frames && displayed;
