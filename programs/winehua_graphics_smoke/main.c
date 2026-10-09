@@ -11,7 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <process.h>
 
 #include <windows.h>
 #include <GL/gl.h>
@@ -750,6 +749,20 @@ static BOOL parse_args(struct app_state *state, struct winehua_smoke_options *sm
     return TRUE;
 }
 
+/* 本进程的内核 pid (见 metrics selfPid 字段注释)。/proc/self/stat 首字段;
+ * 打不开 = 0 (判定层对 0 走旧路径)。 */
+static unsigned long long d49_unix_pid(void)
+{
+    FILE *f = fopen("/proc/self/stat", "r");
+    unsigned int pid = 0;
+    if (f)
+    {
+        if (fscanf(f, "%u", &pid) != 1) pid = 0;
+        fclose(f);
+    }
+    return pid;
+}
+
 int main(int argc, char **argv)
 {
     struct app_state state = {0};
@@ -947,14 +960,15 @@ int main(int argc, char **argv)
                  ? (long long)(GetTickCount64() - state.last_display_change_ms)
                  : -1LL,
              state.presented_key,
-             /* 本进程的 Unix getpid —— 与 presentedKey 高 32 位同源 (mesa/
-              * win32u 填 key 用的就是它)。归属断言用 guest 事实自洽: key 的
-              * pid == selfPid ⇒ 这一帧是本进程的面。host 侧的 spawn 记录
-              * (nativespawn 壳 pid) 与 guest getpid 在 x86 链上结构性差一
-              * 层 fork (D49: x64 恒等, x86 恒偏 +21), 不能互为断言对象。
-              * msvcrt _getpid 返回 Unix pid (非 GetCurrentProcessId 的
-              * Wine ptid —— 2026-10-01 注释里「只拿得到 ptid」没试过它)。 */
-             (unsigned long long)_getpid());
+             /* 本进程的 Unix pid —— 与 presentedKey 高 32 位同源 (mesa/
+              * win32u 填 key 用 libc getpid, 都是内核 pid 空间)。归属断言
+              * 用 guest 事实自洽: key 的 pid == selfPid ⇒ 帧是本进程的面。
+              * 取法: guest 是真实 Linux 内核, wine 文件层透传 /proc ——
+              * /proc/self/stat 首字段即内核 pid。msvcrt _getpid 在本 wine
+              * 里返回 Wine ptid (实测 332/376, D49 第一轮), 与 key 不同源,
+              * 不能用。host 侧 spawn 记录 (nativespawn 壳 pid) 在 x86 链
+              * 结构性差一层 fork (D49: x64 恒等, x86 恒偏 +21), 也不能用。 */
+             (unsigned long long)d49_unix_pid());
     {
         BOOL displayed = !smoke.automation || !state.display_fps_file || state.has_display_fps;
         BOOL passed = frames && displayed;
