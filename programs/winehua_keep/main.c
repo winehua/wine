@@ -14,6 +14,7 @@
  * See server/winstation.c: close_desktop_timeout / remove_desktop_user.
  */
 #include <windows.h>
+#include <string.h>
 
 /* Same as explorer's desktop.c — not available in mingw headers */
 #define DESKTOP_ALL_ACCESS 0x01ff
@@ -39,6 +40,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     WNDCLASSA wc = {0};
     HWND hwnd;
     MSG msg;
+
+    /* Boot-trigger mode (WineHua init orchestration): when spawned as a
+     * session's first PE process, our ntdll run_wineboot dispatches the
+     * single real wineboot --init and blocks until it completes, so WinMain
+     * only ever runs after boot is done.  Exit immediately — the desktop
+     * anchor behavior below is for the explorer desktop spawn only. */
+    if (lpCmdLine && strstr(lpCmdLine, "--boot-once"))
+        return 0;
 
     /* Open the desktop that explorer created. */
     hDesk = OpenDesktopA("shell", 0, FALSE, DESKTOP_ALL_ACCESS);
