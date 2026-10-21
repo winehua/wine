@@ -16,6 +16,7 @@ SOURCES = \
 	keyboard.c \
 	mouse.c \
 	opengl.c \
+	opengl_winehua.c \
 	palette.c \
 	pen.c \
 	version.rc \
