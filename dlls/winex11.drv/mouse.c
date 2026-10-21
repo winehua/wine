@@ -1484,10 +1484,16 @@ BOOL X11DRV_SetCursorPos( INT x, INT y )
         return FALSE;
     }
 
+#ifdef SONAME_LIBXFIXES
+    /* warp 瞬间藏硬件光标 (xfixes), 库缺失时跳过 —— Xwayland/wlroots 侧的
+     * 光标由合成器管理, 跳过只影响 warp 瞬间的可见性, 不影响定位。 */
     pXFixesHideCursor( data->display, root_window );
+#endif
     XWarpPointer( data->display, root_window, root_window, 0, 0, 0, 0, pos.x, pos.y );
     data->warp_serial = NextRequest( data->display );
+#ifdef SONAME_LIBXFIXES
     pXFixesShowCursor( data->display, root_window );
+#endif
     XFlush( data->display ); /* avoids bad mouse lag in games that do their own mouse warping */
     TRACE( "warped to %d,%d serial %lu\n", x, y, data->warp_serial );
     return TRUE;

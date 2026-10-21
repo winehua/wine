@@ -4266,9 +4266,9 @@ BOOL X11DRV_HasWindowManager( const char *name )
     int opcode, event, error;
 
     if (!strcmp( name, "xwayland" )) return XQueryExtension( gdi_display, "XWAYLAND", &opcode, &event, &error );
-    if (!strcmp( name, "xwayland_glx_nvidia" ))
-        return XQueryExtension( gdi_display, "XWAYLAND", &opcode, &event, &error ) && glx_renderer
-               && strstr( glx_renderer, "NVIDIA" );
+    /* WineHua: "xwayland_glx_nvidia" (上游 11.0) 依赖 glx_renderer —— 该符号
+     * 定义在 GLX 编译区, 无 GLX (SONAME_LIBGL 空) 时不存在; 11.10 上游已整体
+     * 移除该 NVIDIA 专用启发式, 此处同撤, 落回 window_manager 判断。 */
     return data->window_manager && !strcmp( data->window_manager, name );
 }
 
