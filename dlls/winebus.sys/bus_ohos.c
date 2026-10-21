@@ -134,6 +134,27 @@ static void apply_state(struct unix_device *iface, const struct whgp_state_v1 *b
     bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
 }
 
+/* D42: 断连重连退避。hub (GamepadBridge) 单客户端策略: 竞争实例连入被
+ * 拒绝并 close; poll 对 HUP 立即返回, 退避失效时形成 connect→被拒→EOF→
+ * 立即重连的微秒级风暴 (2026-10-09 实测单日 3.4M 行 stderr / 267MB;
+ * 2026-10-16 双 SCM/双 winebus 场景实测 ~8.6K 圈/s × 14min = 750 万行)。
+ *
+ * last_drop_ms 必须由 close_socket() (断连唯一出口) 记录, 禁止改用
+ * ohos_bus_wait 的栈上变量: 该函数每 pop 到一个事件即返回上层、上层处理完
+ * 重入 — 栈变量随之归零; 而断连路径 apply_neutral() 自己会排队一个输入
+ * 报告事件, 保证重入立即发生, 栈变量基准的退避被结构性绕过 (首版 D42 即
+ * 死代码于此)。connect 失败 (hub 未起) 不经过 close_socket, 仍走 50ms 节拍。 */
+#define WHGP_RECONNECT_BACKOFF_MS 250
+
+static int64_t last_drop_ms; /* 最近断连时刻(ms); 读写均在 ohos_cs 锁域内 */
+
+static int64_t whgp_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static void close_socket(void)
 {
     if (sock_fd >= 0)
@@ -141,6 +162,7 @@ static void close_socket(void)
         shutdown(sock_fd, SHUT_RDWR);
         close(sock_fd);
         sock_fd = -1;
+        last_drop_ms = whgp_now_ms();
     }
 }
 
@@ -505,7 +527,11 @@ NTSTATUS ohos_bus_wait(void *args)
             break;
         }
         if (sock_fd < 0 && path)
-            connect_socket(path);
+        {
+            if (whgp_now_ms() - last_drop_ms >= WHGP_RECONNECT_BACKOFF_MS)
+                connect_socket(path);
+            /* 未到退避期限: sock_fd 保持 -1, 落到下方 usleep 分支 */
+        }
         fd = sock_fd;
         dev = NULL;
         if (!list_empty(&device_list))
