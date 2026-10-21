@@ -1108,6 +1108,29 @@ void init_display_driver(void)
     if (user_driver == &lazy_load_driver) load_display_driver();
 }
 
+/* WineHua (OHOS display routes): load the user driver before the Vulkan driver
+ * init runs -- driver load only, deliberately without load_driver()'s display
+ * cache refresh.
+ *
+ * Rationale (measured, m0 wine tree M2-T5): on the X route the per-process
+ * route override can leave the display driver unloaded until the first Vulkan
+ * call, so win32u's Vulkan init used to reach the lazy driver entry
+ * (loaderdrv_VulkanInit -> load_driver) from inside its own pthread_once.
+ * That load refreshed the display cache, whose force branch enumerates GPUs
+ * through vulkan_instance_create() and therefore drives the host Vulkan
+ * loader / Venus ICD (a second host instance) from inside the guest's own
+ * Vulkan init; the process spun at ~100% CPU.  Refreshing the cache here
+ * instead is not an option either: it forces the same GPU enumeration at
+ * first Vulkan call on *both* routes and measurably destabilised the guest's
+ * storage-image submission on the Wayland route.  The Vulkan entry only needs
+ * the driver; the cache keeps being refreshed where it always was - on
+ * display paths, after this init has completed.  Callers:
+ * __wine_get_vulkan_driver(). */
+void preload_display_driver(void)
+{
+    if (user_driver == &lazy_load_driver) load_display_driver();
+}
+
 /**********************************************************************
  *           get_display_driver
  */

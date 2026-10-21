@@ -45,6 +45,7 @@
 #define WIN32_NO_STATUS
 #include "win32u_private.h"
 #include "ntuser_private.h"
+#include "wine/winehua_vulkan.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
@@ -61,32 +62,7 @@ WINE_DECLARE_DEBUG_CHANNEL(fps);
 static const struct vulkan_driver_funcs *driver_funcs;
 static int fshack_enabled = -1;
 
-#define WINEHUA_VULKAN_SURFACE_TAG UINT64_C(0x5748530000000000)
 #define WINEHUA_VULKAN_SWAPCHAIN_TAG UINT64_C(0x5748430000000000)
-
-static BOOL winehua_vulkan_present_enabled(void)
-{
-    const char *value = getenv("WINEHUA_VULKAN_PRESENT");
-    if (value && value[0] && strcmp(value, "0")) return TRUE;
-    value = getenv("WINEHUA_PRESENT_BACKEND");
-    if (value && (!strcmp(value, "venus_broker_present") ||
-                  !strcmp(value, "venus_direct_present"))) return TRUE;
-
-    /* WineHua launches Windows children through the NCP/Box64 boundary.  A
-     * child created by an already-running wineserver may only retain the
-     * baseline graphics variables, while the per-launch present variable is
-     * not serialized by Wine's Windows environment.  On this product path a
-     * VirGL guest is necessarily paired with the private Venus presenter;
-     * use that stable marker as a final capability fallback.  This keeps the
-     * decision local to WineHua and does not claim native Host WSI support. */
-    value = getenv("WINEHUA_GRAPHICS_BACKEND");
-    if (value && !strcmp(value, "virgl"))
-    {
-        TRACE("WineHua: enabling private Vulkan present from VirGL runtime marker\n");
-        return TRUE;
-    }
-    return FALSE;
-}
 
 static BOOL winehua_present_image_trace_enabled(void)
 {
@@ -5284,6 +5260,9 @@ const struct vulkan_funcs *__wine_get_vulkan_driver( UINT version )
         return NULL;
     }
 
+    /* WineHua: the display driver must be loaded before the init below runs;
+     * see preload_display_driver() in driver.c. */
+    preload_display_driver();
     pthread_once( &init_once, vulkan_init_once );
     if (!vulkan_handle) return NULL;
     return &vulkan_funcs;
