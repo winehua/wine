@@ -3189,22 +3189,14 @@ BOOL X11DRV_CreateWindow( HWND hwnd )
 {
     if (hwnd == NtUserGetDesktopWindow())
     {
-        static const WCHAR winsta0[] = {'W','i','n','S','t','a','0',0};
         struct x11drv_thread_data *data = x11drv_init_thread_data();
-        WCHAR winstation_name[64];
         XSetWindowAttributes attr;
 
-        if (NtUserGetObjectInformation( NtUserGetProcessWindowStation(), UOI_NAME, winstation_name,
-                                        sizeof(winstation_name), NULL ))
-        {
-            TRACE( "winstation name %s.\n", debugstr_w(winstation_name) );
-            if (!wcscmp( winstation_name, winsta0 ))
-            {
-                /* listen to raw xinput event in the desktop window thread */
-                data->xinput2_rawinput = TRUE;
-                x11drv_xinput2_enable( data->display, DefaultRootWindow( data->display ) );
-            }
-        }
+        /* WineHua: 上游 (Valve 11.0) 在 WinSta0 会话里给桌面窗线程开
+         * XInput2 raw input; OHOS 无该 winstation 语义, 且 HAVE_X11_EXTENSIONS_
+         * XINPUT2_H 在本 sysroot 未定义 (XInput2.h 属 libXi, x11 栈未装),
+         * x11drv_thread_data 无 xinput2_rawinput 字段 —— 整段撤除。 */
+        (void)data;
         /* create the cursor clipping window */
         attr.override_redirect = TRUE;
         attr.event_mask = StructureNotifyMask | FocusChangeMask;
