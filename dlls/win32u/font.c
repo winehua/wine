@@ -4518,6 +4518,44 @@ static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bit
 }
 
 /*************************************************************
+ *           ohos_font_aa_override
+ *
+ * Per-process override for GDI text antialiasing.
+ *
+ * A large family of legacy CJK (and western) titles renders text with GDI into
+ * an offscreen bitmap and then thresholds that bitmap into a 1-bit glyph mask -
+ * e.g. the popular GGE/XYQ private-server clients keep only pixels above
+ * 0x7ffe as ink. Grayscale antialiasing turns most of a 12px CJK stroke grey,
+ * so the mask keeps only stroke cores and the rendered text falls apart into
+ * scattered fragments.
+ *
+ * Game processes can therefore ask for bilevel glyphs without changing the
+ * desktop appearance:
+ *
+ *     WINEHUA_FONT_AA=bitmap -> GGO_BITMAP      (no antialiasing)
+ *     WINEHUA_FONT_AA=gray   -> GGO_GRAY4_BITMAP
+ */
+static UINT ohos_font_aa_override(void)
+{
+#ifdef __OHOS__
+    static int cached = -1;
+
+    if (cached < 0)
+    {
+        const char *value = getenv( "WINEHUA_FONT_AA" );
+
+        cached = 0;
+        if (value && !strcmp( value, "bitmap" )) cached = GGO_BITMAP;
+        else if (value && !strcmp( value, "gray" )) cached = GGO_GRAY4_BITMAP;
+        TRACE( "OHOS font AA override env=%s -> %#x\n", value ? value : "(unset)", cached );
+    }
+    return cached;
+#else
+    return 0;
+#endif
+}
+
+/*************************************************************
  * font_SelectFont
  */
 static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
@@ -4541,6 +4579,12 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
         case ANTIALIASED_QUALITY:
             if (!*aa_flags) *aa_flags = GGO_GRAY4_BITMAP;
             break;
+        }
+
+        {
+            UINT forced_aa = ohos_font_aa_override();
+
+            if (forced_aa) *aa_flags = forced_aa;
         }
 
         if (lf.lfOutPrecision == OUT_TT_ONLY_PRECIS)
