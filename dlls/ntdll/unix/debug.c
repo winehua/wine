@@ -197,9 +197,12 @@ static void init_options(void)
 {
     char *wine_debug = getenv("WINEDEBUG");
     const char *app_name, *p;
-    struct stat st1, st2;
 
     nb_debug_options = 0;
+
+#ifndef __OHOS__
+    {
+    struct stat st1, st2;
 
     /* check for stderr pointing to /dev/null */
     if (!fstat( 2, &st1 ) && S_ISCHR(st1.st_mode) &&
@@ -209,6 +212,11 @@ static void init_options(void)
         default_flags = 0;
         return;
     }
+    }
+#else
+    /* OHOS appspawn gives children /dev/null on fd 2; keep WINEDEBUG active
+     * there and rely on the stderr pipe/hilog bridge for output. */
+#endif
     if (!wine_debug) return;
     if (!strcmp( wine_debug, "help" )) debug_usage();
 
