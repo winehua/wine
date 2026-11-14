@@ -24,6 +24,9 @@
 #include "wine/asm.h"
 #include "wine/debug.h"
 
+#include <stdlib.h> /* getenv */
+#include <string.h> /* strcmp */
+
 WINE_DEFAULT_DEBUG_CHANNEL(system);
 
 
@@ -162,6 +165,9 @@ void SYSPARAMS_Init(void)
 {
     WCHAR buffer[256];
     DWORD option;
+#ifdef __OHOS__
+    BOOL declared = FALSE; /* manifest 是否已声明 awareness (无声明时默认 system-aware) */
+#endif
 
     system_dpi = NtUserGetSystemDpiForProcess( NULL );
 
@@ -201,6 +207,9 @@ void SYSPARAMS_Init(void)
     else if (QueryActCtxSettingsW( 0, NULL, L"http://schemas.microsoft.com/SMI/2005/WindowsSettings",
                                    L"dpiAware", buffer, ARRAY_SIZE(buffer), NULL ))
     {
+#ifdef __OHOS__
+        declared = TRUE;
+#endif
         TRACE( "got dpiAware=%s\n", debugstr_w(buffer) );
         if (!wcsicmp( buffer, L"true" ))
             SetProcessDpiAwarenessContext( DPI_AWARENESS_CONTEXT_SYSTEM_AWARE );
@@ -209,6 +218,19 @@ void SYSPARAMS_Init(void)
         else
             SetProcessDpiAwarenessContext( DPI_AWARENESS_CONTEXT_UNAWARE );
     }
+
+#ifdef __OHOS__
+    /* WineHua: 无 manifest/IFEO 声明的进程默认 system-aware。wine px = 物理 px
+     * 模型下窗口度量、消息坐标与渲染必须同域; 上游 unaware 语义会让消息按
+     * 192→96 虚化, 而全屏游戏按自己的显示模式 (如 800x600) 渲染, 点击坐标
+     * 被二次变换成一半落点 (2026-11-14 war3 实测)。WINEHUA_DPI_AWARE=0
+     * 还原上游 unaware 行为。 */
+    {
+        const char *aware = getenv( "WINEHUA_DPI_AWARE" );
+        if (!declared && !(aware && !strcmp( aware, "0" )))
+            SetProcessDpiAwarenessContext( DPI_AWARENESS_CONTEXT_SYSTEM_AWARE );
+    }
+#endif
 }
 
 static BOOL update_desktop_wallpaper(void)

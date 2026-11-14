@@ -427,7 +427,11 @@ static BOOL winehua_readback_present(struct opengl_drawable *base)
                                            gl->state->in_flight);
     wl_surface_attach(client->wl_surface, buffer->wl_buffer, 0, 0);
     wl_surface_damage_buffer(client->wl_surface, 0, 0, gl->width, gl->height);
-    if (client->wp_viewport) wp_viewport_set_destination(client->wp_viewport, gl->width, gl->height);
+    /* 不写 viewport destination: 几何归 wayland_surface_reconfigure_client
+     * 单一所有 (物理客户区口径)。这里写 gl->width/height (应用可见尺寸,
+     * DPI-unaware 窗口为物理的一半) 会覆盖物理 destination, 帧缩到窗口
+     * 左上角; 合成器按 destination 把应用尺寸的帧拉伸到物理客户区,
+     * 即 DPI 虚拟化的呈现侧语义。 */
     wl_surface_commit(client->wl_surface);
     wl_display_flush(process_wayland.wl_display);
     winehua_gl_stage_end(WINEHUA_GL_SHM_COMMIT, stage_started);

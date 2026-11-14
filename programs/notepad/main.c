@@ -196,7 +196,9 @@ static VOID NOTEPAD_LoadSettingFromRegistry(void)
     Globals.iMarginRight = 2000;
     Globals.bStatusBar = TRUE;
     
-    Globals.lfFont.lfHeight         = -12;
+    /* 上游以固定 96-DPI 像素取默认编辑字体高度, 高 DPI 屏上文本框文字只有
+     * 一半观感尺寸; 与本函数 iPointSize 路径同款换算 (96 DPI 下数值不变)。 */
+    Globals.lfFont.lfHeight         = -MulDiv(12, GetDpiForWindow(GetDesktopWindow()), 96);
     Globals.lfFont.lfWidth          = 0;
     Globals.lfFont.lfEscapement     = 0;
     Globals.lfFont.lfOrientation    = 0;

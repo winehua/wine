@@ -24,6 +24,9 @@
 #endif
 
 #include <assert.h>
+#include <stdio.h> /* DPI 诊断: fprintf */
+#include <stdlib.h> /* DPI 诊断: getenv */
+#include <unistd.h> /* DPI 诊断: getpid */
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -5575,6 +5578,16 @@ static WND *create_window_handle( HWND parent, HWND owner, UNICODE_STRING *name,
         }
     }
     SERVER_END_REQ;
+
+    { /* DPI 诊断 (WINEHUA_DPI_DIAG=1): 窗口创建时携带的线程 DPI context。
+       * dpi-consistency 判定至少一次建窗为 aware，平时不采集。 */
+        static int diag = -1;
+        static unsigned int diag_win;
+        if (diag < 0) diag = getenv( "WINEHUA_DPI_DIAG" ) != NULL;
+        if (diag && handle && diag_win++ < 40)
+            fprintf(stderr, "DPIDIAG wincreate pid=%u hwnd=%p thread_ctx=%#x\n",
+                    (unsigned)getpid(), handle, dpi_context);
+    }
 
     if (!handle)
     {

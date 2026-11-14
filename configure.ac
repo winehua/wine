@@ -458,7 +458,7 @@ do
     AS_VAR_COPY([CFLAGS],[${wine_arch}_CFLAGS])
     AS_VAR_COPY([CXXFLAGS],[${wine_arch}_CXXFLAGS])
     AS_VAR_COPY([LDFLAGS],[${wine_arch}_LDFLAGS])
-    AS_VAR_SET([${wine_arch}_EXTRACFLAGS],["-D__WINE_PE_BUILD -Wall"])
+    AS_VAR_SET([${wine_arch}_EXTRACFLAGS],["-D__WINE_PE_BUILD -D__OHOS__ -Wall"])
 
     target=""
     set x $CC

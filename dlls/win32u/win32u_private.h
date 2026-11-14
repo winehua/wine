@@ -170,6 +170,7 @@ extern COLORREF get_sys_color( int index );
 extern HBRUSH get_sys_color_brush( unsigned int index );
 extern HPEN get_sys_color_pen( unsigned int index );
 extern UINT get_system_dpi(void);
+extern UINT get_logpixels_override(void);
 extern int get_system_metrics( int index );
 extern UINT get_thread_dpi(void);
 extern UINT set_thread_dpi_awareness_context( UINT context );

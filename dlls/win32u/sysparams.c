@@ -26,7 +26,9 @@
 
 #include <pthread.h>
 #include <assert.h>
+#include <stdio.h> /* DPI 诊断: fprintf */
 #include <stdlib.h>
+#include <unistd.h> /* DPI 诊断: getpid */
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -662,6 +664,24 @@ static unsigned int query_reg_subkey_value( HKEY hkey, const char *name, KEY_VAL
     return size;
 }
 
+#ifdef __OHOS__
+UINT get_logpixels_override(void); /* 定义见 sysparams_init 段 */
+
+/* OHOS: 监视器 DPI 必须与本进程 system_dpi 同源。显示源 DPI 持久化在 prefix
+ * 注册表, 由第一个初始化显示设备的 GUI 进程写入 —— 启动链/模式不同会让它
+ * 写成 96, 之后带 192 的进程 (游戏/程序直启) 也读回 96, phys→win 坐标换算
+ * 因两端相等而短路, unaware 窗口收到物理坐标 (2026-11-14: war3 光标钳到
+ * 画面中线)。两条路线都以 WINEHUA_LOGPIXELS 为准自愈: 坐标域必须与
+ * system_dpi 一致, 否则 system-aware 窗口会被反向放大。x11 虚拟桌面的
+ * viewport 2× 是呈现层问题, 与这里的坐标域无关, 仍按 D 项单独收口。 */
+static UINT ohos_source_dpi( UINT dpi )
+{
+    UINT override_dpi = get_logpixels_override();
+    if (override_dpi) return override_dpi;
+    return dpi;
+}
+#endif
+
 static BOOL read_source_from_registry( unsigned int index, struct source *source, char *gpu_path )
 {
     char buffer[4096];
@@ -690,7 +710,11 @@ static BOOL read_source_from_registry( unsigned int index, struct source *source
 
     /* Dpi */
     if (query_reg_ascii_value( hkey, "Dpi", value, sizeof(buffer) ) && value->Type == REG_DWORD)
+#ifdef __OHOS__
+        source->dpi = ohos_source_dpi( *(DWORD *)value->Data );
+#else
         source->dpi = *(DWORD *)value->Data;
+#endif
 
     /* Depth */
     if (query_reg_ascii_value( hkey, "Depth", value, sizeof(buffer) ) && value->Type == REG_DWORD)
@@ -1888,7 +1912,11 @@ static void add_source( const char *name, UINT state_flags, UINT dpi, void *para
         source->id = 0;
         ctx->has_primary = TRUE;
     }
+#ifdef __OHOS__
+    source->dpi = ohos_source_dpi( dpi );
+#else
     source->dpi = dpi;
+#endif
 
     /* Wine specific config key where source settings will be held, symlinked with the logically indexed config key */
     snprintf( source->path, sizeof(source->path), "%s\\%s\\Video\\%s\\Sources\\%s", config_keyA,
@@ -3268,6 +3296,30 @@ UINT get_system_dpi(void)
     if (awareness == DPI_AWARENESS_UNAWARE) return USER_DEFAULT_SCREEN_DPI;
     return system_dpi;
 }
+
+#ifdef __OHOS__
+/* WINEHUA_LOGPIXELS 覆盖值 (0 = 未设置)。消费点: sysparams 的 system_dpi
+ * 初始化 (窗口度量) 与 font.c init_font_options (字体光栅化密度) —— 两个
+ * DPI 判据共用一个 env 读取单点, 缺一侧会出现"度量 192 / 字形 96"的脱节
+ * (2026-11-08 真机实证)。 */
+UINT get_logpixels_override(void)
+{
+    static UINT cached;
+    static BOOL cached_valid;
+    const char *env;
+
+    if (!cached_valid)
+    {
+        cached_valid = TRUE;
+        if ((env = getenv( "WINEHUA_LOGPIXELS" )) && *env)
+        {
+            UINT v = (UINT)atoi( env );
+            if (v >= 96 && v <= 480) cached = v;
+        }
+    }
+    return cached;
+}
+#endif
 
 /* keep in sync with user32 */
 UINT set_thread_dpi_awareness_context( UINT context )
@@ -5992,6 +6044,14 @@ void sysparams_init(void)
 
     config_key = reg_create_ascii_key( NULL, config_keyA, 0, NULL );
 
+#ifdef __OHOS__
+    /* OHOS: 宿主按内容缩放下发 DPI (WINEHUA_LOGPIXELS), 覆盖注册表
+     * LogPixels —— 呈现层 1:1 无上采样, wine 在物理分辨率上原生渲染。
+     * 字体光栅化密度 (font.c init_font_options) 同口径, 换算单点 =
+     * get_logpixels_override()。 */
+    system_dpi = get_logpixels_override();
+    if (!system_dpi)
+#endif
     get_dword_entry( (union sysparam_all_entry *)&entry_LOGPIXELS, 0, &system_dpi, 0 );
     if (!system_dpi)  /* check fallback key */
     {
@@ -6006,6 +6066,19 @@ void sysparams_init(void)
         }
     }
     if (!system_dpi) system_dpi = USER_DEFAULT_SCREEN_DPI;
+
+    { /* DPI 诊断 (WINEHUA_DPI_DIAG=1): 进程 DPI 来源链。dpi 套件的
+       * dpi-consistency 判定读 stderr 这一行，平时关闭避免日志膨胀。 */
+        static int diag = -1;
+        if (diag < 0) diag = getenv( "WINEHUA_DPI_DIAG" ) != NULL;
+        if (diag)
+        {
+            const char *env = getenv( "WINEHUA_LOGPIXELS" );
+            fprintf(stderr, "DPIDIAG sysparams pid=%u env=%s override=%u system_dpi=%u\n",
+                    (unsigned)getpid(), env ? env : "(unset)",
+                    get_logpixels_override(), system_dpi);
+        }
+    }
 
     /* FIXME: what do the DpiScalingVer flags mean? */
     get_dword_entry( (union sysparam_all_entry *)&entry_DPISCALINGVER, 0, &dpi_scaling, 0 );

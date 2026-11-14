@@ -4718,8 +4718,19 @@ static UINT init_font_options(void)
     char value_buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[20 * sizeof(WCHAR)])];
     KEY_VALUE_PARTIAL_INFORMATION *info = (void *)value_buffer;
     HKEY key;
+#ifdef __OHOS__
+    /* OHOS: 光栅化密度与窗口度量同口径 (WINEHUA_LOGPIXELS 覆盖, 换算单点
+     * get_logpixels_override)。缺此覆盖会出现"窗口度量 192 / 字形渲染 96"
+     * 的脱节 (2026-11-08 真机实证)。 */
+    extern UINT get_logpixels_override(void);
+    UINT override_dpi = get_logpixels_override();
+#endif
     DWORD i, val, gamma = 1400;
     UINT dpi = 0;
+#ifdef __OHOS__
+    /* 覆盖优先于注册表: 旧 prefix 里持久化的 96 值不得盖过宿主下发值 */
+    dpi = override_dpi;
+#endif
 
     if (query_reg_ascii_value( wine_fonts_key, "AntialiasFakeBoldOrItalic",
                                info, sizeof(value_buffer) ) && info->Type == REG_SZ)
@@ -4754,7 +4765,11 @@ static UINT init_font_options(void)
         {
             gamma = min( max( val, 1000 ), 2200 );
         }
+#ifdef __OHOS__
+        if (!dpi && get_key_value( key, "LogPixels", &val )) dpi = val;
+#else
         if (get_key_value( key, "LogPixels", &val )) dpi = val;
+#endif
         NtClose( key );
     }
 

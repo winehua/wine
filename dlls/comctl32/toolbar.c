@@ -2782,6 +2782,62 @@ TOOLBAR_CustomizeDialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     }
 }
 
+#ifdef __OHOS__
+/* OHOS HiDPI: 系统/内部位图按屏幕密度缩放 (96 DPI 基准)。呈现层 1:1,
+ * 固定像素位图不再被呈现放大, 不缩放则图标只有一半观感尺寸。 */
+static inline int TOOLBAR_GetDpiScale(void)
+{
+    HDC hdc = GetDC (0);
+    int dpi = hdc ? GetDeviceCaps (hdc, LOGPIXELSX) : 0;
+    if (hdc) ReleaseDC (0, hdc);
+    dpi = (dpi > 0) ? dpi : USER_DEFAULT_SCREEN_DPI;
+    return dpi;
+}
+
+/* OHOS HiDPI: 条带最近邻缩放 (96 DPI 基准 → 屏幕 DPI)。内部工具栏位图是
+ * 32bpp 带 alpha 的资源, 透明由 alpha 通道承担 (imagelist add_with_alpha
+ * 检测到非零 alpha 后按 alpha 生成遮罩); 把位深降到 24bpp 或经 GDI 拉伸
+ * 丢掉 alpha 字节都会让整图不透明、黑色背景原样画出。因此这里不走 GDI
+ * 拉伸, 直接按 DIB section 位指针逐 DWORD 最近邻复制, alpha 字节原样保留。
+ * 非 32bpp 条带返回 NULL, 调用方保持原尺寸 (图标偏小但不破色)。 */
+static HBITMAP TOOLBAR_ScaleStrip(HBITMAP src, int dpi)
+{
+    BITMAP bm;
+    BITMAPINFOHEADER bi;
+    HBITMAP dst;
+    void *dst_bits;
+    const DWORD *s;
+    DWORD *d;
+    int cx, cy, x, y;
+
+    if (!GetObjectW (src, sizeof(bm), &bm)) return NULL;
+    if (bm.bmBitsPixel != 32 || !bm.bmBits) return NULL;
+
+    cx = MulDiv (bm.bmWidth, dpi, USER_DEFAULT_SCREEN_DPI);
+    cy = MulDiv (bm.bmHeight, dpi, USER_DEFAULT_SCREEN_DPI);
+    if (cx <= bm.bmWidth) return NULL;
+
+    memset (&bi, 0, sizeof(bi));
+    bi.biSize = sizeof(bi);
+    bi.biWidth = cx;
+    bi.biHeight = cy;
+    bi.biPlanes = 1;
+    bi.biBitCount = 32;
+    bi.biCompression = BI_RGB;
+    dst = CreateDIBSection (NULL, (BITMAPINFO *)&bi, DIB_RGB_COLORS, &dst_bits, NULL, 0);
+    if (!dst) return NULL;
+
+    for (y = 0; y < cy; y++)
+    {
+        s = (const DWORD *)((const BYTE *)bm.bmBits + (LONG_PTR)y * bm.bmHeight / cy * bm.bmWidthBytes);
+        d = (DWORD *)((BYTE *)dst_bits + (LONG_PTR)y * cx * 4);
+        for (x = 0; x < cx; x++)
+            d[x] = s[x * bm.bmWidth / cx];
+    }
+    return dst;
+}
+#endif /* __OHOS__ */
+
 static BOOL
 TOOLBAR_AddBitmapToImageList(TOOLBAR_INFO *infoPtr, HIMAGELIST himlDef, const TBITMAP_INFO *bitmap)
 {
@@ -2797,8 +2853,28 @@ TOOLBAR_AddBitmapToImageList(TOOLBAR_INFO *infoPtr, HIMAGELIST himlDef, const TB
     if (bitmap->hInst == NULL)         /* a handle was passed */
         hbmLoad = CopyImage(ULongToHandle(bitmap->nID), IMAGE_BITMAP, 0, 0, 0);
     else if (bitmap->hInst == COMCTL32_hModule)
+    {
+#ifdef __OHOS__
+        /* OHOS HiDPI: 内部位图原尺寸加载后按密度拉伸 (基准 24/16 px, 与
+         * TOOLBAR_AddBitmap 的 TB_SETBITMAPSIZE 同一系数), 图例格尺寸
+         * 随 SETBITMAPSIZE 已放大, 两者对齐后条带才能正确切分。 */
+        int dpi = TOOLBAR_GetDpiScale();
         hbmLoad = LoadImageW( bitmap->hInst, MAKEINTRESOURCEW(bitmap->nID),
                               IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION );
+        if (dpi != USER_DEFAULT_SCREEN_DPI && hbmLoad)
+        {
+            HBITMAP hbmScaled = TOOLBAR_ScaleStrip (hbmLoad, dpi);
+            if (hbmScaled)
+            {
+                DeleteObject (hbmLoad);
+                hbmLoad = hbmScaled;
+            }
+        }
+#else
+        hbmLoad = LoadImageW( bitmap->hInst, MAKEINTRESOURCEW(bitmap->nID),
+                              IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION );
+#endif
+    }
     else
         hbmLoad = CreateMappedBitmap(bitmap->hInst, bitmap->nID, 0, NULL, 0);
 
@@ -2912,6 +2988,14 @@ TOOLBAR_AddBitmap (TOOLBAR_INFO *infoPtr, INT count, const TBADDBITMAP *lpAddBmp
         TRACE ("adding %d internal bitmaps\n", info.nButtons);
 
 	/* Windows resize all the buttons to the size of a newly added standard image */
+#ifdef __OHOS__
+	{
+	    /* OHOS HiDPI: large 24x24 / small 16x16 基准, 按屏幕密度缩放 */
+	    int base = (lpAddBmp->nID & 1) ? 24 : 16;
+	    int size = MulDiv (base, TOOLBAR_GetDpiScale(), USER_DEFAULT_SCREEN_DPI);
+	    SendMessageW (infoPtr->hwndSelf, TB_SETBITMAPSIZE, 0, MAKELPARAM(size, size));
+	}
+#else
 	if (lpAddBmp->nID & 1)
 	{
 	    /* large icons: 24x24. Will make the button 31x30 */
@@ -2922,6 +3006,7 @@ TOOLBAR_AddBitmap (TOOLBAR_INFO *infoPtr, INT count, const TBADDBITMAP *lpAddBmp
 	    /* small icons: 16x16. Will make the buttons 23x22 */
 	    SendMessageW (infoPtr->hwndSelf, TB_SETBITMAPSIZE, 0, MAKELPARAM(16, 16));
 	}
+#endif
 
 	TOOLBAR_CalcToolbar (infoPtr);
     }

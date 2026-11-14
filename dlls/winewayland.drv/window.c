@@ -180,7 +180,16 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
     }
 
     conf->state = window_state;
+#ifdef __OHOS__
+    /* OHOS: 宿主合成器按 1:1 呈现 (wine px == 物理 px, 无 output scale),
+     * surface-local 坐标必须保持物理口径。DPI (WINEHUA_LOGPIXELS) 只在
+     * win32u 内部驱动字体/UI 度量, 不参与驱动层坐标换算 —— 若跟随
+     * system_dpi 缩放 (上游默认 = dpi/96), viewport dst / window_geometry /
+     * subsurface position 会被除以 2, 合成器窗口尺寸与点击映射全部失配。 */
+    conf->scale = 1.0;
+#else
     conf->scale = NtUserGetSystemDpiForProcess(0) / 96.0;
+#endif
     conf->visible = (style & WS_VISIBLE) == WS_VISIBLE;
     conf->managed = data->managed;
 }

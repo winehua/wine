@@ -31,7 +31,9 @@
 
 #include "ntuser.h"
 
+#include <stdio.h> /* DPI 诊断: fprintf */
 #include <stdlib.h>
+#include <unistd.h> /* DPI 诊断: getpid */
 
 WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 
@@ -199,6 +201,13 @@ static void wayland_add_device_source(const struct gdi_device_manager *device_ma
                                        void *param, UINT state_flags, struct output_info *output_info)
 {
     UINT dpi = NtUserGetSystemDpiForProcess( NULL );
+    { /* DPI 诊断 (WINEHUA_DPI_DIAG=1): 监视器源注册 DPI */
+        static int diag = -1;
+        if (diag < 0) diag = getenv( "WINEHUA_DPI_DIAG" ) != NULL;
+        if (diag)
+            fprintf(stderr, "DPIDIAG wayland_source pid=%u name=%s dpi=%u\n",
+                    (unsigned)getpid(), output_info->output->name, dpi);
+    }
     TRACE("name=%s state_flags=0x%x\n",
           output_info->output->name, state_flags);
     device_manager->add_source(output_info->output->name, state_flags, dpi, param);

@@ -25,6 +25,8 @@
 #endif
 
 #include <assert.h>
+#include <stdio.h> /* DPI 诊断: fprintf */
+#include <stdlib.h> /* DPI 诊断: getenv */
 #include "ntstatus.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
@@ -2645,7 +2647,26 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
     }
     update_current_mouse_window( msg->hwnd, hittest, msg->pt );
 
-    msg->pt = point_phys_to_win_dpi( msg->hwnd, msg->pt );
+    {
+        /* DPI 诊断 (WINEHUA_DPI_DIAG=1): 消息物理坐标 → 窗口坐标的转换。
+         * dpi-consistency 判定读 raw/win 是否相等，平时不采集。 */
+        static int diag = -1;
+        POINT raw = msg->pt;
+        UINT raw_mon_dpi = 0, mon_dpi = 0;
+        if (diag < 0) diag = getenv( "WINEHUA_DPI_DIAG" ) != NULL;
+        if (diag) mon_dpi = get_win_monitor_dpi( msg->hwnd, &raw_mon_dpi );
+        msg->pt = point_phys_to_win_dpi( msg->hwnd, msg->pt );
+        if (diag)
+        {
+            static unsigned int diag_msg;
+            BOOL is_btn = msg->message >= WM_LBUTTONDOWN && msg->message <= WM_XBUTTONDBLCLK;
+            if (is_btn || ++diag_msg <= 5 || !(diag_msg % 100))
+                fprintf(stderr, "MSGDIAG raw=%d,%d win=%d,%d hwnd=%p msg=%#x dctx=%#x thread_dpi=%u mon=%u raw_mon=%u win_dpi=%u\n",
+                        raw.x, raw.y, msg->pt.x, msg->pt.y, msg->hwnd, msg->message,
+                        get_window_dpi_awareness_context( msg->hwnd ), get_thread_dpi(),
+                        mon_dpi, raw_mon_dpi, get_dpi_for_window( msg->hwnd ));
+        }
+    }
     set_thread_dpi_awareness_context( get_window_dpi_awareness_context( msg->hwnd ));
 
     if ((extra_info & 0xffffff00) != 0xff515700 && is_mouse_in_pointer_enabled( msg->hwnd ))
@@ -2728,6 +2749,18 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
         }
     }
     msg->lParam = MAKELONG( pt.x, pt.y );
+
+    { /* DPI 诊断 (WINEHUA_DPI_DIAG=1): 窗口客户区坐标与命中测试 */
+        static int diag = -1;
+        if (diag < 0) diag = getenv( "WINEHUA_DPI_DIAG" ) != NULL;
+        if (diag)
+        {
+            static unsigned int diag_cli;
+            if (message != WM_MOUSEMOVE || !(++diag_cli % 100))
+                fprintf(stderr, "MSGDIAG client hwnd=%p msg=%#x pt=%d,%d hittest=%#x\n",
+                        msg->hwnd, message, pt.x, pt.y, hittest);
+        }
+    }
 
     /* translate double clicks */
 

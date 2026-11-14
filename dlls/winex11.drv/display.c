@@ -24,6 +24,10 @@
 
 #include "config.h"
 
+#include <stdio.h> /* DPI 诊断: fprintf */
+#include <stdlib.h> /* DPI 诊断: getenv */
+#include <unistd.h> /* DPI 诊断: getpid */
+
 #include "ntstatus.h"
 #include "x11drv.h"
 #include "wine/debug.h"
@@ -418,6 +422,13 @@ UINT X11DRV_UpdateDisplayDevices( const struct gdi_device_manager *device_manage
             UINT dpi = NtUserGetSystemDpiForProcess( NULL );
 
             sprintf( buffer, "%04lx", adapters[adapter].id );
+            { /* DPI 诊断 (WINEHUA_DPI_DIAG=1): 监视器源注册 DPI */
+                static int diag = -1;
+                if (diag < 0) diag = getenv( "WINEHUA_DPI_DIAG" ) != NULL;
+                if (diag)
+                    fprintf( stderr, "DPIDIAG x11_source pid=%u name=%s dpi=%u\n",
+                             (unsigned)getpid(), buffer, dpi );
+            }
             device_manager->add_source( buffer, adapters[adapter].state_flags, dpi, param );
 
             if (!host_handler.get_monitors( adapters[adapter].id, &monitors, &monitor_count )) break;
