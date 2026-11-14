@@ -58,6 +58,11 @@ int ohos_broker_spawn_child( char **argv, int socketfd, int *child_pid );
  * Returns 1 if condition met, 0 otherwise. */
 int ohos_broker_scan_wineserver( const char *prefix, int poll_sec, int vanish_mode );
 
+/* Ask the host to open a URL or file URI with the OHOS system handler.
+ * Protocol: "OPEN\n{target}\n"; response int32_t[2] = {status, 0}.
+ * Returns 0 if the host accepted the request, -1 otherwise. */
+int ohos_broker_open( const char *target );
+
 #endif /* __OHOS__ */
 
 #endif /* __WINE_OHOS_BROKER_H */

@@ -500,6 +500,11 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
     pid_t pid, wret;
     int fd[2], status, err;
 
+#ifdef __OHOS__
+    if (argv[0] && !strcmp( argv[0], "winehua-open" ) && argv[1])
+        return ohos_broker_open( argv[1] ) == 0 ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+#endif
+
 #ifdef HAVE_PIPE2
     if (pipe2( fd, O_CLOEXEC ) == -1)
 #endif

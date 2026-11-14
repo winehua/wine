@@ -145,6 +145,48 @@ int ohos_broker_spawn(const char *entry_params,
 }
 
 
+/***********************************************************************
+ *           ohos_broker_open
+ *
+ * Ask the host process to open a URL or file URI with the OHOS system
+ * handler. The broker runs in the HAP process and forwards the target to
+ * ArkTS, which calls startAbility().
+ *
+ * Protocol (over Unix socket):
+ *   send:  "OPEN\n{target}\n"
+ *   recv:  int32_t[2] = {status, 0}   (status 0 = accepted)
+ */
+int ohos_broker_open( const char *target )
+{
+    const char *path = broker_socket_path();
+    struct sockaddr_un addr;
+    char request[4096];
+    int32_t response[2];
+    int broker_fd, len, ret = -1;
+
+    if (!target || !*target || strchr( target, '\n' ) || strchr( target, '\r' ))
+        return -1;
+    len = snprintf( request, sizeof(request), "OPEN\n%s\n", target );
+    if (len <= 0 || (size_t)len >= sizeof(request)) return -1;
+
+    broker_fd = socket( AF_UNIX, SOCK_STREAM, 0 );
+    if (broker_fd < 0) return -1;
+
+    memset( &addr, 0, sizeof(addr) );
+    addr.sun_family = AF_UNIX;
+    strcpy( addr.sun_path, path );
+
+    if (connect( broker_fd, (struct sockaddr *)&addr, sizeof(addr) ) == 0 &&
+        send( broker_fd, request, len, MSG_NOSIGNAL ) == len &&
+        recv( broker_fd, response, sizeof(response), MSG_WAITALL ) == sizeof(response) &&
+        response[0] == 0)
+        ret = 0;
+
+    close( broker_fd );
+    return ret;
+}
+
+
 /* Resolve binDir from WINEBINDIR env or fallback. */
 static const char *resolve_bindir(void)
 {

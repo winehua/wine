@@ -71,6 +71,21 @@ static int launch_app( const WCHAR *candidates, const WCHAR *argv1 )
 
     if (!(cmdline = strdup_unixcp( argv1 ))) return 1;
 
+    /* PE builds do not see the Unix-side __OHOS__ macro; the launcher always
+     * sets WINEHUA_DESKTOP_MODE, which identifies the WineHua host process. */
+    if (getenv( "WINEHUA_DESKTOP_MODE" ))
+    {
+        char *open_argv[3];
+
+        open_argv[0] = (char *)"winehua-open";
+        open_argv[1] = cmdline;
+        open_argv[2] = NULL;
+        if (!__wine_unix_spawnvp( open_argv, FALSE )) ExitProcess( 0 );
+        WINE_ERR( "could not open %s through the OHOS host\n", debugstr_w( argv1 ));
+        free( cmdline );
+        return 1;
+    }
+
     while (*candidates)
     {
         WCHAR **args = CommandLineToArgvW( candidates, &count );
