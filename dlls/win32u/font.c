@@ -2263,6 +2263,30 @@ static struct gdi_font_face *find_any_face( const LOGFONTW *lf, FONTSIGNATURE fs
     return NULL;
 }
 
+#ifdef __OHOS__
+/* 返回剥掉 " (LocaleName)" 注解后的基本名长度; 0 = 无注解, 原名可用。
+ * OHOS: 部分应用 (SAP 类 OCX 控件在 CJK Windows 上) 把显示用的 locale 注解
+ * 写进 lfFaceName (如 "Tahoma (中文)")。原样参与替换匹配会查不到
+ * "MS Shell Dlg" 替换链, 整段中文退到兜底字体。仅匹配语义收窄,
+ * 不改返回给应用的名字。 */
+static SIZE_T strip_font_locale_annotation( const WCHAR *name )
+{
+    SIZE_T len = lstrlenW( name );
+    SIZE_T i;
+    BOOL has_non_ascii = FALSE;
+
+    if (len < 4) return 0;
+    if (name[len - 1] != ')') return 0;
+    for (i = len - 2; i > 0; i--)
+    {
+        if (name[i] > 127) has_non_ascii = TRUE;
+        if (name[i] == '(' && name[i - 1] == ' ' && has_non_ascii)
+            return i - 1;
+    }
+    return 0;
+}
+#endif
+
 static struct gdi_font_face *find_matching_face( const LOGFONTW *lf, CHARSETINFO *csi, BOOL can_use_bitmap,
                                                  BOOL *substituted, const WCHAR **orig_name )
 {
@@ -2278,7 +2302,23 @@ static struct gdi_font_face *find_matching_face( const LOGFONTW *lf, CHARSETINFO
     if (lf->lfFaceName[0])
     {
         int subst_charset;
+#ifdef __OHOS__
+        const WCHAR *face_name = lf->lfFaceName;
+        WCHAR stripped_buf[LF_FACESIZE];
+        SIZE_T stripped_len = strip_font_locale_annotation( lf->lfFaceName );
+
+        if (stripped_len && stripped_len < LF_FACESIZE)
+        {
+            memcpy( stripped_buf, lf->lfFaceName, stripped_len * sizeof(WCHAR) );
+            stripped_buf[stripped_len] = 0;
+            face_name = stripped_buf;
+            TRACE( "stripped locale annotation: %s -> %s\n",
+                   debugstr_w(lf->lfFaceName), debugstr_w(face_name) );
+        }
+        const WCHAR *subst = get_gdi_font_subst( face_name, lf->lfCharSet, &subst_charset );
+#else
         const WCHAR *subst = get_gdi_font_subst( lf->lfFaceName, lf->lfCharSet, &subst_charset );
+#endif
 
 	if (subst)
         {
@@ -2754,7 +2794,15 @@ static void add_child_font( struct gdi_font *font, const WCHAR *family_name )
     child->matrix = font->matrix;
     child->can_use_bitmap = font->can_use_bitmap;
     child->scale_y = font->scale_y;
+#ifdef __OHOS__
+    /* OHOS: 子字体不继承父字体的拉丁 aveWidth。父字体 (如 Tahoma) 的
+     * aveWidth 相对拉丁字宽, freetype 按它算 width_ratio 套到 CJK 子字体上
+     * (CJK 的 tmAveCharWidth 大得多) 会把中文压成细竖条。置 0 让 freetype
+     * 跳过按宽度比的缩放, 中文用自身度量渲染。其他平台保持上游行为。 */
+    child->aveWidth = 0;
+#else
     child->aveWidth = font->aveWidth;
+#endif
     child->charset = font->charset;
     child->codepage = font->codepage;
     child->base_font = font;

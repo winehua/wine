@@ -2257,12 +2257,108 @@ enum matrices_index
     matrix_unrotated
 };
 
+#ifdef __OHOS__
+/* 设备字体路径判定。不能用 libc wcsstr: unixlib.h 的宽字符映射只覆盖
+ * wcslen/wcsncmp/wcsicmp 等一组 (libc wchar_t 是 4 字节, wine WCHAR 是
+ * 16 位, 直接调 libc 宽字符函数会按错误步长扫描), 包含检查用 wcsncmp
+ * 手写。 */
+static BOOL ohos_path_is_device_font( const WCHAR *file )
+{
+    static const WCHAR *slash_path = L"/system/fonts/";
+    static const WCHAR *nt_path = L"\\system\\fonts\\";
+    SIZE_T len = wcslen( file ), i, plen;
+
+    plen = wcslen( slash_path ); /* 14 */
+    for (i = 0; i + plen <= len; i++)
+        if (!wcsncmp( file + i, slash_path, plen )) return TRUE;
+    plen = wcslen( nt_path ); /* 14 */
+    for (i = 0; i + plen <= len; i++)
+        if (!wcsncmp( file + i, nt_path, plen )) return TRUE;
+    return FALSE;
+}
+
+/* WINEHUA_CJK_CHILD_SCALE: CJK 观感校准开关, 默认关 (未设置 = 严格上游行为)。
+ * 设备中文字体 (HarmonyOS Sans/FZ 系) 在同字号下比 Windows 中文字体视觉尺寸
+ * 大, Windows 程序按自身字体度量算的布局会显得过大。设为 (0,1) 内比例
+ * (如 0.85) 启用, 仅作用于设备字体目录里的字面, 且只缩两条回退路径:
+ * (a) 拉丁基字体的 CJK 回退子字体 (base_font != NULL);
+ * (b) 请求的字族设备上不存在, 直接落到别的设备字面 (解析字族 != 请求字族,
+ *     如 MS Shell Dlg -> HarmonyOS Sans SC)。点名使用已安装字族的不缩,
+ *     应用自带字体不缩。 */
+static double ohos_cjk_child_scale( struct gdi_font *font )
+{
+    static double cached = -2.0;
+    const char *env;
+    const WCHAR *req;
+    FT_Face ft_face;
+    WCHAR resolved[64];
+    SIZE_T i;
+
+    if (cached < -1.0)
+    {
+        cached = 0.0; /* 未设置/非法值 = 关 */
+        if ((env = getenv( "WINEHUA_CJK_CHILD_SCALE" )) && *env)
+        {
+            double v = atof( env );
+            if (v > 0.0 && v < 1.0) cached = v;
+        }
+    }
+    if (cached <= 0.0) return 0.0;
+
+    /* 设备字体门: face 文件须在系统字体目录 (存储形态两种: unix 原路径与
+     * \??\unix\ 前缀的 NT 形态, 见 font.c get_nt_path) */
+    if (!font->file[0])
+    {
+        TRACE( "cjk scale: no file, off\n" );
+        return 0.0;
+    }
+    if (!ohos_path_is_device_font( font->file ))
+    {
+        TRACE( "cjk scale: file %s not device font, off\n", debugstr_w(font->file) );
+        return 0.0;
+    }
+
+    /* (a) 拉丁基字体的 CJK 回退子字体 */
+    if (font->base_font) return cached;
+
+    /* (b) 直接回退: 解析字族 != 请求字族才缩 */
+    req = font->lf.lfFaceName;
+    if (req[0] == '@') req++;
+    if (!req[0])
+    {
+        TRACE( "cjk scale: empty req name, off\n" );
+        return 0.0;
+    }
+    ft_face = get_ft_face( font );
+    if (!ft_face || !ft_face->family_name)
+    {
+        TRACE( "cjk scale: no ft face/family, off\n" );
+        return 0.0;
+    }
+    /* FT 字族名 ASCII 拷贝; 非 ASCII (本地化族名) 视为不同名 */
+    for (i = 0; i < 63 && ft_face->family_name[i]; i++)
+        resolved[i] = (WCHAR)(unsigned char)ft_face->family_name[i];
+    resolved[i] = 0;
+    if (wcsicmp( resolved, req ) == 0)
+    {
+        TRACE( "cjk scale: req==resolved %s, off\n", debugstr_w(resolved) );
+        return 0.0;
+    }
+    TRACE( "cjk scale: req %s resolved %s -> scale %g\n",
+           debugstr_w(req), debugstr_w(resolved), cached );
+    return cached;
+}
+#endif
+
 static FT_Matrix *get_transform_matrices( struct gdi_font *font, BOOL vertical, const MAT2 *user_transform,
                                           FT_Matrix matrices[3] )
 {
     static const FT_Matrix identity_mat = { (1 << 16), 0, 0, (1 << 16) };
     BOOL needs_transform = FALSE;
     double width_ratio;
+#ifdef __OHOS__
+    BOOL ohos_child_scaled = FALSE;
+#endif
     int i;
 
     matrices[matrix_unrotated] = identity_mat;
@@ -2275,7 +2371,20 @@ static FT_Matrix *get_transform_matrices( struct gdi_font *font, BOOL vertical, 
         width_ratio /= (double)font->otm.otmTextMetrics.tmAveCharWidth;
     }
     else
+    {
+#ifdef __OHOS__
+        double cs = ohos_cjk_child_scale( font );
+        if (cs > 0.0)
+        {
+            width_ratio = cs;
+            ohos_child_scaled = TRUE;
+        }
+        else
+            width_ratio = font->scale_y;
+#else
         width_ratio = font->scale_y;
+#endif
+    }
 
     /* Scaling transform */
     if (width_ratio != 1.0 || font->scale_y != 1)
@@ -2284,7 +2393,13 @@ static FT_Matrix *get_transform_matrices( struct gdi_font *font, BOOL vertical, 
         scale_mat.xx = FT_FixedFromFloat( width_ratio );
         scale_mat.xy = 0;
         scale_mat.yx = 0;
+#ifdef __OHOS__
+        /* 校准时 Y 同比例等比缩, 否则字形窄高; 其余保持上游 */
+        scale_mat.yy = ohos_child_scaled ? FT_FixedFromFloat( width_ratio )
+                                         : (font->scale_y << 16);
+#else
         scale_mat.yy = font->scale_y << 16;
+#endif
 
         pFT_Matrix_Multiply( &scale_mat, &matrices[matrix_unrotated] );
         needs_transform = TRUE;
@@ -2403,7 +2518,14 @@ static FT_Vector get_advance_metric( struct gdi_font *font, FT_Pos base_advance,
     FT_Vector adv;
     FT_Fixed em_scale = 0;
     BOOL fixed_pitch_full = FALSE;
+#ifdef __OHOS__
+    /* OHOS: advance 用子字体自身的 ntmAvgWidth。上游取 base_font 的拉丁
+     * average, GetTextExtentExPoint 按它算列宽会低估实际 CJK 字宽, 列挤叠。
+     * width_ratio 只影响字形 bbox, 不影响 advance (排版宽度)。 */
+    struct gdi_font *incoming_font = font;
+#else
     struct gdi_font *incoming_font = font->base_font ? font->base_font : font;
+#endif
 
     adv.x = base_advance;
     adv.y = 0;
@@ -3104,7 +3226,9 @@ static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT 
                                         GLYPHMETRICS *lpgm, ABC *abc, UINT buflen, void *buf,
                                         const MAT2 *lpmat, BOOL tategaki )
 {
+#ifndef __OHOS__ /* OHOS: 裁切按字形自身度量, 见下方裁切点 */
     struct gdi_font *base_font = font->base_font ? font->base_font : font;
+#endif
     FT_Face ft_face = get_ft_face( font );
     FT_Glyph_Metrics metrics;
     FT_Error err;
@@ -3150,6 +3274,31 @@ static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT 
     /* Some poorly-created fonts contain glyphs that exceed the boundaries set
      * by the text metrics. The proper behavior is to clip the glyph metrics to
      * fit within the maximums specified in the text metrics. */
+#ifdef __OHOS__
+    /* OHOS: 字形按自身字体度量裁切。上游裁到 base_font (父字体) 的
+     * tmAscent/tmDescent, 对拉丁字形够用, 对 CJK 子字体即使等比缩放后
+     * horiBearingY 仍可能超出父字体 ascent, 顶部被切。非子字体两者相同,
+     * 行为不变。 */
+    if (freetype_set_outline_text_metrics(font) ||
+        freetype_set_bitmap_text_metrics(font)) {
+        TEXTMETRICW *ptm = &font->otm.otmTextMetrics;
+        INT top = min( metrics.horiBearingY, ptm->tmAscent << 6 );
+        INT bottom = max( metrics.horiBearingY - metrics.height, -(ptm->tmDescent << 6) );
+
+        if (top < bottom)
+        {
+            INT t = top;
+            top = bottom;
+            bottom = t;
+        }
+
+        metrics.horiBearingY = top;
+        metrics.height = top - bottom;
+
+        /* TODO: Are we supposed to clip the width as well...? */
+        /* metrics.width = min( metrics.width, ptm->tmMaxCharWidth << 6 ); */
+    }
+#else
     if (freetype_set_outline_text_metrics(base_font) ||
         freetype_set_bitmap_text_metrics(base_font)) {
         TEXTMETRICW *ptm = &base_font->otm.otmTextMetrics;
@@ -3169,6 +3318,7 @@ static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT 
         /* TODO: Are we supposed to clip the width as well...? */
         /* metrics.width = min( metrics.width, ptm->tmMaxCharWidth << 6 ); */
     }
+#endif
 
     bbox = get_transformed_bbox( &metrics, matrices );
     compute_metrics( font, bbox, &metrics, tategaki, vertical_metrics, matrices, lpgm, abc );
